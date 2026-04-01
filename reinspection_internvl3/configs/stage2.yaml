@@ -1,0 +1,39 @@
+# Stage 2: spatial reasoning fine-tuning
+# Trainable: ReInspectionModule + LoRA on LLM
+# Loss: L_CE only
+
+# Re-Inspection Module
+model_name_or_path: "OpenGVLab/InternVL3-8B-hf"
+d_model: 3584
+d_bottleneck: 256
+n_queries: 32
+n_heads: 4
+ffn_mult: 4
+dropout: 0.0
+
+# LoRA
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules:
+  - q_proj
+  - v_proj
+
+# Stage 2 training
+stage2_lr_module: 5.0e-5
+stage2_lr_lora: 2.0e-5
+stage2_epochs: 10
+stage2_batch_size: 4
+stage2_grad_accum: 8
+stage2_warmup_ratio: 0.20
+
+# Image processing
+max_pixels: 1003520
+min_pixels: 3136
+crop_to_patches_stage2: true
+
+# Misc
+seed: 42
+bf16: true
+gradient_checkpointing: true
+output_dir: "outputs"

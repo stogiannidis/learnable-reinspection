@@ -1,0 +1,32 @@
+# Stage 1: Grounding warm-up on RefCOCO
+# Trainable: ReInspectionModule only (~1.8M params)
+# Loss: L_CE + lambda * L_attn (binary focal loss with per-query targets)
+
+model_name_or_path: "Qwen/Qwen3-VL-8B-Instruct"
+
+# Re-Inspection Module
+d_model: 4096
+d_bottleneck: 256
+n_queries: 32
+n_heads: 4
+ffn_mult: 4
+dropout: 0.0
+
+# Stage 1 training
+stage1_lr_module: 1.0e-4
+stage1_lr_merger: 1.0e-5
+stage1_epochs: 5
+stage1_batch_size: 4
+stage1_grad_accum: 8
+stage1_warmup_ratio: 0.03
+stage1_attn_loss_weight: 10.0
+
+# Image processing
+max_pixels: 1003520  # 1280 * 28 * 28
+min_pixels: 3136     # 4 * 28 * 28
+
+# Misc
+seed: 42
+bf16: true
+gradient_checkpointing: true
+output_dir: "outputs"

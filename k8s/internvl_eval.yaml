@@ -1,0 +1,85 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-internvl-eval-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-internvl-eval
+    spec:
+      containers:
+      - name: reinspection-internvl-eval
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            mkdir -p logs outputs
+            bash reinspection_internvl3/scripts/run_eval.sh 2>&1 | tee logs/internvl_eval.log
+        terminationMessagePath: "/tmp/my-log"
+        terminationMessagePolicy: File
+        imagePullPolicy: "Always"
+        env:
+          - name: DATA_ROOT
+            value: "/data/datasets"
+          - name: CHECKPOINT_DIR
+            value: "outputs/internvl/stage2/epoch_1"
+          - name: OUTPUT_FILE
+            value: "outputs/internvl/eval_results.json"
+          - name: HF_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: reinspection-secrets
+                key: HF_TOKEN
+          - name: WANDB_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: reinspection-secrets
+                key: WANDB_API_KEY
+          - name: WANDB_PROJECT
+            value: "reinspection-internvl3"
+          - name: USER
+            value: "stogian_ph"
+          - name: OMP_NUM_THREADS
+            value: "4"
+        resources:
+          requests:
+            cpu: 8
+            memory: "64Gi"
+            nvidia.com/gpu: 1
+          limits:
+            cpu: 8
+            memory: "64Gi"
+            nvidia.com/gpu: 1
+        volumeMounts:
+          - mountPath: /dev/shm
+            name: dshm
+          - mountPath: /data
+            name: nfs
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 30545
+        runAsGroup: 4451
+        runAsNonRoot: true
+      volumes:
+      - emptyDir:
+          medium: Memory
+          sizeLimit: "16Gi"
+        name: dshm
+      - name: nfs
+        nfs:
+          server: 10.24.6.66
+          path: /
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+
+# NVIDIA-A100-SXM4-80GB
+# NVIDIA-H100-80GB-HBM

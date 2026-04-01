@@ -1,0 +1,23 @@
+# Secrets and local env
+.env
+.env.*
+k8s/secrets.yaml
+
+# Local artifacts
+reinspection_qwen3vl/
+reinspection_internvl3/
+wandb/
+outputs/
+logs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Editor / local
+.claude/
+AGENTS.md
+CLAUDE.md
+doc.md
+simpledoc.md
+newplan.md

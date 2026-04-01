@@ -1,0 +1,684 @@
+"""Qwen3-VL with Re-Inspection Module.
+
+Wraps Qwen3VLForConditionalGeneration, inserting task-conditioned
+re-inspection tokens (R) between the user message and assistant response.
+
+Integration points:
+  1. After masked_scatter (vision tokens placed), extract V and T
+  2. Run ReInspectionModule(V, T) -> R tokens
+  3. Insert R into inputs_embeds before <|im_start|>assistant
+  4. Extend attention_mask, position_ids, labels accordingly
+  5. DeepStack's visual_pos_masks naturally excludes R positions
+"""
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, List, Tuple
+from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+
+from reinspection_vlm.config import ReInspectionConfig
+from reinspection_vlm.outputs import ReInspectionOutput
+from reinspection_vlm.reinspection_module import ReInspectionModule
+
+
+class Qwen3VLWithReInspection(nn.Module):
+    """Qwen3-VL-8B + Re-Inspection Module.
+
+    Instead of subclassing (which is fragile with HF internals),
+    we wrap the base model and override the forward flow by:
+      1. Running vision encoding + token embedding via the base model's internals
+      2. Injecting R tokens at the right position
+      3. Forwarding through the LLM
+    """
+
+    def __init__(self, config: ReInspectionConfig, base_model: Qwen3VLForConditionalGeneration):
+        super().__init__()
+        self.config = config
+        self.base_model = base_model
+        target_dtype = torch.bfloat16 if config.bf16 else torch.float32
+        self.reinspection = ReInspectionModule(config, dtype=target_dtype)
+
+        # Cache special token IDs
+        self._im_start_id = base_model.config.im_start_id if hasattr(base_model.config, 'im_start_id') else None
+        self._image_token_id = base_model.config.image_token_id
+        self._video_token_id = base_model.config.video_token_id
+
+        # Store last attention maps for visualization
+        self._last_attn_task = None
+        self._last_attn_vis = None
+
+    @property
+    def device(self):
+        return next(self.base_model.parameters()).device
+
+    @property
+    def dtype(self):
+        return next(self.base_model.parameters()).dtype
+
+    def _find_assistant_start_positions(self, input_ids: torch.LongTensor) -> torch.LongTensor:
+        """Find the position of the last <|im_start|> token in each sequence.
+
+        This is where we insert R tokens — right before <|im_start|>assistant.
+        Returns tensor of shape (B,) with insertion positions.
+        """
+        B, L = input_ids.shape
+
+        if self._im_start_id is not None:
+            mask = (input_ids == self._im_start_id)
+            has_match = mask.any(dim=1)
+            # Multiply by position indices; non-matches stay 0, take max
+            indices = mask.long() * torch.arange(L, device=input_ids.device).unsqueeze(0)
+            positions = indices.max(dim=1).values
+            positions[~has_match] = L
+        else:
+            positions = torch.full((B,), L, dtype=torch.long, device=input_ids.device)
+
+        return positions
+
+    def _compute_mrope_position_ids(
+        self,
+        input_ids: torch.LongTensor,
+        image_grid_thw: Optional[torch.LongTensor],
+        video_grid_thw: Optional[torch.LongTensor],
+        attention_mask: Optional[torch.Tensor],
+    ) -> Tuple[torch.LongTensor, torch.LongTensor]:
+        """Compute 3D MRoPE position IDs for Qwen3-VL.
+
+        Reimplements get_rope_index logic directly to be version-independent.
+        Returns position_ids (3, B, L) and rope_deltas (B, 1).
+        """
+        model = self.base_model.model
+        cfg = model.config
+        spatial_merge_size = cfg.vision_config.spatial_merge_size
+        image_token_id = cfg.image_token_id
+        video_token_id = cfg.video_token_id
+        vision_start_token_id = cfg.vision_start_token_id
+
+        if video_grid_thw is not None:
+            video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+            video_grid_thw = video_grid_thw.clone()
+            video_grid_thw[:, 0] = 1
+
+        B, L = input_ids.shape
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+
+        position_ids = torch.ones(3, B, L, dtype=torch.long, device=input_ids.device)
+        mrope_position_deltas = []
+        image_index, video_index = 0, 0
+
+        for i in range(B):
+            seq = input_ids[i][attention_mask[i] == 1]
+            input_tokens = seq.tolist()
+
+            vision_start_indices = (seq == vision_start_token_id).nonzero(as_tuple=True)[0]
+            vision_tokens = seq[vision_start_indices + 1] if len(vision_start_indices) else seq.new_empty(0)
+            image_nums = int((vision_tokens == image_token_id).sum())
+            video_nums = int((vision_tokens == video_token_id).sum())
+
+            llm_pos_ids_list: list = []
+            st = 0
+            remain_images, remain_videos = image_nums, video_nums
+
+            for _ in range(image_nums + video_nums):
+                ed_image = input_tokens.index(image_token_id, st) if image_token_id in input_tokens[st:] and remain_images > 0 else len(input_tokens) + 1
+                ed_video = input_tokens.index(video_token_id, st) if video_token_id in input_tokens[st:] and remain_videos > 0 else len(input_tokens) + 1
+
+                if ed_image < ed_video:
+                    t = image_grid_thw[image_index][0].item()
+                    h = image_grid_thw[image_index][1].item() // spatial_merge_size
+                    w = image_grid_thw[image_index][2].item() // spatial_merge_size
+                    image_index += 1
+                    remain_images -= 1
+                    ed = ed_image
+                else:
+                    t = video_grid_thw[video_index][0].item()
+                    h = video_grid_thw[video_index][1].item() // spatial_merge_size
+                    w = video_grid_thw[video_index][2].item() // spatial_merge_size
+                    video_index += 1
+                    remain_videos -= 1
+                    ed = ed_video
+
+                text_len = ed - st
+                st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
+                if text_len > 0:
+                    llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+                    st_idx = llm_pos_ids_list[-1].max() + 1
+
+                t_idx = torch.arange(t).view(-1, 1).expand(-1, h * w).flatten()
+                h_idx = torch.arange(h).view(1, -1, 1).expand(t, -1, w).flatten()
+                w_idx = torch.arange(w).view(1, 1, -1).expand(t, h, -1).flatten()
+                llm_pos_ids_list.append(torch.stack([t_idx, h_idx, w_idx]) + st_idx)
+                st = ed + t * h * w
+
+            if st < len(input_tokens):
+                st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
+                text_len = len(input_tokens) - st
+                llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+
+            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+            position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
+            mrope_position_deltas.append(llm_positions.max() + 1 - len(input_tokens))
+
+        rope_deltas = torch.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
+        return position_ids, rope_deltas
+
+    def _extract_vision_and_text(
+        self,
+        inputs_embeds: torch.FloatTensor,
+        input_ids: torch.LongTensor,
+        insert_positions: torch.LongTensor,
+        vision_mask: torch.BoolTensor = None,
+    ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.BoolTensor, torch.BoolTensor, torch.BoolTensor]:
+        """Extract vision tokens V and text tokens T from mixed inputs_embeds.
+
+        V = all tokens at image/video placeholder positions
+        T = all non-vision tokens up to the insert position (user message text)
+
+        Since vision tokens have been scattered in, we use the original input_ids
+        (or a pre-computed vision_mask) to identify which positions are vision vs text.
+
+        Returns V, T, vision_mask, V_mask, T_mask (masks for padding in V/T).
+        """
+        B, L, D = inputs_embeds.shape
+
+        # Build vision mask from input_ids (or use pre-computed mask)
+        if vision_mask is None:
+            vision_mask = (input_ids == self._image_token_id) | (input_ids == self._video_token_id)
+
+        # Extract V and T per batch element (variable lengths)
+        V_list = []
+        T_list = []
+        for b in range(B):
+            vis_positions = vision_mask[b].nonzero(as_tuple=False).squeeze(-1)
+            insert_pos = insert_positions[b].item()
+
+            # Text positions: non-vision positions before insert point
+            text_mask_b = ~vision_mask[b].clone()
+            text_mask_b[insert_pos:] = False  # only text up to insert point
+            text_positions = text_mask_b.nonzero(as_tuple=False).squeeze(-1)
+
+            V_list.append(inputs_embeds[b, vis_positions])  # (N_v_b, D)
+            T_list.append(inputs_embeds[b, text_positions])  # (N_t_b, D)
+
+        # Pad to max lengths for batching
+        max_v = max(v.shape[0] for v in V_list) if V_list else 1
+        max_t = max(t.shape[0] for t in T_list) if T_list else 1
+
+        V = torch.zeros(B, max_v, D, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        T = torch.zeros(B, max_t, D, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        V_mask = torch.zeros(B, max_v, dtype=torch.bool, device=inputs_embeds.device)
+        T_mask = torch.zeros(B, max_t, dtype=torch.bool, device=inputs_embeds.device)
+
+        for b in range(B):
+            nv = V_list[b].shape[0]
+            nt = T_list[b].shape[0]
+            V[b, :nv] = V_list[b]
+            T[b, :nt] = T_list[b]
+            V_mask[b, :nv] = True
+            T_mask[b, :nt] = True
+
+        return V, T, vision_mask, V_mask, T_mask
+
+    def _insert_tokens(
+        self,
+        inputs_embeds: torch.FloatTensor,
+        R: torch.FloatTensor,
+        insert_positions: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: Optional[torch.LongTensor],
+        labels: Optional[torch.LongTensor],
+        input_ids: Optional[torch.LongTensor],
+    ) -> dict:
+        """Insert R tokens into the sequence at insert_positions.
+
+        For each batch element b, inserts N_q tokens at position insert_positions[b].
+        Also extends attention_mask, position_ids, and labels accordingly.
+        """
+        B, L, D = inputs_embeds.shape
+        N_q = R.shape[1]
+        new_L = L + N_q
+
+        new_embeds = torch.zeros(B, new_L, D, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+
+        new_attention_mask = None
+        if attention_mask is not None:
+            new_attention_mask = torch.zeros(B, new_L, device=attention_mask.device, dtype=attention_mask.dtype)
+
+        new_labels = None
+        if labels is not None:
+            new_labels = torch.full((B, new_L), -100, device=labels.device, dtype=labels.dtype)
+
+        new_input_ids = None
+        if input_ids is not None:
+            new_input_ids = torch.zeros(B, new_L, device=input_ids.device, dtype=input_ids.dtype)
+
+        for b in range(B):
+            pos = insert_positions[b].item()
+
+            # Before insertion point
+            new_embeds[b, :pos] = inputs_embeds[b, :pos]
+            # R tokens
+            new_embeds[b, pos:pos + N_q] = R[b]
+            # After insertion point
+            new_embeds[b, pos + N_q:] = inputs_embeds[b, pos:]
+
+            if attention_mask is not None:
+                new_attention_mask[b, :pos] = attention_mask[b, :pos]
+                new_attention_mask[b, pos:pos + N_q] = 1  # R tokens are always attended to
+                new_attention_mask[b, pos + N_q:] = attention_mask[b, pos:]
+
+            if labels is not None:
+                new_labels[b, :pos] = labels[b, :pos]
+                # R token positions get -100 (ignored in loss)
+                new_labels[b, pos + N_q:] = labels[b, pos:]
+
+            if input_ids is not None:
+                new_input_ids[b, :pos] = input_ids[b, :pos]
+                # Use pad token or 0 for R positions in input_ids
+                new_input_ids[b, pos + N_q:] = input_ids[b, pos:]
+
+        # Handle position_ids: shape (4, B, L) for Qwen3-VL with MRoPE
+        new_position_ids = None
+        if position_ids is not None:
+            ndim = position_ids.ndim
+            if ndim == 3:
+                n_dims = position_ids.shape[0]  # 3 or 4
+                new_position_ids = torch.zeros(
+                    n_dims, B, new_L,
+                    device=position_ids.device, dtype=position_ids.dtype,
+                )
+                for b in range(B):
+                    pos = insert_positions[b].item()
+                    for d in range(n_dims):
+                        # Before insert
+                        new_position_ids[d, b, :pos] = position_ids[d, b, :pos]
+
+                        # R tokens: increment all MRoPE dims uniformly (same
+                        # as text tokens).  The previous code set h,w to 0
+                        # which created positional encodings the LLM had
+                        # never seen during pretraining.
+                        if pos > 0:
+                            last_pos = position_ids[d, b, pos - 1].item()
+                        else:
+                            last_pos = -1
+
+                        r_ids = torch.arange(N_q, device=position_ids.device) + last_pos + 1
+
+                        new_position_ids[d, b, pos:pos + N_q] = r_ids
+
+                        # After insert: shift ALL dims by N_q.
+                        # Text tokens use the same incrementing value for all 3
+                        # MRoPE dims (t, h, w), so all must advance uniformly.
+                        # Only text tokens exist after the insertion point
+                        # (assistant turn), so this is safe for vision dims too.
+                        after_ids = position_ids[d, b, pos:] + N_q
+                        new_position_ids[d, b, pos + N_q:] = after_ids
+            else:
+                # 2D position_ids (B, L) — simpler case
+                new_position_ids = torch.zeros(B, new_L, device=position_ids.device, dtype=position_ids.dtype)
+                for b in range(B):
+                    pos = insert_positions[b].item()
+                    new_position_ids[b, :pos] = position_ids[b, :pos]
+                    last_pos = position_ids[b, pos - 1].item() if pos > 0 else -1
+                    new_position_ids[b, pos:pos + N_q] = torch.arange(N_q, device=position_ids.device) + last_pos + 1
+                    new_position_ids[b, pos + N_q:] = position_ids[b, pos:] + N_q
+
+        return {
+            "inputs_embeds": new_embeds,
+            "attention_mask": new_attention_mask,
+            "position_ids": new_position_ids,
+            "labels": new_labels,
+            "input_ids": new_input_ids,
+        }
+
+    def _encode_vision_and_scatter(
+        self,
+        input_ids: torch.LongTensor,
+        inputs_embeds: torch.FloatTensor,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.FloatTensor, Optional[torch.Tensor], Optional[list]]:
+        """Encode vision features and scatter into inputs_embeds.
+
+        Returns:
+            inputs_embeds: updated with vision tokens scattered in
+            visual_pos_masks: bool mask of vision positions (for DeepStack)
+            deepstack_visual_embeds: list of deepstack features per layer
+        """
+        model = self.base_model.model
+        image_mask = None
+        video_mask = None
+        deepstack_image_embeds = None
+        deepstack_video_embeds = None
+
+        if pixel_values is not None:
+            image_outputs = model.get_image_features(
+                pixel_values, image_grid_thw, return_dict=True
+            )
+            image_embeds = image_outputs.pooler_output
+            deepstack_image_embeds = image_outputs.deepstack_features
+            image_embeds = torch.cat(image_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            image_mask, _ = model.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, image_features=image_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+
+        if pixel_values_videos is not None:
+            video_outputs = model.get_video_features(
+                pixel_values_videos, video_grid_thw, return_dict=True
+            )
+            video_embeds = video_outputs.pooler_output
+            deepstack_video_embeds = video_outputs.deepstack_features
+            video_embeds = torch.cat(video_embeds, dim=0).to(inputs_embeds.device, inputs_embeds.dtype)
+            _, video_mask = model.get_placeholder_mask(
+                input_ids, inputs_embeds=inputs_embeds, video_features=video_embeds
+            )
+            inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+        # Build visual_pos_masks and deepstack_visual_embeds
+        visual_pos_masks = None
+        deepstack_visual_embeds = None
+        if image_mask is not None and video_mask is not None:
+            img_m = image_mask[..., 0]
+            vid_m = video_mask[..., 0]
+            visual_pos_masks = img_m | vid_m
+            deepstack_visual_embeds = []
+            image_mask_joint = img_m[visual_pos_masks]
+            video_mask_joint = vid_m[visual_pos_masks]
+            for img_emb, vid_emb in zip(deepstack_image_embeds, deepstack_video_embeds):
+                embed_joint = img_emb.new_zeros(visual_pos_masks.sum(), img_emb.shape[-1])
+                embed_joint[image_mask_joint, :] = img_emb
+                embed_joint[video_mask_joint, :] = vid_emb
+                deepstack_visual_embeds.append(embed_joint)
+        elif image_mask is not None:
+            visual_pos_masks = image_mask[..., 0]
+            deepstack_visual_embeds = deepstack_image_embeds
+        elif video_mask is not None:
+            visual_pos_masks = video_mask[..., 0]
+            deepstack_visual_embeds = deepstack_video_embeds
+
+        return inputs_embeds, visual_pos_masks, deepstack_visual_embeds
+
+    def _expand_visual_pos_masks(
+        self,
+        visual_pos_masks: torch.Tensor,
+        insert_positions: torch.LongTensor,
+        new_L: int,
+    ) -> torch.Tensor:
+        """Expand visual_pos_masks to account for inserted R tokens.
+
+        R positions are NOT vision tokens, so they stay False.
+        """
+        B = visual_pos_masks.shape[0]
+        N_q = self.config.n_queries
+        new_mask = torch.zeros(B, new_L, device=visual_pos_masks.device, dtype=visual_pos_masks.dtype)
+        for b in range(B):
+            pos = insert_positions[b].item()
+            new_mask[b, :pos] = visual_pos_masks[b, :pos]
+            new_mask[b, pos + N_q:] = visual_pos_masks[b, pos:]
+        return new_mask
+
+    def _prepare_reinspection_inputs(
+        self,
+        input_ids: torch.LongTensor,
+        inputs_embeds: torch.FloatTensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: Optional[torch.LongTensor],
+        labels: Optional[torch.LongTensor],
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        need_weights: bool = False,
+    ) -> dict:
+        """Prepare inputs with vision encoding, reinspection, and token insertion.
+
+        Used by forward() for training. generate() uses a different approach
+        (placeholder tokens + forward hook) to preserve the base model's MRoPE
+        and DeepStack pipeline.
+        """
+        model = self.base_model.model
+
+        if inputs_embeds is None:
+            inputs_embeds = model.get_input_embeddings()(input_ids)
+
+        # Vision encoding + scatter
+        inputs_embeds, visual_pos_masks, deepstack_visual_embeds = self._encode_vision_and_scatter(
+            input_ids, inputs_embeds, pixel_values, pixel_values_videos,
+            image_grid_thw, video_grid_thw,
+        )
+
+        # Compute position_ids from the ORIGINAL sequence (before R insertion).
+        # We implement MRoPE computation directly to avoid get_rope_index API differences
+        # across transformers versions.
+        if position_ids is None:
+            position_ids, rope_deltas = self._compute_mrope_position_ids(
+                input_ids, image_grid_thw, video_grid_thw, attention_mask,
+            )
+            model.rope_deltas = rope_deltas
+
+        # Extract V, T and run reinspection
+        insert_positions = self._find_assistant_start_positions(input_ids)
+        V, T, _, V_mask, T_mask = self._extract_vision_and_text(inputs_embeds, input_ids, insert_positions)
+        R, A_task, A_vis = self.reinspection(
+            V, T, V_mask=V_mask, T_mask=T_mask, need_weights=need_weights,
+        )
+
+        if need_weights:
+            self._last_attn_task = A_task.detach().cpu()
+            self._last_attn_vis = A_vis.detach().cpu()
+        else:
+            self._last_attn_task = None
+            self._last_attn_vis = None
+
+        # Insert R tokens (extends inputs_embeds, attention_mask, position_ids, labels, input_ids)
+        inserted = self._insert_tokens(
+            inputs_embeds, R, insert_positions,
+            attention_mask, position_ids, labels, input_ids,
+        )
+
+        # Expand visual_pos_masks for inserted R tokens
+        if visual_pos_masks is not None:
+            visual_pos_masks = self._expand_visual_pos_masks(
+                visual_pos_masks, insert_positions, inserted["inputs_embeds"].shape[1],
+            )
+
+        return {
+            **inserted,
+            "visual_pos_masks": visual_pos_masks,
+            "deepstack_visual_embeds": deepstack_visual_embeds,
+            "A_task": A_task,
+            "A_vis": A_vis,
+        }
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values=None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        pixel_values: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.FloatTensor] = None,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        logits_to_keep: int = 0,
+        return_attn_maps: bool = False,
+        **kwargs,
+    ) -> ReInspectionOutput:
+        """Forward pass with Re-Inspection token injection."""
+        prepared = self._prepare_reinspection_inputs(
+            input_ids, inputs_embeds, attention_mask, position_ids, labels,
+            pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw,
+            need_weights=return_attn_maps,
+        )
+
+        outputs = self.base_model.model.language_model(
+            input_ids=None,
+            position_ids=prepared["position_ids"],
+            attention_mask=prepared["attention_mask"],
+            past_key_values=past_key_values,
+            inputs_embeds=prepared["inputs_embeds"],
+            cache_position=cache_position,
+            visual_pos_masks=prepared["visual_pos_masks"],
+            deepstack_visual_embeds=prepared["deepstack_visual_embeds"],
+            **kwargs,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        if logits_to_keep > 0:
+            logits = self.base_model.lm_head(hidden_states[:, -logits_to_keep:, :])
+        else:
+            logits = self.base_model.lm_head(hidden_states)
+
+        loss = None
+        if prepared["labels"] is not None:
+            loss = self.base_model.loss_function(
+                logits=logits,
+                labels=prepared["labels"],
+                vocab_size=self.base_model.config.text_config.vocab_size,
+            )
+
+        return ReInspectionOutput(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            rope_deltas=getattr(self.base_model.model, 'rope_deltas', None),
+            attn_task=prepared["A_task"] if return_attn_maps else None,
+            attn_vis=prepared["A_vis"] if return_attn_maps else None,
+        )
+
+    def get_attention_maps(self):
+        """Return the last computed attention maps for visualization."""
+        return self._last_attn_task, self._last_attn_vis
+
+    @torch.no_grad()
+    def generate(self, **kwargs):
+        """Generation with R token injection via forward hook.
+
+        Instead of pre-computing inputs_embeds and bypassing the base model's
+        vision pipeline (which breaks MRoPE and DeepStack), we:
+        1. Insert N_q placeholder tokens into input_ids before <|im_start|>assistant
+        2. Let the base model handle vision encoding, MRoPE, and DeepStack normally
+        3. Use a forward pre-hook on language_model to replace placeholder
+           embeddings with actual R tokens from the reinspection module
+
+        This ensures correct MRoPE spatial positions, DeepStack visual feature
+        injection, and proper KV cache state during autoregressive generation.
+        """
+        input_ids = kwargs.pop("input_ids", None)
+        pixel_values = kwargs.pop("pixel_values", None)
+        pixel_values_videos = kwargs.pop("pixel_values_videos", None)
+        image_grid_thw = kwargs.pop("image_grid_thw", None)
+        video_grid_thw = kwargs.pop("video_grid_thw", None)
+        attention_mask = kwargs.pop("attention_mask", None)
+        mm_token_type_ids = kwargs.pop("mm_token_type_ids", None)
+
+        if input_ids is None:
+            raise ValueError("input_ids is required for generate()")
+
+        N_q = self.config.n_queries
+        B, L = input_ids.shape
+        device = input_ids.device
+
+        # Find insertion point (before last <|im_start|>)
+        insert_positions = self._find_assistant_start_positions(input_ids)
+
+        # --- Build extended input_ids with N_q placeholder tokens ---
+        pad_id = getattr(self.base_model.config, 'pad_token_id', 0) or 0
+        new_L = L + N_q
+        new_input_ids = torch.full((B, new_L), pad_id, device=device, dtype=input_ids.dtype)
+        new_attention_mask = (
+            torch.ones(B, new_L, device=device, dtype=attention_mask.dtype)
+            if attention_mask is not None else None
+        )
+        new_mm = (
+            torch.zeros(B, new_L, device=device, dtype=mm_token_type_ids.dtype)
+            if mm_token_type_ids is not None else None
+        )
+
+        for b in range(B):
+            pos = insert_positions[b].item()
+            # Before insertion point — unchanged
+            new_input_ids[b, :pos] = input_ids[b, :pos]
+            # Placeholder positions stay as pad_id
+            # After insertion point — shifted by N_q
+            new_input_ids[b, pos + N_q:] = input_ids[b, pos:]
+
+            if attention_mask is not None:
+                new_attention_mask[b, :pos] = attention_mask[b, :pos]
+                new_attention_mask[b, pos:pos + N_q] = 1
+                new_attention_mask[b, pos + N_q:] = attention_mask[b, pos:]
+
+            if mm_token_type_ids is not None:
+                new_mm[b, :pos] = mm_token_type_ids[b, :pos]
+                # R positions are text-type (0) — already zeros
+                new_mm[b, pos + N_q:] = mm_token_type_ids[b, pos:]
+
+        # --- Hook: replace placeholder embeddings with R tokens ---
+        is_prefill = [True]
+
+        def _inject_reinspection(module, args, hook_kwargs):
+            if not is_prefill[0]:
+                return  # Only modify prefill, not autoregressive steps
+            is_prefill[0] = False
+
+            inputs_embeds = hook_kwargs['inputs_embeds']
+            visual_pos_masks = hook_kwargs.get('visual_pos_masks')
+
+            # Extract V (vision) and T (text before insertion point)
+            V, T, _, V_mask, T_mask = self._extract_vision_and_text(
+                inputs_embeds, None, insert_positions, vision_mask=visual_pos_masks,
+            )
+
+            # Run reinspection module
+            R, A_task, A_vis = self.reinspection(
+                V, T, V_mask=V_mask, T_mask=T_mask, need_weights=True,
+            )
+            self._last_attn_task = A_task.detach().cpu() if A_task is not None else None
+            self._last_attn_vis = A_vis.detach().cpu() if A_vis is not None else None
+
+            # Replace placeholder embeddings with R embeddings
+            new_embeds = inputs_embeds.clone()
+            for b in range(B):
+                pos = insert_positions[b].item()
+                new_embeds[b, pos:pos + N_q] = R[b]
+            hook_kwargs['inputs_embeds'] = new_embeds
+
+            return args, hook_kwargs
+
+        handle = self.base_model.model.language_model.register_forward_pre_hook(
+            _inject_reinspection, with_kwargs=True,
+        )
+
+        try:
+            gen_kwargs = dict(
+                input_ids=new_input_ids,
+                attention_mask=new_attention_mask,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                **kwargs,
+            )
+            if new_mm is not None:
+                gen_kwargs["mm_token_type_ids"] = new_mm
+
+            return self.base_model.generate(**gen_kwargs)
+        finally:
+            handle.remove()
+
+
+def load_model(config: ReInspectionConfig, device_map: str = "auto") -> Qwen3VLWithReInspection:
+    """Load Qwen3-VL-8B and wrap with Re-Inspection Module."""
+    base_model = Qwen3VLForConditionalGeneration.from_pretrained(
+        config.model_name_or_path,
+        torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
+        device_map=device_map,
+    )
+    return Qwen3VLWithReInspection(config, base_model)

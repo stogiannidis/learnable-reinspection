@@ -1,0 +1,88 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-stage2-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-stage2
+    spec:
+      containers:
+      - name: reinspection-stage2
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            mkdir -p logs outputs
+            bash reinspection_qwen3vl/scripts/run_stage2.sh 2>&1 | tee logs/qwen_stage2.log
+        terminationMessagePath: "/tmp/my-log"
+        terminationMessagePolicy: File
+        imagePullPolicy: "Always"
+        env:
+          - name: DATA_ROOT
+            value: "/data/datasets"
+          - name: OUTPUT_DIR
+            value: "outputs/qwen3vl"
+          - name: NUM_GPUS
+            value: "2"
+          - name: STAGE1_CKPT
+            value: "outputs/qwen3vl/stage1/epoch_5/reinspection_module.pt"
+          - name: WANDB_RUN_NAME
+            value: "stage2-spatial"
+          - name: HF_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: reinspection-secrets
+                key: HF_TOKEN
+          - name: WANDB_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: reinspection-secrets
+                key: WANDB_API_KEY
+          - name: USER
+            value: "stogian_ph"
+          - name: OMP_NUM_THREADS
+            value: "4"
+          - name: NCCL_P2P_DISABLE
+            value: "0"
+          - name: NCCL_IB_DISABLE
+            value: "1"
+        resources:
+          requests:
+            cpu: 16
+            memory: "128Gi"
+            nvidia.com/gpu: 2
+          limits:
+            cpu: 16
+            memory: "128Gi"
+            nvidia.com/gpu: 2
+        volumeMounts:
+          - mountPath: /dev/shm
+            name: dshm
+          - mountPath: /data
+            name: nfs
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 30545
+        runAsGroup: 4451
+        runAsNonRoot: true
+      volumes:
+      - emptyDir:
+          medium: Memory
+          sizeLimit: "64Gi"
+        name: dshm
+      - name: nfs
+        nfs:
+          server: 10.24.6.66
+          path: /
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
