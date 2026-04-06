@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import warnings
 from collections import defaultdict
 from dataclasses import asdict
@@ -54,6 +55,15 @@ BENCHMARK_CONFIGS = {
 
 # tqdm refresh and explicit acc line (both avoid per-instance log spam when tee'd to a file).
 EVAL_PROGRESS_LOG_INTERVAL = 200
+
+
+def _eval_tqdm_disable() -> bool:
+    """Skip tqdm bar when stderr is not a TTY (pipes, ``tee``, log files).
+
+    In those cases each refresh becomes a new log line (~once/sec with default
+    dynamic miniters). Rely on ``print`` every ``EVAL_PROGRESS_LOG_INTERVAL`` instead.
+    """
+    return not sys.stderr.isatty()
 
 
 def _repo_root() -> Path:
@@ -352,6 +362,8 @@ def load_condition_model(
                     model.reinspection.load_state_dict(state_dict)
                 model.reinspection.to(model.device)
                 lora_path = os.path.join(checkpoint_dir, "lora_weights")
+                if not os.path.exists(lora_path) and lora_checkpoint_dir:
+                    lora_path = os.path.join(lora_checkpoint_dir, "lora_weights")
                 if os.path.exists(lora_path):
                     model.base_model.model.language_model = PeftModel.from_pretrained(
                         model.base_model.model.language_model, lora_path
@@ -385,6 +397,8 @@ def load_condition_model(
                 model.reinspection.load_state_dict(state_dict)
             model.reinspection.to(model.device)
             lora_path = os.path.join(checkpoint_dir, "lora_weights")
+            if not os.path.exists(lora_path) and lora_checkpoint_dir:
+                lora_path = os.path.join(lora_checkpoint_dir, "lora_weights")
             if os.path.exists(lora_path):
                 model.base_model.model.language_model = PeftModel.from_pretrained(
                     model.base_model.model.language_model, lora_path
@@ -450,6 +464,7 @@ def evaluate_benchmark(
         desc=benchmark_name,
         miniters=EVAL_PROGRESS_LOG_INTERVAL,
         mininterval=1.0,
+        disable=_eval_tqdm_disable(),
     ):
         sample = ds.samples[i]
         gt_answer = sample["answer"]

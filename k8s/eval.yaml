@@ -69,4 +69,4 @@ spec:
           server: 10.24.6.66
           path: /
       nodeSelector:
-        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
+        nvidia.com/gpu.product: NVIDIA-H200

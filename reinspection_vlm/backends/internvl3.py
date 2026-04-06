@@ -285,6 +285,10 @@ class InternVL3WithReInspection(nn.Module):
             "input_ids": new_input_ids,
         }
 
+    def _nan_check(self, tensor: torch.Tensor, name: str, step: int) -> None:
+        if tensor is not None and torch.isnan(tensor).any():
+            raise RuntimeError(f"NaN detected in {name} at step {step}")
+
     def _encode_vision_and_scatter(
         self,
         input_ids: torch.LongTensor,
@@ -348,7 +352,7 @@ class InternVL3WithReInspection(nn.Module):
         self._nan_check(V, "V_extracted", step)
         self._nan_check(T, "T_extracted", step)
 
-        R, A_task, A_vis = self.reinspection(
+        R, A_task, A_vis, R_r = self.reinspection(
             V, T, V_mask=V_mask, T_mask=T_mask, need_weights=True,
         )
         self._nan_check(R, "R_tokens", step)
@@ -366,22 +370,8 @@ class InternVL3WithReInspection(nn.Module):
             "image_features": image_features,
             "A_task": A_task,
             "A_vis": A_vis,
+            "R_bottleneck": R_r,
         }
-
-    _nan_debug_steps: int = 5
-
-    def _nan_check(self, tensor: torch.Tensor, name: str, step: int):
-        if step < self._nan_debug_steps and tensor is not None:
-            has_nan = torch.isnan(tensor).any().item()
-            has_inf = torch.isinf(tensor).any().item()
-            if has_nan or has_inf:
-                import logging
-                logging.warning(
-                    f"NaN/Inf detected in {name}: nan={has_nan} inf={has_inf} "
-                    f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
-                    f"min={tensor[torch.isfinite(tensor)].min().item() if torch.isfinite(tensor).any() else 'N/A'} "
-                    f"max={tensor[torch.isfinite(tensor)].max().item() if torch.isfinite(tensor).any() else 'N/A'}"
-                )
 
     def forward(
         self,
@@ -399,16 +389,12 @@ class InternVL3WithReInspection(nn.Module):
         return_attn_maps: bool = False,
         **kwargs,
     ) -> ReInspectionOutput:
-        step = getattr(self, "_fwd_step", 0)
-        self._fwd_step = step + 1
-
         prepared = self._prepare_reinspection_inputs(
             input_ids, inputs_embeds, attention_mask, position_ids, labels,
             pixel_values, vision_feature_layer, vision_feature_select_strategy,
         )
 
         prepared["inputs_embeds"] = prepared["inputs_embeds"].to(self.base_model.dtype)
-        self._nan_check(prepared["inputs_embeds"], "prepared_embeds", step)
 
         outputs = self.base_model.model.language_model(
             position_ids=prepared["position_ids"],
@@ -420,24 +406,15 @@ class InternVL3WithReInspection(nn.Module):
         )
 
         hidden_states = outputs.last_hidden_state
-        self._nan_check(hidden_states, "lm_hidden_states", step)
 
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.base_model.lm_head(hidden_states[:, slice_indices, :])
-        self._nan_check(logits, "logits", step)
 
         loss = None
         if prepared["labels"] is not None:
             labels = prepared["labels"]
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            n_valid = (shift_labels != -100).sum().item()
-            if step < self._nan_debug_steps:
-                import logging
-                logging.warning(
-                    f"[nan_debug step={step}] n_valid_labels={n_valid} "
-                    f"shift_logits range=[{shift_logits.min().item():.4f}, {shift_logits.max().item():.4f}]"
-                )
             loss = _chunked_cross_entropy(shift_logits, shift_labels, ignore_index=-100)
 
         return ReInspectionOutput(
@@ -449,6 +426,7 @@ class InternVL3WithReInspection(nn.Module):
             image_hidden_states=prepared["image_features"],
             attn_task=prepared["A_task"] if return_attn_maps else None,
             attn_vis=prepared["A_vis"] if return_attn_maps else None,
+            R_bottleneck=prepared["R_bottleneck"] if return_attn_maps else None,
         )
 
     def get_attention_maps(self):

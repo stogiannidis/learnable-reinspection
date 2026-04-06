@@ -463,7 +463,7 @@ class Qwen3VLWithReInspection(nn.Module):
         # Extract V, T and run reinspection
         insert_positions = self._find_assistant_start_positions(input_ids)
         V, T, _, V_mask, T_mask = self._extract_vision_and_text(inputs_embeds, input_ids, insert_positions)
-        R, A_task, A_vis = self.reinspection(
+        R, A_task, A_vis, R_r = self.reinspection(
             V, T, V_mask=V_mask, T_mask=T_mask, need_weights=need_weights,
         )
 
@@ -492,6 +492,7 @@ class Qwen3VLWithReInspection(nn.Module):
             "deepstack_visual_embeds": deepstack_visual_embeds,
             "A_task": A_task,
             "A_vis": A_vis,
+            "R_bottleneck": R_r,
         }
 
     def forward(
@@ -551,6 +552,7 @@ class Qwen3VLWithReInspection(nn.Module):
             rope_deltas=getattr(self.base_model.model, 'rope_deltas', None),
             attn_task=prepared["A_task"] if return_attn_maps else None,
             attn_vis=prepared["A_vis"] if return_attn_maps else None,
+            R_bottleneck=prepared["R_bottleneck"] if return_attn_maps else None,
         )
 
     def get_attention_maps(self):
@@ -637,7 +639,7 @@ class Qwen3VLWithReInspection(nn.Module):
             )
 
             # Run reinspection module
-            R, A_task, A_vis = self.reinspection(
+            R, A_task, A_vis, _R_r = self.reinspection(
                 V, T, V_mask=V_mask, T_mask=T_mask, need_weights=True,
             )
             self._last_attn_task = A_task.detach().cpu() if A_task is not None else None
