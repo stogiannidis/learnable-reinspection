@@ -20,3 +20,4 @@ class ReInspectionOutput(ModelOutput):
     image_hidden_states: Optional[torch.FloatTensor] = None
     attn_task: Optional[torch.FloatTensor] = None
     attn_vis: Optional[torch.FloatTensor] = None
+    R_bottleneck: Optional[torch.FloatTensor] = None

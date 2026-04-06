@@ -169,7 +169,7 @@ class ReInspectionModule(nn.Module):
 
         A_task_out = A_task.mean(dim=1) if A_task is not None else None
         A_vis_out = A_vis.mean(dim=1) if A_vis is not None else None
-        return R, A_task_out, A_vis_out
+        return R, A_task_out, A_vis_out, R_r
 
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

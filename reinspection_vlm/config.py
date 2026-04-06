@@ -57,7 +57,9 @@ class ReInspectionConfig:
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
-    lora_target_modules: List[str] = field(default_factory=lambda: ["q_proj", "v_proj"])
+    lora_target_modules: List[str] = field(
+        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    )
 
     # ------------------------------------------------------------------ #
     # Stage 1                                                              #
@@ -73,6 +75,11 @@ class ReInspectionConfig:
     stage1_attn_loss_weight: float = 10.0
     stage1_train_projector: bool = False
     stage1_attn_loss_type: str = "focal"
+    stage1_aux_loss: str = "both"  # "attn" | "grounding" | "both"
+    stage1_grounding_loss_weight: float = 5.0
+    stage1_grounding_l1_weight: float = 5.0
+    stage1_grounding_giou_weight: float = 2.0
+    stage1_grounding_warmup_steps: int = 100
 
     # ------------------------------------------------------------------ #
     # Stage 2                                                              #

@@ -1,7 +1,7 @@
 # @package _global_
 backend: qwen3vl
 model_name_or_path: Qwen/Qwen3-VL-8B-Instruct
-deepspeed_config: reinspection_vlm/configs/qwen3vl/deepspeed_z3.json
+deepspeed_config: reinspection_vlm/configs/deepspeed_z3.json
 wandb_project: reinspection-qwen3vl
 
 # Re-Inspection Module
@@ -17,7 +17,7 @@ stage1_lr_module: 1.0e-4
 stage1_lr_merger: 1.0e-5
 stage1_epochs: 5
 stage1_batch_size: 8
-stage1_grad_accum: 8
+stage1_grad_accum: 16
 stage1_warmup_ratio: 0.03
 stage1_attn_loss_weight: 10.0
 stage1_attn_loss_type: focal
@@ -25,11 +25,13 @@ stage1_attn_loss_type: focal
 # Stage 2
 stage2_lr_module: 5.0e-5
 stage2_lr_lora: 2.0e-5
-stage2_epochs: 10
+stage2_epochs: 4
 stage2_batch_size: 8
-stage2_grad_accum: 8
+stage2_grad_accum: 16
 stage2_warmup_ratio: 0.03
-lora_r: 16
+lora_r: 8
+lora_alpha: 16
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
 
 # Data
 max_pixels: 1003520

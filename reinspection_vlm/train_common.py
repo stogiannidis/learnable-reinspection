@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoProcessor
 
 from reinspection_vlm.attn_loss import compute_attn_loss_focal, compute_attn_loss_kl
+from reinspection_vlm.bbox_head import BboxHead, compute_grounding_loss
 from reinspection_vlm.config import ReInspectionConfig
 from reinspection_vlm.data.refcoco import RefCOCODataset
 from reinspection_vlm.data.spatial_dataset import build_spatial_dataset
@@ -323,6 +324,12 @@ def _load_stage1_weights(model, checkpoint_path: str) -> None:
     model.reinspection.load_state_dict(state_dict)
 
 
+def _attach_bbox_head(model, config: ReInspectionConfig) -> None:
+    """Create and attach a BboxHead for Stage 1 grounding supervision."""
+    dtype = torch.bfloat16 if config.bf16 else torch.float32
+    model.bbox_head = BboxHead(config.d_bottleneck, dtype=dtype)
+
+
 def _setup_model_qwen_stage1(config: ReInspectionConfig):
     from reinspection_vlm.backends.qwen3vl import load_model
 
@@ -331,11 +338,11 @@ def _setup_model_qwen_stage1(config: ReInspectionConfig):
         param.requires_grad = False
     for param in model.reinspection.parameters():
         param.requires_grad = True
-    optimizer = torch.optim.AdamW(
-        model.reinspection.parameters(),
-        lr=config.stage1_lr_module,
-        weight_decay=0.01,
-    )
+    optim_groups = [{"params": list(model.reinspection.parameters()), "lr": config.stage1_lr_module}]
+    if config.stage1_aux_loss in ("grounding", "both"):
+        _attach_bbox_head(model, config)
+        optim_groups.append({"params": list(model.bbox_head.parameters()), "lr": config.stage1_lr_module})
+    optimizer = torch.optim.AdamW(optim_groups, weight_decay=0.01)
     return model, optimizer
 
 
@@ -382,6 +389,9 @@ def _setup_model_intern_stage1(config: ReInspectionConfig, processor):
     for parameter in model.reinspection.parameters():
         parameter.requires_grad = True
     optim_groups = [{"params": list(model.reinspection.parameters()), "lr": config.stage1_lr_module}]
+    if config.stage1_aux_loss in ("grounding", "both"):
+        _attach_bbox_head(model, config)
+        optim_groups.append({"params": list(model.bbox_head.parameters()), "lr": config.stage1_lr_module})
     if config.stage1_train_projector:
         for parameter in model.base_model.model.multi_modal_projector.parameters():
             parameter.requires_grad = True
@@ -478,6 +488,15 @@ def _save_checkpoint(ds_engine, save_dir: str, save_lora: bool = False) -> None:
                 unwrapped.reinspection.state_dict(),
                 os.path.join(save_dir, "reinspection_module.pt"),
             )
+    if hasattr(unwrapped, "bbox_head"):
+        bbox_params = list(unwrapped.bbox_head.parameters())
+        with deepspeed.zero.GatheredParameters(bbox_params, modifier_rank=0):
+            if is_main_process():
+                torch.save(
+                    unwrapped.bbox_head.state_dict(),
+                    os.path.join(save_dir, "bbox_head.pt"),
+                )
+
     if save_lora:
         lora_params = list(unwrapped.base_model.model.language_model.parameters())
         with deepspeed.zero.GatheredParameters(lora_params, modifier_rank=0):
@@ -564,6 +583,23 @@ def _stage1_attn_loss(config: ReInspectionConfig, outputs, batch, device):
         image_grid_thw=batch.get("image_grid_thw"),
         n_queries=config.n_queries,
     )
+
+
+def _stage1_grounding_loss(config, model, outputs, batch, device, global_step):
+    unwrapped = model.module if hasattr(model, "module") else model
+    if not hasattr(unwrapped, "bbox_head"):
+        return torch.zeros((), device=device)
+    if outputs.R_bottleneck is None or "bbox_norm" not in batch:
+        return torch.zeros((), device=device)
+    bbox_gt = batch["bbox_norm"].to(device)
+    bbox_pred = unwrapped.bbox_head(outputs.R_bottleneck)
+    warmup = min(1.0, global_step / max(1, config.stage1_grounding_warmup_steps))
+    loss = compute_grounding_loss(
+        bbox_pred, bbox_gt,
+        l1_weight=config.stage1_grounding_l1_weight,
+        giou_weight=config.stage1_grounding_giou_weight,
+    )
+    return loss * warmup
 
 
 def _compute_grad_norm(model) -> float:
@@ -722,6 +758,9 @@ def run_training(config: ReInspectionConfig) -> None:
         "dataset/num_workers": num_workers,
     }, step=0)
 
+    use_attn = is_stage1 and config.stage1_aux_loss in ("attn", "both")
+    use_grounding = is_stage1 and config.stage1_aux_loss in ("grounding", "both")
+
     model.train()
     global_step = 0
     update_step = 0
@@ -735,6 +774,7 @@ def run_training(config: ReInspectionConfig) -> None:
         epoch_loss = 0.0
         epoch_ce = 0.0
         epoch_attn = 0.0
+        epoch_grounding = 0.0
 
         for step, batch in enumerate(train_loader):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
@@ -748,10 +788,15 @@ def run_training(config: ReInspectionConfig) -> None:
                 ce_loss = torch.tensor(0.0, device=device)
 
             attn_loss = torch.zeros((), device=device)
-            if is_stage1:
+            grounding_loss = torch.zeros((), device=device)
+            if use_attn:
                 attn_loss = _stage1_attn_loss(config, outputs, batch, device)
+            if use_grounding:
+                grounding_loss = _stage1_grounding_loss(config, model, outputs, batch, device, global_step)
 
-            loss = ce_loss + (config.stage1_attn_loss_weight * attn_loss if is_stage1 else 0.0)
+            loss = ce_loss \
+                + (config.stage1_attn_loss_weight * attn_loss if use_attn else 0.0) \
+                + (config.stage1_grounding_loss_weight * grounding_loss if use_grounding else 0.0)
             micro_loss = loss / grad_accum
 
             _finite = torch.tensor(float(torch.isfinite(loss)), device=device)
@@ -760,7 +805,8 @@ def run_training(config: ReInspectionConfig) -> None:
             if _finite.item() < 0.5:
                 log(
                     f"[WARNING] Non-finite loss={loss.item():.4f} "
-                    f"(ce={ce_loss.item():.4f}, attn={attn_loss.item():.4f}) "
+                    f"(ce={ce_loss.item():.4f}, attn={attn_loss.item():.4f}, "
+                    f"grounding={grounding_loss.item():.4f}) "
                     f"at global_step={global_step}, skipping batch"
                 )
                 global_step += 1
@@ -775,6 +821,7 @@ def run_training(config: ReInspectionConfig) -> None:
             epoch_loss += loss.item()
             epoch_ce += ce_loss.item()
             epoch_attn += attn_loss.item()
+            epoch_grounding += grounding_loss.item()
             global_step += 1
 
             lr = scheduler.get_last_lr()[0] if update_step > 0 else optimizer.param_groups[0]["lr"]
@@ -783,8 +830,10 @@ def run_training(config: ReInspectionConfig) -> None:
                 f"{pfx}/train/ce_loss": ce_loss.item(),
                 f"{pfx}/train/lr": lr,
             }
-            if is_stage1:
+            if use_attn:
                 metrics[f"{pfx}/train/attn_loss"] = attn_loss.item()
+            if use_grounding:
+                metrics[f"{pfx}/train/grounding_loss"] = grounding_loss.item()
 
             if (step + 1) % grad_accum == 0:
                 metrics[f"{pfx}/train/grad_norm"] = _compute_grad_norm(model)
@@ -798,8 +847,10 @@ def run_training(config: ReInspectionConfig) -> None:
 
             if global_step % 1000 == 0:
                 msg = f"Epoch {epoch + 1} Step {global_step}: loss={loss.item():.4f} ce={ce_loss.item():.4f}"
-                if is_stage1:
+                if use_attn:
                     msg += f" attn={attn_loss.item():.4f}"
+                if use_grounding:
+                    msg += f" ground={grounding_loss.item():.4f}"
                 msg += f" lr={lr:.2e}"
                 log("  " + msg)
 
@@ -810,13 +861,20 @@ def run_training(config: ReInspectionConfig) -> None:
             f"{pfx}/epoch/ce_loss": epoch_ce / num_steps,
             f"{pfx}/epoch/epoch": epoch + 1,
         }
-        if is_stage1:
+        if use_attn:
             summary[f"{pfx}/epoch/attn_loss"] = epoch_attn / num_steps
+        if use_grounding:
+            summary[f"{pfx}/epoch/grounding_loss"] = epoch_grounding / num_steps
         _log_wandb(summary, global_step)
 
+        aux_msg = ""
+        if use_attn:
+            aux_msg += f" attn={epoch_attn / num_steps:.4f}"
+        if use_grounding:
+            aux_msg += f" ground={epoch_grounding / num_steps:.4f}"
         log(
             f"Epoch {epoch + 1}/{n_epochs}: loss={avg_epoch_loss:.4f} ce={epoch_ce / num_steps:.4f}"
-            + (f" attn={epoch_attn / num_steps:.4f}" if is_stage1 else "")
+            + aux_msg
         )
 
         save_dir = os.path.join(config.output_dir, backend, f"stage{stage}", f"epoch_{epoch + 1}")
