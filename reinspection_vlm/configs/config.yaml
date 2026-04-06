@@ -1,6 +1,7 @@
 defaults:
   - backend: internvl3
   - stage: stage1
+  - hydra/job_logging: disabled
   - _self_
 
 hydra:
