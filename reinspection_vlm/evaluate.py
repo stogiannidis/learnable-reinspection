@@ -1,4 +1,4 @@
-"""Unified spatial-benchmark evaluation for Qwen3-VL and InternVL3 backends.
+"""Unified spatial-benchmark evaluation for Qwen3-VL, Qwen2.5-VL, InternVL3 and Gemma4 backends.
 
 Entry point is Hydra-only: ``python -m reinspection_vlm.evaluate stage=eval [overrides]``.
 """
@@ -19,13 +19,20 @@ import torch
 from peft import PeftModel
 from PIL import Image
 from tqdm import tqdm
-from transformers import AutoProcessor, InternVLForConditionalGeneration, Qwen3VLForConditionalGeneration
+from transformers import (
+    AutoProcessor,
+    InternVLForConditionalGeneration,
+    Qwen3VLForConditionalGeneration,
+    Qwen2_5_VLForConditionalGeneration,
+    Gemma4ForConditionalGeneration,
+)
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
 from reinspection_vlm.config import ReInspectionConfig
 from reinspection_vlm.data.chat_template import build_chat_messages as intern_build_chat
+from reinspection_vlm.data.gemma4_chat import build_chat_messages as gemma4_build_chat
 from reinspection_vlm.data.spatial_dataset import SpatialVQADataset
 from reinspection_vlm.data.utils import build_chat_messages as qwen_build_chat
 from reinspection_vlm.hydra_util import strip_deepspeed_local_rank_argv
@@ -340,44 +347,8 @@ def load_condition_model(
     checkpoint_dir: Optional[str] = None,
     lora_checkpoint_dir: Optional[str] = None,
 ):
-    if backend == "qwen3vl":
-        from reinspection_vlm.backends.qwen3vl import load_model as load_qwen_ri
-
-        if condition == "reinspection":
-            model = load_qwen_ri(config, device_map="auto")
-            if checkpoint_dir:
-                path = os.path.join(checkpoint_dir, "reinspection_module.pt")
-                if os.path.exists(path):
-                    state_dict = torch.load(path, map_location="cpu", weights_only=True)
-                    model.reinspection.load_state_dict(state_dict)
-                model.reinspection.to(model.device)
-                lora_path = os.path.join(checkpoint_dir, "lora_weights")
-                if os.path.exists(lora_path):
-                    model.base_model.model.language_model = PeftModel.from_pretrained(
-                        model.base_model.model.language_model, lora_path
-                    )
-            return model, True
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            config.model_name_or_path,
-            torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
-            device_map="auto",
-        )
-        if condition == "lora_only":
-            ckpt = lora_checkpoint_dir or checkpoint_dir
-            if ckpt is None:
-                raise ValueError("lora_only requires --checkpoint_dir or --lora_checkpoint_dir")
-            lora_path = os.path.join(ckpt, "lora_weights")
-            if not os.path.exists(lora_path):
-                raise FileNotFoundError(f"LoRA weights not found: {lora_path}")
-            model.model.language_model = PeftModel.from_pretrained(
-                model.model.language_model, lora_path
-            )
-        return model, False
-
-    from reinspection_vlm.backends.internvl3 import load_model as load_intern_ri
-
-    if condition == "reinspection":
-        model = load_intern_ri(config, device_map="auto", processor=processor)
+    def _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir):
+        """Load reinspection weights and optional LoRA into a *WithReInspection wrapper."""
         if checkpoint_dir:
             path = os.path.join(checkpoint_dir, "reinspection_module.pt")
             if os.path.exists(path):
@@ -385,10 +356,77 @@ def load_condition_model(
                 model.reinspection.load_state_dict(state_dict)
             model.reinspection.to(model.device)
             lora_path = os.path.join(checkpoint_dir, "lora_weights")
+            if not os.path.exists(lora_path) and lora_checkpoint_dir:
+                lora_path = os.path.join(lora_checkpoint_dir, "lora_weights")
             if os.path.exists(lora_path):
                 model.base_model.model.language_model = PeftModel.from_pretrained(
                     model.base_model.model.language_model, lora_path
                 )
+
+    def _load_lora_only(base_model, checkpoint_dir, lora_checkpoint_dir):
+        ckpt = lora_checkpoint_dir or checkpoint_dir
+        if ckpt is None:
+            raise ValueError("lora_only requires --checkpoint_dir or --lora_checkpoint_dir")
+        lora_path = os.path.join(ckpt, "lora_weights")
+        if not os.path.exists(lora_path):
+            raise FileNotFoundError(f"LoRA weights not found: {lora_path}")
+        base_model.model.language_model = PeftModel.from_pretrained(
+            base_model.model.language_model, lora_path
+        )
+
+    if backend == "qwen3vl":
+        from reinspection_vlm.backends.qwen3vl import load_model as load_qwen_ri
+
+        if condition == "reinspection":
+            model = load_qwen_ri(config, device_map="auto")
+            _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir)
+            return model, True
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            config.model_name_or_path,
+            torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
+            device_map="auto",
+        )
+        if condition == "lora_only":
+            _load_lora_only(model, checkpoint_dir, lora_checkpoint_dir)
+        return model, False
+
+    if backend == "qwen25vl":
+        from reinspection_vlm.backends.qwen25vl import load_model as load_qwen25_ri
+
+        if condition == "reinspection":
+            model = load_qwen25_ri(config, device_map="auto")
+            _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir)
+            return model, True
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            config.model_name_or_path,
+            torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
+            device_map="auto",
+        )
+        if condition == "lora_only":
+            _load_lora_only(model, checkpoint_dir, lora_checkpoint_dir)
+        return model, False
+
+    if backend == "gemma4":
+        from reinspection_vlm.backends.gemma4 import load_model as load_gemma4_ri
+
+        if condition == "reinspection":
+            model = load_gemma4_ri(config, device_map="auto", processor=processor)
+            _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir)
+            return model, True
+        model = Gemma4ForConditionalGeneration.from_pretrained(
+            config.model_name_or_path,
+            torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
+            device_map="auto",
+        )
+        if condition == "lora_only":
+            _load_lora_only(model, checkpoint_dir, lora_checkpoint_dir)
+        return model, False
+
+    from reinspection_vlm.backends.internvl3 import load_model as load_intern_ri
+
+    if condition == "reinspection":
+        model = load_intern_ri(config, device_map="auto", processor=processor)
+        _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir)
         return model, True
 
     model = InternVLForConditionalGeneration.from_pretrained(
@@ -397,13 +435,7 @@ def load_condition_model(
         device_map="auto",
     )
     if condition == "lora_only":
-        ckpt = lora_checkpoint_dir or checkpoint_dir
-        if ckpt is None:
-            raise ValueError("lora_only evaluation requires --checkpoint_dir or --lora_checkpoint_dir")
-        lora_path = os.path.join(ckpt, "lora_weights")
-        if not os.path.exists(lora_path):
-            raise FileNotFoundError(f"LoRA weights not found: {lora_path}")
-        model.model.language_model = PeftModel.from_pretrained(model.model.language_model, lora_path)
+        _load_lora_only(model, checkpoint_dir, lora_checkpoint_dir)
     return model, False
 
 
@@ -444,6 +476,10 @@ def evaluate_benchmark(
     model.eval()
 
     from reinspection_vlm.backends.internvl3 import InternVL3WithReInspection
+    from reinspection_vlm.backends.gemma4 import Gemma4WithReInspection
+
+    _QWEN_BACKENDS = ("qwen3vl", "qwen25vl")
+    _PROMPT_LEN_BACKENDS = ("internvl3", "gemma4")
 
     for i in tqdm(
         range(n),
@@ -461,7 +497,7 @@ def evaluate_benchmark(
             continue
 
         try:
-            if backend == "qwen3vl":
+            if backend in _QWEN_BACKENDS:
                 messages = qwen_build_chat(question, image_path=image_path)
                 text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                 inputs = processor(
@@ -470,6 +506,18 @@ def evaluate_benchmark(
                     return_tensors="pt",
                     max_pixels=config.max_pixels,
                     min_pixels=config.min_pixels,
+                )
+            elif backend == "gemma4":
+                messages = gemma4_build_chat(
+                    question=question,
+                    image_path=image_path,
+                    system_prompt=config.system_prompt,
+                )
+                text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                inputs = processor(
+                    text=[text],
+                    images=[image_path],
+                    return_tensors="pt",
                 )
             else:
                 messages = intern_build_chat(
@@ -499,16 +547,15 @@ def evaluate_benchmark(
             **_generate_extra_kw(processor),
         )
 
-        if backend == "qwen3vl":
+        if backend in _QWEN_BACKENDS:
             if is_reinspection:
                 input_len = inputs["input_ids"].shape[1] + config.n_queries
             else:
                 input_len = inputs["input_ids"].shape[1]
+        elif hasattr(model, "last_generation_prompt_lengths") and model.last_generation_prompt_lengths is not None:
+            input_len = int(model.last_generation_prompt_lengths[0].item())
         else:
-            if isinstance(model, InternVL3WithReInspection) and model.last_generation_prompt_lengths is not None:
-                input_len = int(model.last_generation_prompt_lengths[0].item())
-            else:
-                input_len = int(inputs["input_ids"].shape[1])
+            input_len = int(inputs["input_ids"].shape[1])
 
         generated_text = processor.batch_decode(
             generated_ids[:, input_len:],
@@ -561,6 +608,10 @@ def main(cfg: DictConfig) -> None:
         from reinspection_vlm.backends.internvl3 import load_processor
 
         processor = load_processor(config)
+    elif backend == "gemma4":
+        from reinspection_vlm.backends.gemma4 import load_processor as load_gemma4_proc
+
+        processor = load_gemma4_proc(config)
     else:
         processor = AutoProcessor.from_pretrained(
             config.model_name_or_path,

@@ -70,9 +70,10 @@ class ReInspectionConfig:
     stage1_grad_accum: int = 8
     stage1_warmup_ratio: float = 0.03
     stage1_warmup_steps: Optional[int] = None
-    stage1_attn_loss_weight: float = 10.0
+    stage1_attn_loss_weight: float = 1.0
     stage1_train_projector: bool = False
     stage1_attn_loss_type: str = "focal"
+    stage1_aux_loss: Optional[str] = None  # None | "attn" | "grounding" | "both"
 
     # ------------------------------------------------------------------ #
     # Stage 2                                                              #

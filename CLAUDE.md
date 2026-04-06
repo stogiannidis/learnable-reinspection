@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Learnable Re-Inspection: a two-stage cross-attention module that injects task-conditioned "R tokens" into a vision-language model (Qwen3-VL-8B) to improve spatial reasoning. The module operates in a bottleneck dimension (d_r=256) and is inserted between the user message and assistant response in the chat template.
+Learnable Re-Inspection: a two-stage cross-attention module that injects task-conditioned "R tokens" into a vision-language model to improve spatial reasoning. The module operates in a bottleneck dimension and is inserted between the user message and assistant response in the chat template. Supported VLM backends: Qwen3-VL-8B, Qwen2.5-VL-7B, InternVL3-8B, and Gemma 4 (12B).
 
 ## Commands
 
@@ -16,7 +16,7 @@ bash poc/scripts/run_poc.sh
 ```
 
 ### Unified VLM package (`reinspection_vlm/`)
-Implementation is consolidated in `reinspection_vlm/`: shared `ReInspectionModule`, `train_common.py`, `evaluate.py`, and backend-specific wrappers under `reinspection_vlm/backends/` (`qwen3vl.py`, `internvl3.py`). Training and eval use **Hydra**: compose `reinspection_vlm/configs/config.yaml` with config groups `backend/` (`qwen3vl`, `internvl3`) and `stage/` (`stage1`, `stage2`, `eval`). DeepSpeed JSON configs remain under `reinspection_vlm/configs/{qwen3vl,internvl3}/`.
+Implementation is consolidated in `reinspection_vlm/`: shared `ReInspectionModule`, `train_common.py`, `evaluate.py`, and backend-specific wrappers under `reinspection_vlm/backends/` (`qwen3vl.py`, `qwen25vl.py`, `internvl3.py`, `gemma4.py`). Training and eval use **Hydra**: compose `reinspection_vlm/configs/config.yaml` with config groups `backend/` (`qwen3vl`, `qwen25vl`, `internvl3`, `gemma4`) and `stage/` (`stage1`, `stage2`, `eval`). DeepSpeed JSON configs are under `reinspection_vlm/configs/`.
 
 ```bash
 pip install -r reinspection_vlm/requirements.txt
@@ -28,9 +28,12 @@ bash reinspection_vlm/scripts/run_eval.sh
 
 # Examples
 deepspeed --module reinspection_vlm.train stage=stage1 backend=qwen3vl data_root=/path/to/data
+deepspeed --module reinspection_vlm.train stage=stage1 backend=qwen25vl data_root=/path/to/data
+deepspeed --module reinspection_vlm.train stage=stage1 backend=gemma4 data_root=/path/to/data
 deepspeed --module reinspection_vlm.train stage=stage1 backend=internvl3_legacy   # older InternVL checkpoint geometry
 # Reference copies: reinspection_vlm/config_archive/internvl3/stage1_legacy.yaml, stage2_legacy.yaml
 deepspeed --module reinspection_vlm.train stage=stage2 stage1_checkpoint=models/internvl3/stage1/epoch_5/reinspection_module.pt
+python -m reinspection_vlm.evaluate stage=eval backend=gemma4 checkpoint_dir=models/gemma4/stage2/epoch_4 data_root=/path/to/data
 python -m reinspection_vlm.evaluate stage=eval checkpoint_dir=models/internvl3/stage2/epoch_4 data_root=/path/to/data
 
 # Attention visualization (Qwen)
@@ -49,18 +52,25 @@ Two-stage cross-attention in bottleneck d_r=256:
 - **Stage 2 (visual re-inspection):** `CrossAttn(Q^1, W_down_v(V))` → R_r
 - `R = W_up(R_r)` projected back to d_model=4096
 
-Key components: `W_down_t`, `W_down_v` (4096→256), `W_up` (256→4096), N_q=32 learnable queries, 4 attention heads. Returns R tokens plus attention maps (A_task, A_vis) for interpretability and L_attn supervision.
+Key components: `W_down_t`, `W_down_v` (d_model→d_bottleneck), `W_up` (d_bottleneck→d_model), N_q learnable queries, multi-head attention. Returns R tokens plus attention maps (A_task, A_vis) for interpretability and L_attn supervision.
 
-### Qwen3VLWithReInspection (`reinspection_vlm/backends/qwen3vl.py`)
-Wraps `Qwen3VLForConditionalGeneration` (not subclassed). Forward flow:
+### Backend wrappers (`reinspection_vlm/backends/`)
+Each backend wraps its base HF model (not subclassed) and follows the same flow:
 1. Embed input_ids, encode vision features via ViT, scatter into embeddings
-2. Find last `<|im_start|>` position (before assistant turn)
+2. Find the insert point (before assistant turn marker)
 3. Extract V (vision tokens) and T (text tokens before insert point)
 4. Run `ReInspectionModule(V, T)` → R tokens
-5. Insert R tokens at the found position, extending attention_mask, position_ids (MRoPE: text dim incrementing, spatial dims=0), and labels (-100 for R positions)
-6. Forward through LLM, compute CE loss
+5. Insert R tokens, extending attention_mask, position_ids, and labels
+6. Forward through LLM, compute loss
 
-The `generate()` method follows the same injection during prefill.
+| Backend | Wrapper class | d_model | Position encoding | Chat template |
+|---|---|---|---|---|
+| `qwen3vl` | `Qwen3VLWithReInspection` | 4096 | 3D MRoPE | `<\|im_start\|>` / `<\|im_end\|>` |
+| `qwen25vl` | `Qwen25VLWithReInspection` | 3584 | 3D MRoPE | `<\|im_start\|>` / `<\|im_end\|>` |
+| `internvl3` | `InternVL3WithReInspection` | 4096 | 1D RoPE | InternVL chat template |
+| `gemma4` | `Gemma4WithReInspection` | 3840 | 1D RoPE + 2D vision | `<start_of_turn>` / `<end_of_turn>` |
+
+Qwen backends use a forward pre-hook for `generate()` (placeholder → R replacement). InternVL3 and Gemma4 pre-build `inputs_embeds` and pass them directly.
 
 ### Training pipeline (`reinspection_vlm/train.py` + Hydra)
 - **Stage 1:** Freeze backbone; train reinspection (and optionally InternVL projector). Loss = L_CE + λ·L_attn. Qwen uses focal loss with diversified bbox targets (`stage1_attn_loss_type: focal`); InternVL defaults to KL (`stage1_attn_loss_type: kl`).
@@ -68,9 +78,9 @@ The `generate()` method follows the same injection during prefill.
 - DeepSpeed (ZeRO per `reinspection_vlm/configs/*/deepspeed_*.json`). Checkpoints save under `{output_dir}/{backend}/stage{N}/epoch_{E}/` (default `output_dir=models`): `reinspection_module.pt` and optionally `lora_weights/`.
 
 ### Data (`reinspection_vlm/data/`)
-- `RefCOCODataset`: Stage 1; `backend='qwen3vl'|'internvl3'` selects processor/chat and bbox→patch supervision.
+- `RefCOCODataset`: Stage 1; `backend='qwen3vl'|'qwen25vl'|'internvl3'|'gemma4'` selects processor/chat and bbox→patch supervision.
 - `SpatialVQADataset` / `build_spatial_dataset()`: Stage 2 spatial VQA; same `backend` flag.
-- Qwen chat helpers: `data/utils.py`; InternVL: `data/chat_template.py`.
+- Qwen chat helpers: `data/utils.py`; InternVL: `data/chat_template.py`; Gemma4: `data/gemma4_chat.py`.
 
 ### Config (`reinspection_vlm/config.py`)
 Single `ReInspectionConfig` dataclass (union of Qwen + InternVL fields). Defaults come from Hydra (`configs/config.yaml` + `backend/*.yaml` + `stage/*.yaml`); override on the command line (`key=value`) or add YAML under those groups.

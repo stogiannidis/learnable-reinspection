@@ -431,6 +431,112 @@ def _setup_model_intern_stage2(config: ReInspectionConfig, processor, stage1_che
     return model, optimizer
 
 
+# ---- Qwen2.5-VL setup (same architecture as Qwen3VL) ----
+
+def _setup_model_qwen25_stage1(config: ReInspectionConfig):
+    from reinspection_vlm.backends.qwen25vl import load_model
+
+    model = load_model(config, device_map=None)
+    for param in model.base_model.parameters():
+        param.requires_grad = False
+    for param in model.reinspection.parameters():
+        param.requires_grad = True
+    optimizer = torch.optim.AdamW(
+        model.reinspection.parameters(),
+        lr=config.stage1_lr_module,
+        weight_decay=0.01,
+    )
+    return model, optimizer
+
+
+def _setup_model_qwen25_stage2(config: ReInspectionConfig):
+    from reinspection_vlm.backends.qwen25vl import load_model
+
+    model = load_model(config, device_map=None)
+    if config.stage1_checkpoint:
+        log(f"Loading Stage 1 checkpoint: {config.stage1_checkpoint}")
+        _load_stage1_weights(model, config.stage1_checkpoint)
+    for param in model.base_model.parameters():
+        param.requires_grad = False
+    for param in model.reinspection.parameters():
+        param.requires_grad = True
+    lora_config = LoraConfig(
+        r=config.lora_r,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+        target_modules=config.lora_target_modules,
+        bias="none",
+        task_type="FEATURE_EXTRACTION",
+    )
+    model.base_model.model.language_model = get_peft_model(
+        model.base_model.model.language_model, lora_config
+    )
+    reinspection_params = list(model.reinspection.parameters())
+    lora_params = [p for _, p in model.base_model.named_parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": reinspection_params, "lr": config.stage2_lr_module},
+            {"params": lora_params, "lr": config.stage2_lr_lora},
+        ],
+        weight_decay=0.01,
+    )
+    return model, optimizer
+
+
+# ---- Gemma4 setup ----
+
+def _setup_model_gemma4_stage1(config: ReInspectionConfig, processor):
+    from reinspection_vlm.backends.gemma4 import load_model
+
+    model = load_model(config, device_map=None, processor=processor)
+    for parameter in model.base_model.parameters():
+        parameter.requires_grad = False
+    for parameter in model.reinspection.parameters():
+        parameter.requires_grad = True
+    optimizer = torch.optim.AdamW(
+        model.reinspection.parameters(),
+        lr=config.stage1_lr_module,
+        weight_decay=0.01,
+    )
+    return model, optimizer
+
+
+def _setup_model_gemma4_stage2(config: ReInspectionConfig, processor, stage1_checkpoint: Optional[str]):
+    from reinspection_vlm.backends.gemma4 import load_model
+
+    model = load_model(config, device_map=None, processor=processor)
+    if stage1_checkpoint:
+        _load_stage1_weights(model, stage1_checkpoint)
+    for parameter in model.base_model.parameters():
+        parameter.requires_grad = False
+    for parameter in model.reinspection.parameters():
+        parameter.requires_grad = True
+    lora_config = LoraConfig(
+        r=config.lora_r,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+        target_modules=config.lora_target_modules,
+        bias="none",
+        task_type=TaskType.FEATURE_EXTRACTION,
+    )
+    model.base_model.model.language_model = get_peft_model(
+        model.base_model.model.language_model,
+        lora_config,
+    )
+    reinspection_params = list(model.reinspection.parameters())
+    lora_params = [
+        param for _, param in model.base_model.model.language_model.named_parameters() if param.requires_grad
+    ]
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": reinspection_params, "lr": config.stage2_lr_module},
+            {"params": lora_params, "lr": config.stage2_lr_lora},
+        ],
+        weight_decay=0.01,
+    )
+    return model, optimizer
+
+
 def _build_dataset(
     backend: str,
     stage: int,
@@ -543,9 +649,12 @@ def _train_forward_kwargs(batch: dict, backend: str, is_stage1: bool) -> dict:
         "labels": batch["labels"],
         "return_attn_maps": is_stage1,
     }
-    if backend == "qwen3vl":
+    if backend in ("qwen3vl", "qwen25vl"):
         fwd["image_grid_thw"] = batch.get("image_grid_thw")
         fwd["video_grid_thw"] = batch.get("video_grid_thw")
+    elif backend == "gemma4":
+        fwd["image_position_ids"] = batch.get("image_position_ids")
+        fwd["mm_token_type_ids"] = batch.get("mm_token_type_ids")
     return fwd
 
 
@@ -637,6 +746,10 @@ def run_training(config: ReInspectionConfig) -> None:
         from reinspection_vlm.backends.internvl3 import load_processor
 
         processor = load_processor(config)
+    elif backend == "gemma4":
+        from reinspection_vlm.backends.gemma4 import load_processor as load_gemma4_proc
+
+        processor = load_gemma4_proc(config)
     _init_wandb(config)
 
     if backend == "qwen3vl":
@@ -644,6 +757,18 @@ def run_training(config: ReInspectionConfig) -> None:
             model, optimizer = _setup_model_qwen_stage1(config)
         else:
             model, optimizer = _setup_model_qwen_stage2(config)
+    elif backend == "qwen25vl":
+        if is_stage1:
+            model, optimizer = _setup_model_qwen25_stage1(config)
+        else:
+            model, optimizer = _setup_model_qwen25_stage2(config)
+    elif backend == "gemma4":
+        if is_stage1:
+            model, optimizer = _setup_model_gemma4_stage1(config, processor)
+        else:
+            model, optimizer = _setup_model_gemma4_stage2(
+                config, processor, config.stage1_checkpoint
+            )
     else:
         if is_stage1:
             model, optimizer = _setup_model_intern_stage1(config, processor)
@@ -680,7 +805,7 @@ def run_training(config: ReInspectionConfig) -> None:
     )
     model = ds_engine
 
-    if backend == "qwen3vl":
+    if backend in ("qwen3vl", "qwen25vl"):
         processor = AutoProcessor.from_pretrained(
             config.model_name_or_path,
             max_pixels=config.max_pixels,
@@ -743,7 +868,7 @@ def run_training(config: ReInspectionConfig) -> None:
 
             ce_loss = outputs.loss
             if ce_loss is None:
-                if backend == "internvl3":
+                if backend in ("internvl3", "gemma4"):
                     raise RuntimeError("Model did not return a loss. Check dataset labels.")
                 ce_loss = torch.tensor(0.0, device=device)
 
@@ -767,7 +892,9 @@ def run_training(config: ReInspectionConfig) -> None:
                 continue
 
             ds_engine.backward(micro_loss)
+            grad_norm = None
             if (step + 1) % grad_accum == 0:
+                grad_norm = _compute_grad_norm(model)
                 ds_engine.step()
                 scheduler.step()
                 update_step += 1
@@ -786,8 +913,8 @@ def run_training(config: ReInspectionConfig) -> None:
             if is_stage1:
                 metrics[f"{pfx}/train/attn_loss"] = attn_loss.item()
 
-            if (step + 1) % grad_accum == 0:
-                metrics[f"{pfx}/train/grad_norm"] = _compute_grad_norm(model)
+            if grad_norm is not None:
+                metrics[f"{pfx}/train/grad_norm"] = grad_norm
                 metrics[f"{pfx}/train/param_norm"] = _compute_param_norm(model)
 
             if torch.cuda.is_available():
