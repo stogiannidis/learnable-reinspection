@@ -1,0 +1,10 @@
+# @package _global_
+# Logged to W&B; evaluate.py does not branch on this field.
+stage: 2
+checkpoint_dir: models/internvl3/stage1/epoch_5
+lora_checkpoint_dir: models/internvl3/stage2/epoch_2
+output_file: models/internvl3/eval_results.json
+benchmarks: [vsr, gqa_spatial, 3dsrbench, mindcube, blink, srbench]
+eval_condition: reinspection
+eval_compare: true
+max_samples: -1

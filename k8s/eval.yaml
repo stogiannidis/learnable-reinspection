@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  generateName: reinspection-eval-
+  generateName: reinspection-internvl-eval-
   namespace: eidf098ns
   labels:
     kueue.x-k8s.io/queue-name: eidf098ns-user-queue
@@ -12,28 +12,22 @@ spec:
   backoffLimit: 0
   template:
     metadata:
-      name: reinspection-eval
+      name: reinspection-internvl-eval
     spec:
       containers:
-      - name: reinspection-eval
+      - name: reinspection-internvl-eval
         image: stogian/l_reinspection:latest
         workingDir: /data/users/stogian/learnable-reinspection
         command:
           - bash
           - -c
           - |
-            mkdir -p logs outputs
-            bash reinspection_qwen3vl/scripts/run_eval.sh 2>&1 | tee logs/qwen_eval.log
+            mkdir -p logs models
+            bash reinspection_vlm/scripts/run_eval.sh 2>&1 | tee logs/internvl_eval.log
         terminationMessagePath: "/tmp/my-log"
         terminationMessagePolicy: File
         imagePullPolicy: "Always"
         env:
-          - name: DATA_ROOT
-            value: "/data/datasets"
-          - name: CHECKPOINT_DIR
-            value: "outputs/qwen3vl/stage2/epoch_3"
-          - name: OUTPUT_FILE
-            value: "outputs/qwen3vl/eval_results.json"
           - name: HF_TOKEN
             valueFrom:
               secretKeyRef:
@@ -44,10 +38,6 @@ spec:
               secretKeyRef:
                 name: reinspection-secrets
                 key: WANDB_API_KEY
-          - name: WANDB_PROJECT
-            value: "reinspection-qwen3vl"
-          - name: USER
-            value: "stogian_ph"
           - name: OMP_NUM_THREADS
             value: "4"
         resources:
@@ -79,4 +69,4 @@ spec:
           server: 10.24.6.66
           path: /
       nodeSelector:
-        nvidia.com/gpu.product: NVIDIA-A100-SXM4-80GB
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3

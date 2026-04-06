@@ -8,6 +8,7 @@ reinspection_qwen3vl/
 reinspection_internvl3/
 wandb/
 outputs/
+models/
 logs/
 __pycache__/
 *.py[cod]

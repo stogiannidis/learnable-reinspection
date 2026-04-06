@@ -16,32 +16,30 @@ bash poc/scripts/run_poc.sh
 ```
 
 ### Unified VLM package (`reinspection_vlm/`)
-Implementation is consolidated in `reinspection_vlm/`: shared `ReInspectionModule`, `train_common.py`, `evaluate.py`, and backend-specific wrappers under `reinspection_vlm/backends/` (`qwen3vl.py`, `internvl3.py`). Configs live in `reinspection_vlm/configs/qwen3vl/` and `reinspection_vlm/configs/internvl3/`. The legacy packages `reinspection_qwen3vl/` and `reinspection_internvl3/` re-export these symbols for backward compatibility.
+Implementation is consolidated in `reinspection_vlm/`: shared `ReInspectionModule`, `train_common.py`, `evaluate.py`, and backend-specific wrappers under `reinspection_vlm/backends/` (`qwen3vl.py`, `internvl3.py`). Training and eval use **Hydra**: compose `reinspection_vlm/configs/config.yaml` with config groups `backend/` (`qwen3vl`, `internvl3`) and `stage/` (`stage1`, `stage2`, `eval`). DeepSpeed JSON configs remain under `reinspection_vlm/configs/{qwen3vl,internvl3}/`.
 
 ```bash
 pip install -r reinspection_vlm/requirements.txt
 
-# Qwen3-VL — same shell scripts (now call reinspection_vlm internally)
-bash reinspection_qwen3vl/scripts/run_stage1.sh
-bash reinspection_qwen3vl/scripts/run_stage2.sh
-bash reinspection_qwen3vl/scripts/run_eval.sh
+# Training / eval (Hydra overrides after the script name)
+bash reinspection_vlm/scripts/run_stage1.sh
+bash reinspection_vlm/scripts/run_stage2.sh
+bash reinspection_vlm/scripts/run_eval.sh
 
-# InternVL3
-bash reinspection_internvl3/scripts/run_stage1.sh
-bash reinspection_internvl3/scripts/run_stage2.sh
-bash reinspection_internvl3/scripts/run_eval.sh
-
-# Explicit CLI
-torchrun --nproc_per_node=2 -m reinspection_vlm.train --backend qwen3vl --stage 1 --data_root ... --config reinspection_vlm/configs/qwen3vl/stage1.yaml
-python -m reinspection_vlm.evaluate --backend internvl3 --config reinspection_vlm/configs/internvl3/stage2.yaml --data_root ...
+# Examples
+deepspeed --module reinspection_vlm.train stage=stage1 backend=qwen3vl data_root=/path/to/data
+deepspeed --module reinspection_vlm.train stage=stage1 backend=internvl3_legacy   # older InternVL checkpoint geometry
+# Reference copies: reinspection_vlm/config_archive/internvl3/stage1_legacy.yaml, stage2_legacy.yaml
+deepspeed --module reinspection_vlm.train stage=stage2 stage1_checkpoint=models/internvl3/stage1/epoch_5/reinspection_module.pt
+python -m reinspection_vlm.evaluate stage=eval checkpoint_dir=models/internvl3/stage2/epoch_4 data_root=/path/to/data
 
 # Attention visualization (Qwen)
 python -m reinspection_vlm.visualize_attention \
-    --checkpoint_dir outputs/stage2/epoch_10 \
+    --checkpoint_dir models/qwen3vl/stage2/epoch_10 \
     --image path/to/image.jpg --question "Where is the cat?"
 ```
 
-Training uses `torchrun` (or DeepSpeed) for distributed execution. Key env vars: `DATA_ROOT`, `OUTPUT_DIR`, `NUM_GPUS`, `STAGE1_CKPT`, `WANDB_PROJECT`, `WANDB_RUN_NAME`.
+Training uses DeepSpeed (`deepspeed --module reinspection_vlm.train ...`) for multi-GPU runs. Pass paths and W&B names as **Hydra overrides** (e.g. `data_root=...`, `output_dir=...`, `wandb_run_name=...`, `stage1_checkpoint=...`) rather than a separate argparse CLI.
 
 ## Architecture
 
@@ -64,10 +62,10 @@ Wraps `Qwen3VLForConditionalGeneration` (not subclassed). Forward flow:
 
 The `generate()` method follows the same injection during prefill.
 
-### Training pipeline (`reinspection_vlm/train.py` via `--backend` and `--stage`)
+### Training pipeline (`reinspection_vlm/train.py` + Hydra)
 - **Stage 1:** Freeze backbone; train reinspection (and optionally InternVL projector). Loss = L_CE + λ·L_attn. Qwen uses focal loss with diversified bbox targets (`stage1_attn_loss_type: focal`); InternVL defaults to KL (`stage1_attn_loss_type: kl`).
 - **Stage 2:** Load Stage 1 checkpoint. Add LoRA (r=16, q_proj+v_proj) to LLM. Train reinspection + LoRA. Loss = L_CE only.
-- Supports DDP (`torchrun`) and DeepSpeed ZeRO-2. Checkpoints save `reinspection_module.pt` and optionally `lora_weights/`.
+- DeepSpeed (ZeRO per `reinspection_vlm/configs/*/deepspeed_*.json`). Checkpoints save under `{output_dir}/{backend}/stage{N}/epoch_{E}/` (default `output_dir=models`): `reinspection_module.pt` and optionally `lora_weights/`.
 
 ### Data (`reinspection_vlm/data/`)
 - `RefCOCODataset`: Stage 1; `backend='qwen3vl'|'internvl3'` selects processor/chat and bbox→patch supervision.
@@ -75,12 +73,12 @@ The `generate()` method follows the same injection during prefill.
 - Qwen chat helpers: `data/utils.py`; InternVL: `data/chat_template.py`.
 
 ### Config (`reinspection_vlm/config.py`)
-Single `ReInspectionConfig` dataclass (union of Qwen + InternVL fields). Override via YAML (`--config`). Stage YAMLs under `reinspection_vlm/configs/<backend>/`.
+Single `ReInspectionConfig` dataclass (union of Qwen + InternVL fields). Defaults come from Hydra (`configs/config.yaml` + `backend/*.yaml` + `stage/*.yaml`); override on the command line (`key=value`) or add YAML under those groups.
 
 ## Deployment
 
 - Docker: `Dockerfile` for the shared Qwen/InternVL VLM image, `Dockerfile.poc` for the PoC image
-- Kubernetes: `k8s/stage1.yaml`, `k8s/stage2.yaml` for Qwen and `k8s/internvl_stage1.yaml`, `k8s/internvl_stage2.yaml` for InternVL
+- Kubernetes: `k8s/stage1.yaml`, `k8s/stage2.yaml`, `k8s/eval.yaml` (invoke `reinspection_vlm/scripts/run_*.sh`; adjust image/workdir for your cluster)
 - Secrets (HF_TOKEN, WANDB_API_KEY) via k8s Secrets; see `k8s/secrets.example.yaml`
 
 ## Conventions

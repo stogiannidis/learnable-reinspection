@@ -6,12 +6,13 @@ import torch.nn.functional as F
 
 def compute_attn_loss_kl(attn_vis: torch.Tensor, attn_target: torch.Tensor) -> torch.Tensor:
     """KL divergence between predicted and target attention (InternVL default)."""
-    pred = attn_vis.clamp(min=1e-8)
+    pred = attn_vis.float().clamp(min=1e-8)
     pred = pred / pred.sum(dim=-1, keepdim=True)
-    target = attn_target.clamp(min=1e-8)
+    target = attn_target.float().clamp(min=1e-8)
     target = target / target.sum(dim=-1, keepdim=True)
     target = target.unsqueeze(1).expand_as(pred)
-    return F.kl_div(pred.log(), target, reduction="batchmean")
+    loss = F.kl_div(pred.log(), target, reduction="batchmean")
+    return loss / pred.shape[1]
 
 
 def _diversify_targets(
@@ -72,7 +73,10 @@ def compute_attn_loss_focal(
     else:
         target = binary.unsqueeze(1).expand_as(A_vis)
 
-    pred = A_vis.clamp(min=1e-6, max=1.0 - 1e-6)
+    # Compute the focal loss in FP32. In bf16, `1.0 - 1e-6` rounds back to 1.0,
+    # which can leave exact 1s after clamping and trigger `0 * log(0) -> NaN`.
+    pred = (A_vis.float() * A_vis.shape[-1]).clamp(min=1e-6, max=1.0 - 1e-6)
+    target = target.float()
     bce = -(target * pred.log() + (1 - target) * (1 - pred).log())
     p_t = target * pred + (1 - target) * (1 - pred)
     focal_weight = (1 - p_t) ** gamma

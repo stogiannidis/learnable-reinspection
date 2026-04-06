@@ -1,0 +1,16 @@
+defaults:
+  - backend: internvl3
+  - stage: stage1
+  - _self_
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+  job:
+    chdir: false
+
+data_root: /data/datasets
+output_dir: models
+wandb_run_name: null
+num_workers: 4

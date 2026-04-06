@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
+import math
 import os
+import platform
+import subprocess
+import sys
 from dataclasses import asdict
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import yaml
 from peft import LoraConfig, TaskType, get_peft_model
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, DistributedSampler
-from transformers import AutoProcessor, get_cosine_schedule_with_warmup
+from transformers import AutoProcessor
 
 from reinspection_vlm.attn_loss import compute_attn_loss_focal, compute_attn_loss_kl
 from reinspection_vlm.config import ReInspectionConfig
@@ -48,18 +53,6 @@ def collate_fn(batch):
     return collated
 
 
-def load_config(config_path: Optional[str], output_dir: str) -> ReInspectionConfig:
-    config = ReInspectionConfig(output_dir=output_dir)
-    if not config_path:
-        return config
-    with open(config_path, "r", encoding="utf-8") as handle:
-        overrides = yaml.safe_load(handle) or {}
-    for key, value in overrides.items():
-        if hasattr(config, key):
-            setattr(config, key, value)
-    config.__post_init__()
-    return config
-
 
 def is_main_process() -> bool:
     return not dist.is_initialized() or dist.get_rank() == 0
@@ -82,7 +75,162 @@ def _get_local_rank() -> int:
     return int(os.environ.get("LOCAL_RANK", 0))
 
 
-def _init_wandb(config: ReInspectionConfig, args, stage: int, backend: str) -> None:
+def _git_info() -> dict:
+    """Collect git revision and diff stats for reproducibility."""
+    info: dict = {}
+    try:
+        info["commit"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+        info["branch"] = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain"], stderr=subprocess.DEVNULL
+        ).decode().strip()
+        info["dirty"] = bool(dirty)
+        info["diff_stat"] = subprocess.check_output(
+            ["git", "diff", "--stat"], stderr=subprocess.DEVNULL
+        ).decode().strip()[:500]
+    except Exception:
+        info["commit"] = "unknown"
+    return info
+
+
+def _env_info() -> dict:
+    """Collect environment details for reproducibility."""
+    info = {
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda or "N/A",
+        "cudnn_version": str(torch.backends.cudnn.version()) if torch.backends.cudnn.is_available() else "N/A",
+        "gpu_count": torch.cuda.device_count(),
+        "gpu_names": [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())],
+    }
+    try:
+        import transformers
+        info["transformers_version"] = transformers.__version__
+    except ImportError:
+        pass
+    try:
+        import peft as _peft
+        info["peft_version"] = _peft.__version__
+    except (ImportError, AttributeError):
+        pass
+    try:
+        import deepspeed as _ds
+        info["deepspeed_version"] = _ds.__version__
+    except (ImportError, AttributeError):
+        pass
+    return info
+
+
+def _file_hash(path: str, algo: str = "sha256") -> str:
+    h = hashlib.new(algo)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _log_dataset_artifact(
+    dataset, stage: int, backend: str, data_root: str
+) -> None:
+    """Log dataset metadata and annotation file checksums as a W&B artifact."""
+    try:
+        import wandb
+
+        if wandb.run is None:
+            return
+
+        meta = {
+            "data_root": data_root,
+            "num_samples": len(dataset),
+            "stage": stage,
+            "backend": backend,
+        }
+
+        art = wandb.Artifact(
+            f"dataset-stage{stage}-{backend}",
+            type="dataset",
+            metadata=meta,
+        )
+
+        ann_files = set()
+        if hasattr(dataset, "samples") and dataset.samples:
+            sample_keys = list(dataset.samples[0].keys()) if dataset.samples else []
+            meta["sample_keys"] = sample_keys
+            meta["first_sample"] = {
+                k: str(v)[:200] for k, v in dataset.samples[0].items()
+            }
+
+        if hasattr(dataset, "datasets"):
+            for sub in dataset.datasets:
+                if hasattr(sub, "samples") and sub.samples:
+                    meta[f"subdataset_{type(sub).__name__}_size"] = len(sub.samples)
+
+        for name in ["refcoco", "refcoco+", "refcocog"]:
+            for split in ["train", "test"]:
+                p = os.path.join(data_root, name, f"{split}.json")
+                if os.path.exists(p):
+                    ann_files.add(p)
+        for name in ["vsr", "whatsup", "gqa_spatial", "spatialbench", "3dsrbench", "mindcube", "blink", "srbench"]:
+            for ext in ["json", "jsonl"]:
+                for split in ["train", "test"]:
+                    p = os.path.join(data_root, name, f"{split}.{ext}")
+                    if os.path.exists(p):
+                        ann_files.add(p)
+
+        checksums = {}
+        for p in sorted(ann_files):
+            try:
+                checksums[os.path.relpath(p, data_root)] = _file_hash(p)
+                art.add_file(p, name=os.path.relpath(p, data_root))
+            except Exception:
+                pass
+
+        meta["annotation_checksums"] = checksums
+        art.metadata = meta
+        wandb.log_artifact(art)
+    except Exception:
+        pass
+
+
+def _log_code_artifact() -> None:
+    """Log the source tree as a W&B artifact for exact code reproducibility."""
+    try:
+        import wandb
+
+        if wandb.run is None:
+            return
+
+        art = wandb.Artifact("source-code", type="code", metadata=_git_info())
+        code_dir = os.path.join(os.path.dirname(__file__))
+        if os.path.isdir(code_dir):
+            art.add_dir(code_dir, name="reinspection_vlm")
+        wandb.log_artifact(art)
+    except Exception:
+        pass
+
+
+def _log_config_artifact(config: ReInspectionConfig) -> None:
+    """Log the resolved config as a JSON artifact."""
+    try:
+        import wandb
+
+        if wandb.run is None:
+            return
+
+        config_path = os.path.join(wandb.run.dir, "resolved_config.json")
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(asdict(config), f, indent=2, default=str)
+        wandb.save(config_path, policy="now")
+    except Exception:
+        pass
+
+
+def _init_wandb(config: ReInspectionConfig) -> None:
     if not is_main_process():
         return
     try:
@@ -90,15 +238,25 @@ def _init_wandb(config: ReInspectionConfig, args, stage: int, backend: str) -> N
 
         os.environ["WANDB_SILENT"] = "true"
         resolved = asdict(config)
-        resolved.update({"stage": stage, "backend": backend, "_cli": vars(args)})
-        name = getattr(args, "wandb_run_name", None)
+        resolved.update({
+            "_git": _git_info(),
+            "_env": _env_info(),
+        })
+        name = config.wandb_run_name
         if name:
-            name = f"{name}_stage{stage}"
+            name = f"{name}_stage{config.stage}"
+
+        tags = [config.backend, f"stage{config.stage}"]
         wandb.init(
-            project=getattr(args, "wandb_project", None),
+            project=config.wandb_project,
             name=name,
             config=resolved,
+            tags=tags,
+            save_code=True,
         )
+
+        _log_config_artifact(config)
+        _log_code_artifact()
     except Exception:
         pass
 
@@ -115,6 +273,46 @@ def _log_wandb(metrics: dict, step: int) -> None:
         pass
 
 
+def _log_model_artifact(
+    save_dir: str, stage: int, backend: str, epoch: int, is_best: bool = False
+) -> None:
+    """Log a model checkpoint as a W&B artifact."""
+    if not is_main_process():
+        return
+    try:
+        import wandb
+
+        if wandb.run is None:
+            return
+
+        name = f"model-stage{stage}-{backend}"
+        aliases = [f"epoch-{epoch}", "latest"]
+        if is_best:
+            aliases.append("best")
+
+        art = wandb.Artifact(
+            name, type="model",
+            metadata={"stage": stage, "backend": backend, "epoch": epoch, "save_dir": save_dir},
+        )
+        if os.path.isdir(save_dir):
+            art.add_dir(save_dir)
+        wandb.log_artifact(art, aliases=aliases)
+    except Exception:
+        pass
+
+
+def _finish_wandb() -> None:
+    if not is_main_process():
+        return
+    try:
+        import wandb
+
+        if wandb.run is not None:
+            wandb.finish()
+    except Exception:
+        pass
+
+
 def _load_stage1_weights(model, checkpoint_path: str) -> None:
     state_path = checkpoint_path
     if os.path.isdir(state_path):
@@ -125,7 +323,7 @@ def _load_stage1_weights(model, checkpoint_path: str) -> None:
     model.reinspection.load_state_dict(state_dict)
 
 
-def _setup_model_qwen_stage1(config: ReInspectionConfig, args):
+def _setup_model_qwen_stage1(config: ReInspectionConfig):
     from reinspection_vlm.backends.qwen3vl import load_model
 
     model = load_model(config, device_map=None)
@@ -141,13 +339,13 @@ def _setup_model_qwen_stage1(config: ReInspectionConfig, args):
     return model, optimizer
 
 
-def _setup_model_qwen_stage2(config: ReInspectionConfig, args):
+def _setup_model_qwen_stage2(config: ReInspectionConfig):
     from reinspection_vlm.backends.qwen3vl import load_model
 
     model = load_model(config, device_map=None)
-    if args.stage1_checkpoint:
-        log(f"Loading Stage 1 checkpoint: {args.stage1_checkpoint}")
-        _load_stage1_weights(model, args.stage1_checkpoint)
+    if config.stage1_checkpoint:
+        log(f"Loading Stage 1 checkpoint: {config.stage1_checkpoint}")
+        _load_stage1_weights(model, config.stage1_checkpoint)
     for param in model.base_model.parameters():
         param.requires_grad = False
     for param in model.reinspection.parameters():
@@ -265,28 +463,90 @@ def _build_dataset(
     )
 
 
-def _save_checkpoint(model, save_dir: str, save_lora: bool = False) -> None:
-    if not is_main_process():
-        return
-    os.makedirs(save_dir, exist_ok=True)
-    unwrapped = model.module if hasattr(model, "module") else model
-    torch.save(unwrapped.reinspection.state_dict(), os.path.join(save_dir, "reinspection_module.pt"))
+def _save_checkpoint(ds_engine, save_dir: str, save_lora: bool = False) -> None:
+    import deepspeed
+
+    if is_main_process():
+        os.makedirs(save_dir, exist_ok=True)
+
+    unwrapped = ds_engine.module
+
+    reinsp_params = list(unwrapped.reinspection.parameters())
+    with deepspeed.zero.GatheredParameters(reinsp_params, modifier_rank=0):
+        if is_main_process():
+            torch.save(
+                unwrapped.reinspection.state_dict(),
+                os.path.join(save_dir, "reinspection_module.pt"),
+            )
     if save_lora:
-        unwrapped.base_model.model.language_model.save_pretrained(os.path.join(save_dir, "lora_weights"))
+        lora_params = list(unwrapped.base_model.model.language_model.parameters())
+        with deepspeed.zero.GatheredParameters(lora_params, modifier_rank=0):
+            if is_main_process():
+                unwrapped.base_model.model.language_model.save_pretrained(
+                    os.path.join(save_dir, "lora_weights")
+                )
+
     log(f"Saved checkpoint to {save_dir}")
 
 
-def _try_deepspeed(model, optimizer, deepspeed_config: Optional[str]):
-    if not deepspeed_config:
-        return None, model, optimizer
+def _resolve_deepspeed_auto_batch(
+    ds_config: dict, micro_batch_per_gpu: int, grad_accum_steps: int
+) -> dict:
+    """Replace string 'auto' batch fields; required when not using HF Trainer + TrainingArguments."""
+    cfg = copy.deepcopy(ds_config)
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    if cfg.get("train_micro_batch_size_per_gpu") == "auto":
+        cfg["train_micro_batch_size_per_gpu"] = micro_batch_per_gpu
+    if cfg.get("gradient_accumulation_steps") == "auto":
+        cfg["gradient_accumulation_steps"] = grad_accum_steps
+    if cfg.get("train_batch_size") == "auto":
+        cfg["train_batch_size"] = (
+            micro_batch_per_gpu * grad_accum_steps * world_size
+        )
+    return cfg
+
+
+def _init_deepspeed(
+    model,
+    optimizer,
+    deepspeed_config: Union[str, dict],
+    micro_batch_per_gpu: int,
+    grad_accum_steps: int,
+):
     import deepspeed
+
+    if not deepspeed_config:
+        raise ValueError("--deepspeed config is required")
+
+    if isinstance(deepspeed_config, str):
+        with open(deepspeed_config, encoding="utf-8") as f:
+            ds_dict = json.load(f)
+    else:
+        ds_dict = copy.deepcopy(deepspeed_config)
+    ds_dict = _resolve_deepspeed_auto_batch(
+        ds_dict, micro_batch_per_gpu, grad_accum_steps
+    )
 
     engine, optimizer, _, _ = deepspeed.initialize(
         model=model,
         optimizer=optimizer,
-        config=deepspeed_config,
+        config=ds_dict,
     )
-    return engine, engine, optimizer
+    return engine, optimizer
+
+
+def _train_forward_kwargs(batch: dict, backend: str, is_stage1: bool) -> dict:
+    fwd = {
+        "input_ids": batch["input_ids"],
+        "attention_mask": batch["attention_mask"],
+        "pixel_values": batch.get("pixel_values"),
+        "labels": batch["labels"],
+        "return_attn_maps": is_stage1,
+    }
+    if backend == "qwen3vl":
+        fwd["image_grid_thw"] = batch.get("image_grid_thw")
+        fwd["video_grid_thw"] = batch.get("video_grid_thw")
+    return fwd
 
 
 def _stage1_attn_loss(config: ReInspectionConfig, outputs, batch, device):
@@ -306,7 +566,57 @@ def _stage1_attn_loss(config: ReInspectionConfig, outputs, batch, device):
     )
 
 
-def run_training(backend: str, stage: int, config: ReInspectionConfig, args) -> None:
+def _compute_grad_norm(model) -> float:
+    """Compute the total L2 gradient norm across all trainable parameters."""
+    total = 0.0
+    for p in model.parameters():
+        if p.requires_grad and p.grad is not None:
+            total += p.grad.data.float().norm(2).item() ** 2
+    return total ** 0.5
+
+
+def _compute_param_norm(model) -> float:
+    """Compute the total L2 parameter norm across trainable parameters."""
+    total = 0.0
+    for p in model.parameters():
+        if p.requires_grad:
+            total += p.data.float().norm(2).item() ** 2
+    return total ** 0.5
+
+
+class _CosineWarmupLR:
+    """Cosine decay with linear warmup (same schedule as HF ``get_cosine_schedule_with_warmup``, num_cycles=0.5).
+
+    Updates ``optimizer.param_groups`` directly so learning rates stay aligned with the optimizer
+    DeepSpeed steps (avoids ``LambdaLR`` / ``optimizer.step()`` ordering issues on wrapped optimizers).
+    """
+
+    def __init__(self, optimizer, num_warmup: int, num_training: int) -> None:
+        self.optimizer = optimizer
+        self.num_warmup = max(1, num_warmup)
+        self.num_training = max(1, num_training)
+        self.base_lrs = [float(pg["lr"]) for pg in optimizer.param_groups]
+        self._step = -1
+
+    def step(self) -> None:
+        self._step += 1
+        mult = self._lr_mult(self._step)
+        for pg, base in zip(self.optimizer.param_groups, self.base_lrs):
+            pg["lr"] = base * mult
+
+    def _lr_mult(self, step: int) -> float:
+        if step < self.num_warmup:
+            return float(step) / float(self.num_warmup)
+        progress = float(step - self.num_warmup) / float(max(1, self.num_training - self.num_warmup))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    def get_last_lr(self) -> list[float]:
+        return [float(pg["lr"]) for pg in self.optimizer.param_groups]
+
+
+def run_training(config: ReInspectionConfig) -> None:
+    backend = config.backend
+    stage = config.stage
     is_stage1 = stage == 1
     grad_accum = config.stage1_grad_accum if is_stage1 else config.stage2_grad_accum
     n_epochs = config.stage1_epochs if is_stage1 else config.stage2_epochs
@@ -318,40 +628,57 @@ def run_training(backend: str, stage: int, config: ReInspectionConfig, args) -> 
     device = torch.device(f"cuda:{local_rank}")
     torch.manual_seed(config.seed)
 
+    checkpoint_root = os.path.join(config.output_dir, backend)
+    if is_main_process():
+        log(f"Checkpoint root: {checkpoint_root} (layout: .../{backend}/stage{{N}}/epoch_{{E}}/)")
+
     processor = None
     if backend == "internvl3":
         from reinspection_vlm.backends.internvl3 import load_processor
 
         processor = load_processor(config)
-    _init_wandb(config, args, stage, backend)
+    _init_wandb(config)
 
     if backend == "qwen3vl":
         if is_stage1:
-            model, optimizer = _setup_model_qwen_stage1(config, args)
+            model, optimizer = _setup_model_qwen_stage1(config)
         else:
-            model, optimizer = _setup_model_qwen_stage2(config, args)
+            model, optimizer = _setup_model_qwen_stage2(config)
     else:
         if is_stage1:
             model, optimizer = _setup_model_intern_stage1(config, processor)
         else:
             model, optimizer = _setup_model_intern_stage2(
-                config, processor, getattr(args, "stage1_checkpoint", None)
+                config, processor, config.stage1_checkpoint
             )
 
     if config.gradient_checkpointing:
-        model.base_model.gradient_checkpointing_enable()
-        log("Gradient checkpointing enabled")
+        if backend == "internvl3":
+            model.base_model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": True}
+            )
+            log("Gradient checkpointing enabled (reentrant mode for InternVL3)")
+        else:
+            model.base_model.gradient_checkpointing_enable()
+            log("Gradient checkpointing enabled")
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     log(f"Trainable: {trainable:,} / {total:,} ({100 * trainable / total:.4f}%)")
+    _log_wandb({
+        "model/trainable_params": trainable,
+        "model/total_params": total,
+        "model/trainable_pct": 100 * trainable / total,
+    }, step=0)
 
-    ds_engine, model, optimizer = _try_deepspeed(model, optimizer, getattr(args, "deepspeed", None))
-    use_deepspeed = ds_engine is not None
-    if not use_deepspeed:
-        model = model.to(device)
-        if dist.is_initialized():
-            model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    ds_engine, optimizer = _init_deepspeed(
+        model,
+        optimizer,
+        config.deepspeed_config,
+        batch_size,
+        grad_accum,
+    )
+    model = ds_engine
 
     if backend == "qwen3vl":
         processor = AutoProcessor.from_pretrained(
@@ -360,12 +687,15 @@ def run_training(backend: str, stage: int, config: ReInspectionConfig, args) -> 
             min_pixels=config.min_pixels,
         )
 
-    train_dataset = _build_dataset(backend, stage, config, args.data_root, processor)
+    train_dataset = _build_dataset(backend, stage, config, config.data_root, processor)
     if len(train_dataset) == 0:
-        raise RuntimeError(f"Dataset is empty. Check --data_root={args.data_root}")
+        raise RuntimeError(f"Dataset is empty. Check data_root={config.data_root}")
     log(f"Training samples: {len(train_dataset)}")
 
-    num_workers = getattr(args, "num_workers", 4)
+    if is_main_process():
+        _log_dataset_artifact(train_dataset, stage, backend, config.data_root)
+
+    num_workers = config.num_workers
     sampler = DistributedSampler(train_dataset) if dist.is_initialized() else None
     train_loader = DataLoader(
         train_dataset,
@@ -381,14 +711,21 @@ def run_training(backend: str, stage: int, config: ReInspectionConfig, args) -> 
     warmup_override = config.stage1_warmup_steps if is_stage1 else config.stage2_warmup_steps
     num_warmup = warmup_override if warmup_override is not None else int(num_updates * warmup_ratio)
     log(f"Scheduler: {num_updates} update steps, {num_warmup} warmup steps")
-    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup, num_updates)
-
-    if not use_deepspeed:
-        optimizer.zero_grad(set_to_none=True)
+    scheduler = _CosineWarmupLR(optimizer, num_warmup, num_updates)
+    _log_wandb({
+        "schedule/num_updates": num_updates,
+        "schedule/num_warmup": num_warmup,
+        "schedule/num_epochs": n_epochs,
+        "schedule/batch_size": batch_size,
+        "schedule/grad_accum": grad_accum,
+        "dataset/num_samples": len(train_dataset),
+        "dataset/num_workers": num_workers,
+    }, step=0)
 
     model.train()
     global_step = 0
     update_step = 0
+    best_epoch_loss = float("inf")
     pfx = f"{backend}_stage{stage}"
 
     for epoch in range(n_epochs):
@@ -402,17 +739,7 @@ def run_training(backend: str, stage: int, config: ReInspectionConfig, args) -> 
         for step, batch in enumerate(train_loader):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
-            fwd = dict(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                pixel_values=batch.get("pixel_values"),
-                labels=batch["labels"],
-                return_attn_maps=is_stage1,
-            )
-            if backend == "qwen3vl":
-                fwd["image_grid_thw"] = batch.get("image_grid_thw")
-                fwd["video_grid_thw"] = batch.get("video_grid_thw")
-            outputs = model(**fwd)
+            outputs = model(**_train_forward_kwargs(batch, backend, is_stage1))
 
             ce_loss = outputs.loss
             if ce_loss is None:
@@ -431,38 +758,19 @@ def run_training(backend: str, stage: int, config: ReInspectionConfig, args) -> 
             if dist.is_initialized():
                 dist.all_reduce(_finite, op=dist.ReduceOp.MIN)
             if _finite.item() < 0.5:
-                log(f"[WARNING] Non-finite loss={loss.item():.4f} at global_step={global_step}, skipping batch")
-                if not use_deepspeed:
-                    optimizer.zero_grad(set_to_none=True)
+                log(
+                    f"[WARNING] Non-finite loss={loss.item():.4f} "
+                    f"(ce={ce_loss.item():.4f}, attn={attn_loss.item():.4f}) "
+                    f"at global_step={global_step}, skipping batch"
+                )
                 global_step += 1
                 continue
 
-            if use_deepspeed:
-                ds_engine.backward(micro_loss)
-                if (step + 1) % grad_accum == 0:
-                    ds_engine.step()
-                    scheduler.step()
-                    update_step += 1
-            else:
-                micro_loss.backward()
-                if (step + 1) % grad_accum == 0:
-                    trainable_params = [p for p in model.parameters() if p.requires_grad]
-                    _grad_finite = torch.tensor(1.0, device=device)
-                    for p in trainable_params:
-                        if p.grad is not None and not torch.isfinite(p.grad).all():
-                            _grad_finite.fill_(0.0)
-                            break
-                    if dist.is_initialized():
-                        dist.all_reduce(_grad_finite, op=dist.ReduceOp.MIN)
-                    if _grad_finite.item() < 0.5:
-                        log(f"[WARNING] Non-finite gradient at global_step={global_step}, skipping optimizer step")
-                        optimizer.zero_grad(set_to_none=True)
-                    else:
-                        torch.nn.utils.clip_grad_norm_(trainable_params, config.max_grad_norm)
-                        optimizer.step()
-                        scheduler.step()
-                        optimizer.zero_grad(set_to_none=True)
-                        update_step += 1
+            ds_engine.backward(micro_loss)
+            if (step + 1) % grad_accum == 0:
+                ds_engine.step()
+                scheduler.step()
+                update_step += 1
 
             epoch_loss += loss.item()
             epoch_ce += ce_loss.item()
@@ -477,9 +785,18 @@ def run_training(backend: str, stage: int, config: ReInspectionConfig, args) -> 
             }
             if is_stage1:
                 metrics[f"{pfx}/train/attn_loss"] = attn_loss.item()
+
+            if (step + 1) % grad_accum == 0:
+                metrics[f"{pfx}/train/grad_norm"] = _compute_grad_norm(model)
+                metrics[f"{pfx}/train/param_norm"] = _compute_param_norm(model)
+
+            if torch.cuda.is_available():
+                metrics[f"{pfx}/system/gpu_mem_allocated_gb"] = torch.cuda.memory_allocated(device) / (1024 ** 3)
+                metrics[f"{pfx}/system/gpu_mem_reserved_gb"] = torch.cuda.memory_reserved(device) / (1024 ** 3)
+
             _log_wandb(metrics, global_step)
 
-            if global_step % 50 == 0:
+            if global_step % 1000 == 0:
                 msg = f"Epoch {epoch + 1} Step {global_step}: loss={loss.item():.4f} ce={ce_loss.item():.4f}"
                 if is_stage1:
                     msg += f" attn={attn_loss.item():.4f}"
@@ -487,24 +804,33 @@ def run_training(backend: str, stage: int, config: ReInspectionConfig, args) -> 
                 log("  " + msg)
 
         num_steps = max(1, len(train_loader))
+        avg_epoch_loss = epoch_loss / num_steps
         summary = {
-            f"{pfx}/epoch/loss": epoch_loss / num_steps,
+            f"{pfx}/epoch/loss": avg_epoch_loss,
             f"{pfx}/epoch/ce_loss": epoch_ce / num_steps,
+            f"{pfx}/epoch/epoch": epoch + 1,
         }
         if is_stage1:
             summary[f"{pfx}/epoch/attn_loss"] = epoch_attn / num_steps
         _log_wandb(summary, global_step)
 
         log(
-            f"Epoch {epoch + 1}/{n_epochs}: loss={epoch_loss / num_steps:.4f} ce={epoch_ce / num_steps:.4f}"
+            f"Epoch {epoch + 1}/{n_epochs}: loss={avg_epoch_loss:.4f} ce={epoch_ce / num_steps:.4f}"
             + (f" attn={epoch_attn / num_steps:.4f}" if is_stage1 else "")
         )
 
+        save_dir = os.path.join(config.output_dir, backend, f"stage{stage}", f"epoch_{epoch + 1}")
         _save_checkpoint(
-            model,
-            save_dir=os.path.join(config.output_dir, f"stage{stage}", f"epoch_{epoch + 1}"),
+            ds_engine,
+            save_dir=save_dir,
             save_lora=not is_stage1,
         )
 
+        is_best = avg_epoch_loss < best_epoch_loss
+        if is_best:
+            best_epoch_loss = avg_epoch_loss
+        _log_model_artifact(save_dir, stage, backend, epoch + 1, is_best=is_best)
+
+    _finish_wandb()
     if dist.is_initialized():
         dist.destroy_process_group()

@@ -14,6 +14,43 @@ from reinspection_vlm.outputs import ReInspectionOutput
 from reinspection_vlm.reinspection_module import ReInspectionModule
 
 
+def _chunked_cross_entropy(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    ignore_index: int = -100,
+    chunk_size: int = 1024,
+) -> torch.Tensor:
+    """Compute cross-entropy in chunks, upcasting each chunk to FP32.
+
+    Avoids materialising the full (B*T, V) tensor in FP32 at once, which
+    can easily exceed GPU memory for large-vocab models like InternVL3 (152K).
+    """
+    flat_logits = logits.view(-1, logits.size(-1))
+    flat_labels = labels.view(-1)
+
+    valid = flat_labels != ignore_index
+    n_valid = valid.sum()
+    if n_valid == 0:
+        return flat_logits.sum() * 0.0
+
+    total_loss = torch.zeros((), device=logits.device, dtype=torch.float32)
+    n = flat_logits.size(0)
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        chunk_labels = flat_labels[start:end]
+        mask = chunk_labels != ignore_index
+        if not mask.any():
+            continue
+        chunk_loss = torch.nn.functional.cross_entropy(
+            flat_logits[start:end].float(),
+            chunk_labels,
+            ignore_index=ignore_index,
+            reduction="sum",
+        )
+        total_loss = total_loss + chunk_loss
+    return total_loss / n_valid.float()
+
+
 class InternVL3WithReInspection(nn.Module):
     """InternVL3-8B + Re-Inspection Module."""
 
@@ -284,8 +321,11 @@ class InternVL3WithReInspection(nn.Module):
         vision_feature_layer: Optional[int] = None,
         vision_feature_select_strategy: Optional[str] = None,
     ) -> dict:
+        step = getattr(self, "_fwd_step", 0)
+
         if inputs_embeds is None:
             inputs_embeds = self.base_model.get_input_embeddings()(input_ids)
+        self._nan_check(inputs_embeds, "token_embeds", step)
 
         inputs_embeds, image_features = self._encode_vision_and_scatter(
             input_ids=input_ids,
@@ -294,6 +334,9 @@ class InternVL3WithReInspection(nn.Module):
             vision_feature_layer=vision_feature_layer,
             vision_feature_select_strategy=vision_feature_select_strategy,
         )
+        self._nan_check(inputs_embeds, "embeds_after_vision_scatter", step)
+        if image_features is not None:
+            self._nan_check(image_features, "image_features", step)
 
         insert_positions = self._find_insert_positions(input_ids, attention_mask=attention_mask, labels=labels)
         V, T, V_mask, T_mask = self._extract_vision_and_text(
@@ -302,9 +345,13 @@ class InternVL3WithReInspection(nn.Module):
             insert_positions,
             attention_mask=attention_mask,
         )
+        self._nan_check(V, "V_extracted", step)
+        self._nan_check(T, "T_extracted", step)
+
         R, A_task, A_vis = self.reinspection(
             V, T, V_mask=V_mask, T_mask=T_mask, need_weights=True,
         )
+        self._nan_check(R, "R_tokens", step)
 
         self._last_attn_task = A_task.detach()
         self._last_attn_vis = A_vis.detach()
@@ -320,6 +367,21 @@ class InternVL3WithReInspection(nn.Module):
             "A_task": A_task,
             "A_vis": A_vis,
         }
+
+    _nan_debug_steps: int = 5
+
+    def _nan_check(self, tensor: torch.Tensor, name: str, step: int):
+        if step < self._nan_debug_steps and tensor is not None:
+            has_nan = torch.isnan(tensor).any().item()
+            has_inf = torch.isinf(tensor).any().item()
+            if has_nan or has_inf:
+                import logging
+                logging.warning(
+                    f"NaN/Inf detected in {name}: nan={has_nan} inf={has_inf} "
+                    f"shape={tuple(tensor.shape)} dtype={tensor.dtype} "
+                    f"min={tensor[torch.isfinite(tensor)].min().item() if torch.isfinite(tensor).any() else 'N/A'} "
+                    f"max={tensor[torch.isfinite(tensor)].max().item() if torch.isfinite(tensor).any() else 'N/A'}"
+                )
 
     def forward(
         self,
@@ -337,12 +399,16 @@ class InternVL3WithReInspection(nn.Module):
         return_attn_maps: bool = False,
         **kwargs,
     ) -> ReInspectionOutput:
+        step = getattr(self, "_fwd_step", 0)
+        self._fwd_step = step + 1
+
         prepared = self._prepare_reinspection_inputs(
             input_ids, inputs_embeds, attention_mask, position_ids, labels,
             pixel_values, vision_feature_layer, vision_feature_select_strategy,
         )
 
         prepared["inputs_embeds"] = prepared["inputs_embeds"].to(self.base_model.dtype)
+        self._nan_check(prepared["inputs_embeds"], "prepared_embeds", step)
 
         outputs = self.base_model.model.language_model(
             position_ids=prepared["position_ids"],
@@ -354,21 +420,25 @@ class InternVL3WithReInspection(nn.Module):
         )
 
         hidden_states = outputs.last_hidden_state
+        self._nan_check(hidden_states, "lm_hidden_states", step)
+
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.base_model.lm_head(hidden_states[:, slice_indices, :])
+        self._nan_check(logits, "logits", step)
 
         loss = None
         if prepared["labels"] is not None:
             labels = prepared["labels"]
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            # Upcast logits to fp32 for the loss computation to prevent
-            # bf16 overflow in the backward pass through the 152K vocab softmax.
-            loss = torch.nn.functional.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)).float(),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+            n_valid = (shift_labels != -100).sum().item()
+            if step < self._nan_debug_steps:
+                import logging
+                logging.warning(
+                    f"[nan_debug step={step}] n_valid_labels={n_valid} "
+                    f"shift_logits range=[{shift_logits.min().item():.4f}, {shift_logits.max().item():.4f}]"
+                )
+            loss = _chunked_cross_entropy(shift_logits, shift_labels, ignore_index=-100)
 
         return ReInspectionOutput(
             loss=loss,

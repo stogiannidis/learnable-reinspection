@@ -1,27 +1,20 @@
-"""Unified training entry: ``python -m reinspection_vlm.train --backend qwen3vl|internvl3 --stage 1|2``."""
+"""Training entry point (Hydra): ``deepspeed --module reinspection_vlm.train stage=stage1 data_root=...``"""
 
-import argparse
+import hydra
+from omegaconf import DictConfig, OmegaConf
 
-from reinspection_vlm.train_common import load_config, run_training
+from reinspection_vlm.hydra_util import strip_deepspeed_local_rank_argv
+
+strip_deepspeed_local_rank_argv()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", type=str, required=True, choices=["qwen3vl", "internvl3"])
-    parser.add_argument("--stage", type=int, required=True, choices=[1, 2])
-    parser.add_argument("--data_root", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="outputs")
-    parser.add_argument("--config", type=str, default=None)
-    parser.add_argument("--stage1_checkpoint", type=str, default=None)
-    parser.add_argument("--deepspeed", type=str, default=None)
-    parser.add_argument("--wandb_project", type=str, default="reinspection-vlm")
-    parser.add_argument("--wandb_run_name", type=str, default=None)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--local_rank", type=int, default=-1)
-    args = parser.parse_args()
+@hydra.main(config_path="configs", config_name="config", version_base=None)
+def main(cfg: DictConfig) -> None:
+    from reinspection_vlm.config import ReInspectionConfig
+    from reinspection_vlm.train_common import run_training
 
-    config = load_config(args.config, output_dir=args.output_dir)
-    run_training(args.backend, args.stage, config, args)
+    config = ReInspectionConfig(**OmegaConf.to_container(cfg, resolve=True))
+    run_training(config)
 
 
 if __name__ == "__main__":

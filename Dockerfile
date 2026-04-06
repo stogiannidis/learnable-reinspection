@@ -26,27 +26,23 @@ RUN apt-get update && \
         python3.12 \
         python3.12-venv \
         python3.12-dev \
-        python3-pip \
+        curl \
         git \
         build-essential && \
     ln -sf /usr/bin/python3.12 /usr/bin/python && \
     ln -sf /usr/bin/python3.12 /usr/bin/python3 && \
+    curl -Ls https://astral.sh/uv/install.sh | sh && \
+    ln -sf /root/.local/bin/uv /usr/local/bin/uv && \
     apt-get clean && \
-    rm -rf /var/lib/apt/lists/* 
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /data/users/stogian/learnable-reinspection
 
-COPY requirements.vlm.txt requirements.vlm.txt
-COPY reinspection_qwen3vl/requirements.txt reinspection_qwen3vl/requirements.txt
-COPY reinspection_internvl3/requirements.txt reinspection_internvl3/requirements.txt
-COPY reinspection_vlm/requirements.txt reinspection_vlm/requirements.txt
+COPY requirements.vlm.txt .
 
-RUN python -m pip install --no-cache-dir --break-system-packages -r requirements.vlm.txt
+RUN uv pip install --system --no-cache --break-system-packages -r requirements.vlm.txt
 
 COPY reinspection_vlm/ reinspection_vlm/
-COPY reinspection_qwen3vl/ reinspection_qwen3vl/
-COPY reinspection_internvl3/ reinspection_internvl3/
-COPY doc.md simpledoc.md CLAUDE.md ./
 
 RUN mkdir -p \
         /data/users/stogian/.torch \
