@@ -11,6 +11,10 @@ from torch.utils.data import Dataset
 
 from .utils import bbox_to_patch_mask as qwen_bbox_to_patch_mask, build_chat_messages as qwen_build_chat
 from .chat_template import build_chat_messages as intern_build_chat
+from .gemma4_chat import build_chat_messages as gemma4_build_chat
+
+_QWEN_BACKENDS = ("qwen3vl", "qwen25vl")
+_VALID_BACKENDS = ("qwen3vl", "qwen25vl", "internvl3", "gemma4")
 
 
 def _squeeze_intern(batch: Dict) -> Dict:
@@ -58,7 +62,7 @@ def intern_bbox_to_patch_mask(
 
 
 class RefCOCODataset(Dataset):
-    """RefCOCO family loader; use ``backend='qwen3vl'`` or ``'internvl3'``."""
+    """RefCOCO family loader for all supported backends."""
 
     def __init__(
         self,
@@ -73,8 +77,8 @@ class RefCOCODataset(Dataset):
         system_prompt: str = "You are a helpful assistant.",
         answer_ignore_index: int = -100,
     ):
-        if backend not in ("qwen3vl", "internvl3"):
-            raise ValueError(f"backend must be 'qwen3vl' or 'internvl3', got {backend}")
+        if backend not in _VALID_BACKENDS:
+            raise ValueError(f"backend must be one of {_VALID_BACKENDS}, got {backend}")
         self.processor = processor
         self.backend = backend
         self.split = split
@@ -135,7 +139,7 @@ class RefCOCODataset(Dataset):
         bbox_norm = self._coco_to_norm(bbox, img_w, img_h)
         answer = f"[{bbox_norm[0]:.3f}, {bbox_norm[1]:.3f}, {bbox_norm[2]:.3f}, {bbox_norm[3]:.3f}]"
 
-        if self.backend == "qwen3vl":
+        if self.backend in _QWEN_BACKENDS:
             question = f"Locate the following object in the image: {expression}"
             prompt_messages = qwen_build_chat(question, image_path=image_path)
             prompt_text = self.processor.apply_chat_template(
@@ -171,6 +175,33 @@ class RefCOCODataset(Dataset):
                 result["attn_target_mask"] = attn_target
             else:
                 result["attn_target_mask"] = torch.tensor([])
+            result["bbox_norm"] = torch.tensor(bbox_norm, dtype=torch.float32)
+            return result
+
+        if self.backend == "gemma4":
+            question = f"Locate the following object in the image: {expression}"
+            image = Image.open(image_path).convert("RGB")
+            prompt_messages = gemma4_build_chat(
+                question=question, image_path=image_path, system_prompt=self.system_prompt,
+            )
+            full_messages = gemma4_build_chat(
+                question=question, answer=answer, image_path=image_path, system_prompt=self.system_prompt,
+            )
+            prompt_text = self.processor.apply_chat_template(
+                prompt_messages, tokenize=False, add_generation_prompt=True,
+            )
+            full_text = self.processor.apply_chat_template(
+                full_messages, tokenize=False, add_generation_prompt=False,
+            )
+            pk = {"return_tensors": "pt", "images": [image]}
+            prompt_inputs = self.processor(text=[prompt_text], **pk)
+            full_inputs = self.processor(text=[full_text], **pk)
+            prompt_len = prompt_inputs["input_ids"].shape[-1]
+            labels = full_inputs["input_ids"].clone()
+            labels[:, :prompt_len] = self.answer_ignore_index
+            full_inputs["labels"] = labels
+            result = _squeeze_intern(full_inputs)
+            result["attn_target_mask"] = torch.tensor([])
             result["bbox_norm"] = torch.tensor(bbox_norm, dtype=torch.float32)
             return result
 

@@ -12,6 +12,10 @@ from torch.utils.data import ConcatDataset, Dataset
 
 from .utils import build_chat_messages as qwen_build_chat
 from .chat_template import build_chat_messages as intern_build_chat
+from .gemma4_chat import build_chat_messages as gemma4_build_chat
+
+_QWEN_BACKENDS = ("qwen3vl", "qwen25vl")
+_VALID_BACKENDS = ("qwen3vl", "qwen25vl", "internvl3", "gemma4")
 
 logger = logging.getLogger(__name__)
 _MAX_RETRIES = 10
@@ -38,7 +42,7 @@ def _squeeze_intern(batch: Dict) -> Dict:
 
 
 class SpatialVQADataset(Dataset):
-    """JSON/JSONL spatial VQA; set ``backend`` to ``qwen3vl`` or ``internvl3``."""
+    """JSON/JSONL spatial VQA for all supported backends."""
 
     def __init__(
         self,
@@ -53,8 +57,8 @@ class SpatialVQADataset(Dataset):
         system_prompt: str = "You are a helpful assistant.",
         answer_ignore_index: int = -100,
     ):
-        if backend not in ("qwen3vl", "internvl3"):
-            raise ValueError(f"backend must be 'qwen3vl' or 'internvl3', got {backend}")
+        if backend not in _VALID_BACKENDS:
+            raise ValueError(f"backend must be one of {_VALID_BACKENDS}, got {backend}")
         self.processor = processor
         self.backend = backend
         self.image_root = image_root
@@ -82,14 +86,15 @@ class SpatialVQADataset(Dataset):
         return {"return_tensors": "pt"}
 
     def __getitem__(self, idx) -> Dict:
-        if self.backend == "internvl3":
+        if self.backend in ("internvl3", "gemma4"):
+            getter = self._getitem_gemma4 if self.backend == "gemma4" else self._getitem_intern
             for _ in range(_MAX_RETRIES):
                 try:
-                    return self._getitem_intern(idx)
+                    return getter(idx)
                 except (OSError, SyntaxError, Image.UnidentifiedImageError) as exc:
                     logger.warning("Skipping bad sample %d: %s", idx, exc)
                     idx = random.randint(0, len(self.samples) - 1)
-            return self._getitem_intern(idx)
+            return getter(idx)
 
         last_error = None
         for _ in range(3):
@@ -157,6 +162,39 @@ class SpatialVQADataset(Dataset):
         pk = self._intern_proc_kwargs()
         prompt_inputs = self.processor(text=[prompt_text], images=[image], **pk)
         full_inputs = self.processor(text=[full_text], images=[image], **pk)
+        prompt_len = prompt_inputs["input_ids"].shape[-1]
+        labels = full_inputs["input_ids"].clone()
+        labels[:, :prompt_len] = self.answer_ignore_index
+        full_inputs["labels"] = labels
+        result = _squeeze_intern(full_inputs)
+        result["image_path"] = image_path
+        return result
+
+    def _getitem_gemma4(self, idx: int) -> Dict:
+        sample = self.samples[idx]
+        image_path = os.path.join(self.image_root, sample["image"])
+        image = Image.open(image_path).convert("RGB")
+
+        prompt_messages = gemma4_build_chat(
+            question=sample["question"],
+            image_path=image_path,
+            system_prompt=self.system_prompt,
+        )
+        full_messages = gemma4_build_chat(
+            question=sample["question"],
+            answer=sample["answer"],
+            image_path=image_path,
+            system_prompt=self.system_prompt,
+        )
+        prompt_text = self.processor.apply_chat_template(
+            prompt_messages, tokenize=False, add_generation_prompt=True,
+        )
+        full_text = self.processor.apply_chat_template(
+            full_messages, tokenize=False, add_generation_prompt=False,
+        )
+        pk = {"return_tensors": "pt", "images": [image]}
+        prompt_inputs = self.processor(text=[prompt_text], **pk)
+        full_inputs = self.processor(text=[full_text], **pk)
         prompt_len = prompt_inputs["input_ids"].shape[-1]
         labels = full_inputs["input_ids"].clone()
         labels[:, :prompt_len] = self.answer_ignore_index
