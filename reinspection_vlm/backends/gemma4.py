@@ -243,18 +243,28 @@ class Gemma4WithReInspection(nn.Module):
         labels: Optional[torch.LongTensor],
         input_ids: Optional[torch.LongTensor],
     ) -> dict:
-        """Insert R tokens and extend all sequence-aligned tensors."""
+        """Insert R tokens and extend all sequence-aligned tensors.
+
+        ``torch.cat`` keeps ``R`` in the autograd graph for LM loss; backbone
+        segments are detached so CE does not backprop into frozen embeddings.
+        """
         B, L, D = inputs_embeds.shape
         N_q = R.shape[1]
 
-        new_embeds = torch.zeros(
-            B, L + N_q, D, device=inputs_embeds.device, dtype=inputs_embeds.dtype
-        )
+        embed_rows = []
         for b in range(B):
             pos = insert_positions[b].item()
-            new_embeds[b, :pos] = inputs_embeds[b, :pos]
-            new_embeds[b, pos : pos + N_q] = R[b]
-            new_embeds[b, pos + N_q :] = inputs_embeds[b, pos:]
+            embed_rows.append(
+                torch.cat(
+                    [
+                        inputs_embeds[b, :pos].detach(),
+                        R[b],
+                        inputs_embeds[b, pos:].detach(),
+                    ],
+                    dim=0,
+                )
+            )
+        new_embeds = torch.stack(embed_rows, dim=0)
 
         def _insert_1d(src, fill_val, positions):
             parts = []

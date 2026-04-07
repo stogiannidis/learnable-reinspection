@@ -40,6 +40,8 @@ spec:
                 key: WANDB_API_KEY
           - name: OMP_NUM_THREADS
             value: "4"
+          - name: HF_HOME
+            value: "/data/Huggingface"
         resources:
           requests:
             cpu: 16

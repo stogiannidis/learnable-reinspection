@@ -31,6 +31,9 @@ _CONCAT_KEYS = {"pixel_values", "image_grid_thw", "video_grid_thw"}
 _VARLEN_FLOAT_PAD_KEYS = {"attn_target_mask", "bbox_norm"}
 _VARLEN_PAD_KEYS = _VARLEN_FLOAT_PAD_KEYS
 
+# Log once if stage-1 attention targets are resized to match attn_vis width.
+_attn_target_vis_mismatch_logged = False
+
 
 def collate_fn(batch):
     keys = batch[0].keys()
@@ -68,8 +71,12 @@ def _setup_distributed() -> None:
     if dist.is_initialized():
         return
     if "RANK" in os.environ:
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        local_rank = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(
+            backend="nccl",
+            device_id=torch.device("cuda", local_rank),
+        )
 
 
 def _get_local_rank() -> int:
@@ -678,11 +685,18 @@ def _train_forward_kwargs(batch: dict, backend: str, is_stage1: bool) -> dict:
 
 
 def _stage1_attn_loss(config: ReInspectionConfig, outputs, batch, device):
+    global _attn_target_vis_mismatch_logged
     if outputs.attn_vis is None or "attn_target_mask" not in batch:
         return torch.zeros((), device=device)
     target = batch["attn_target_mask"]
     n_v = outputs.attn_vis.shape[-1]
     if target.shape[-1] != n_v:
+        if is_main_process() and not _attn_target_vis_mismatch_logged:
+            log(
+                f"[WARNING] attn_target_mask width {target.shape[-1]} != attn_vis {n_v}; "
+                "truncating/padding for loss. Check image patch counts vs ViT tokens if this persists."
+            )
+            _attn_target_vis_mismatch_logged = True
         target = F.pad(target[:, :n_v], (0, max(0, n_v - target.shape[-1])))
     if config.stage1_attn_loss_type == "kl":
         return compute_attn_loss_kl(outputs.attn_vis, target)
@@ -718,6 +732,21 @@ def _compute_grad_norm(model) -> float:
         if p.requires_grad and p.grad is not None:
             total += p.grad.data.float().norm(2).item() ** 2
     return total ** 0.5
+
+
+def _global_grad_norm_for_log(engine) -> Optional[float]:
+    """Gradient norm for logging.
+
+    Under DeepSpeed ZeRO, gradients are not stored on ``param.grad``; the engine
+    records the global L2 norm during ``step()`` (used for clipping). Call this
+    only **after** ``engine.step()``.
+    """
+    if hasattr(engine, "get_global_grad_norm"):
+        raw = engine.get_global_grad_norm()
+        if raw is None:
+            return None
+        return float(raw)
+    return _compute_grad_norm(engine)
 
 
 def _compute_param_norm(model) -> float:
@@ -853,8 +882,14 @@ def run_training(config: ReInspectionConfig) -> None:
         raise RuntimeError(f"Dataset is empty. Check data_root={config.data_root}")
     log(f"Training samples: {len(train_dataset)}")
 
+    # Keep all ranks aligned: rank-0-only W&B work must finish before any rank
+    # enters the DataLoader/training loop (otherwise NCCL collectives deadlock).
+    if dist.is_initialized():
+        dist.barrier()
     if is_main_process():
         _log_dataset_artifact(train_dataset, stage, backend, config.data_root)
+    if dist.is_initialized():
+        dist.barrier()
 
     num_workers = config.num_workers
     sampler = DistributedSampler(train_dataset) if dist.is_initialized() else None
@@ -872,6 +907,11 @@ def run_training(config: ReInspectionConfig) -> None:
     warmup_override = config.stage1_warmup_steps if is_stage1 else config.stage2_warmup_steps
     num_warmup = warmup_override if warmup_override is not None else int(num_updates * warmup_ratio)
     log(f"Scheduler: {num_updates} update steps, {num_warmup} warmup steps")
+    if is_stage1 and is_main_process():
+        log(
+            f"Stage 1 LR: base lr (first param group)={optimizer.param_groups[0]['lr']:.2e}, "
+            f"linear warmup for {num_warmup} optimizer steps then cosine decay."
+        )
     scheduler = _CosineWarmupLR(optimizer, num_warmup, num_updates)
     _log_wandb({
         "schedule/num_updates": num_updates,
@@ -892,6 +932,11 @@ def run_training(config: ReInspectionConfig) -> None:
     best_epoch_loss = float("inf")
     pfx = f"{backend}_stage{stage}"
 
+    log(
+        "Starting training loop. Console loss logs every 100 micro-steps; "
+        "the first forward/backward on a large VLM can take several minutes."
+    )
+
     for epoch in range(n_epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -900,6 +945,7 @@ def run_training(config: ReInspectionConfig) -> None:
         epoch_ce = 0.0
         epoch_attn = 0.0
         epoch_grounding = 0.0
+        epoch_stage1_supervision = 0.0
 
         for step, batch in enumerate(train_loader):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
@@ -940,10 +986,10 @@ def run_training(config: ReInspectionConfig) -> None:
             ds_engine.backward(micro_loss)
             grad_norm = None
             if (step + 1) % grad_accum == 0:
-                grad_norm = _compute_grad_norm(model)
                 ds_engine.step()
                 scheduler.step()
                 update_step += 1
+                grad_norm = _global_grad_norm_for_log(ds_engine)
 
             epoch_loss += loss.item()
             epoch_ce += ce_loss.item()
@@ -961,6 +1007,14 @@ def run_training(config: ReInspectionConfig) -> None:
                 metrics[f"{pfx}/train/attn_loss"] = attn_loss.item()
             if use_grounding:
                 metrics[f"{pfx}/train/grounding_loss"] = grounding_loss.item()
+            if is_stage1 and (use_attn or use_grounding):
+                stage1_sup = 0.0
+                if use_attn:
+                    stage1_sup += config.stage1_attn_loss_weight * attn_loss.item()
+                if use_grounding:
+                    stage1_sup += config.stage1_grounding_loss_weight * grounding_loss.item()
+                metrics[f"{pfx}/train/stage1_supervision_loss"] = stage1_sup
+                epoch_stage1_supervision += stage1_sup
 
             if grad_norm is not None:
                 metrics[f"{pfx}/train/grad_norm"] = grad_norm
@@ -972,7 +1026,13 @@ def run_training(config: ReInspectionConfig) -> None:
 
             _log_wandb(metrics, global_step)
 
-            if global_step % 1000 == 0:
+            if global_step == 1:
+                log(
+                    f"First training step complete (loss={loss.item():.4f}). "
+                    f"Next console log at step 100."
+                )
+
+            if global_step % 100 == 0:
                 msg = f"Epoch {epoch + 1} Step {global_step}: loss={loss.item():.4f} ce={ce_loss.item():.4f}"
                 if use_attn:
                     msg += f" attn={attn_loss.item():.4f}"
@@ -992,6 +1052,8 @@ def run_training(config: ReInspectionConfig) -> None:
             summary[f"{pfx}/epoch/attn_loss"] = epoch_attn / num_steps
         if use_grounding:
             summary[f"{pfx}/epoch/grounding_loss"] = epoch_grounding / num_steps
+        if is_stage1 and (use_attn or use_grounding):
+            summary[f"{pfx}/epoch/stage1_supervision_loss"] = epoch_stage1_supervision / num_steps
         _log_wandb(summary, global_step)
 
         aux_msg = ""

@@ -4,7 +4,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 ENV TORCH_HOME=/data/users/stogian/.torch \
     HF_HOME=/data/Huggingface \
-    HF_DATASETS_CACHE=/data/Huggingface \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     DNNLIB_CACHE_DIR=/data/users/stogian/.cache/dnnlib \
     TORCH_EXTENSIONS_DIR=/data/users/stogian/.torch/torch_extensions \
@@ -45,6 +44,7 @@ RUN uv pip install --system --no-cache --break-system-packages -r requirements.v
 COPY reinspection_vlm/ reinspection_vlm/
 
 RUN mkdir -p \
+        /data/Huggingface \
         /data/users/stogian/.torch \
         /data/users/stogian/.cache/dnnlib \
         /data/users/stogian/.torch/torch_extensions \
@@ -54,7 +54,7 @@ RUN mkdir -p \
         /data/users/stogian/.cache/triton && \
     groupadd --gid 4451 stogian_ph && \
     useradd -u 30545 -g 4451 -m -s /bin/bash stogian_ph && \
-    chown -R stogian_ph /data/users/stogian
+    chown -R stogian_ph /data/users/stogian /data/Huggingface
 
 RUN chown -R stogian_ph /data/users/stogian/learnable-reinspection
 

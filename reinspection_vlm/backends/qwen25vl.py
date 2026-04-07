@@ -203,12 +203,29 @@ class Qwen25VLWithReInspection(nn.Module):
         labels: Optional[torch.LongTensor],
         input_ids: Optional[torch.LongTensor],
     ) -> dict:
-        """Insert R tokens into the sequence at insert_positions."""
+        """Insert R tokens into the sequence at insert_positions.
+
+        ``torch.cat`` preserves gradients through ``R`` for LM loss; backbone
+        segments are detached.
+        """
         B, L, D = inputs_embeds.shape
         N_q = R.shape[1]
         new_L = L + N_q
 
-        new_embeds = torch.zeros(B, new_L, D, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        embed_rows = []
+        for b in range(B):
+            pos = insert_positions[b].item()
+            embed_rows.append(
+                torch.cat(
+                    [
+                        inputs_embeds[b, :pos].detach(),
+                        R[b],
+                        inputs_embeds[b, pos:].detach(),
+                    ],
+                    dim=0,
+                )
+            )
+        new_embeds = torch.stack(embed_rows, dim=0)
 
         new_attention_mask = None
         if attention_mask is not None:
@@ -224,10 +241,6 @@ class Qwen25VLWithReInspection(nn.Module):
 
         for b in range(B):
             pos = insert_positions[b].item()
-
-            new_embeds[b, :pos] = inputs_embeds[b, :pos]
-            new_embeds[b, pos:pos + N_q] = R[b]
-            new_embeds[b, pos + N_q:] = inputs_embeds[b, pos:]
 
             if attention_mask is not None:
                 new_attention_mask[b, :pos] = attention_mask[b, :pos]

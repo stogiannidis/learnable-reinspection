@@ -4,6 +4,7 @@ Wraps `InternVLForConditionalGeneration`, inserting task-conditioned
 re-inspection tokens (R) into the prompt right before generation, or before the
 first supervised answer token during training.
 """
+import os
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple
@@ -63,6 +64,13 @@ class InternVL3WithReInspection(nn.Module):
         super().__init__()
         self.config = config
         self.base_model = base_model
+        text_hidden = int(base_model.config.text_config.hidden_size)
+        if int(config.d_model) != text_hidden:
+            raise ValueError(
+                f"ReInspectionConfig.d_model={config.d_model} must match "
+                f"base_model.config.text_config.hidden_size={text_hidden} "
+                f"(update configs/backend/internvl3.yaml or your Hydra overrides)."
+            )
         self.reinspection = ReInspectionModule(config)
         self._image_token_id = base_model.config.image_token_id
         self._pad_token_id = getattr(base_model.config.text_config, "pad_token_id", 0) or 0
@@ -222,24 +230,28 @@ class InternVL3WithReInspection(nn.Module):
     ) -> dict:
         """Insert re-inspection tokens and extend sequence-aligned tensors.
 
-        Uses in-place assignment into a fresh zeros buffer (requires_grad=False),
-        which detaches R from the frozen-LLM backward path. This prevents CE
-        gradients from amplifying back through frozen bf16 layers and corrupting
-        the trainable parameters. The reinspection module is trained in stage 1
-        with attn supervision; in stage 2 only LoRA receives CE gradients.
+        Embeddings are built with ``torch.cat`` so CE (and other LM) loss can
+        backprop into ``R`` and train ``W_up`` / value-FFN blocks. Left and
+        right segments are ``detach()``ed so gradients do not flow into frozen
+        backbone embeddings.
         """
         B, L, D = inputs_embeds.shape
         N_q = R.shape[1]
 
-        # --- embeddings: in-place into new buffer (detaches autograd through R) ---
-        new_embeds = torch.zeros(
-            B, L + N_q, D, device=inputs_embeds.device, dtype=inputs_embeds.dtype
-        )
+        embed_rows = []
         for b in range(B):
             pos = insert_positions[b].item()
-            new_embeds[b, :pos] = inputs_embeds[b, :pos]
-            new_embeds[b, pos:pos + N_q] = R[b]
-            new_embeds[b, pos + N_q:] = inputs_embeds[b, pos:]
+            embed_rows.append(
+                torch.cat(
+                    [
+                        inputs_embeds[b, :pos].detach(),
+                        R[b],
+                        inputs_embeds[b, pos:].detach(),
+                    ],
+                    dim=0,
+                )
+            )
+        new_embeds = torch.stack(embed_rows, dim=0)
 
         # --- helper for non-differentiable integer/bool tensors ---
         def _insert_1d(src, fill_val, positions):
@@ -464,8 +476,44 @@ class InternVL3WithReInspection(nn.Module):
         )
 
 
+def _resolve_pretrained_local_path(
+    repo_or_path: str,
+    *,
+    local_rank: int,
+    is_dist: bool,
+) -> str:
+    """Resolve a Hub model id to a local snapshot path for safe multi-GPU loads.
+
+    Rank 0 downloads; all ranks then use ``local_files_only=True`` so non-zero
+    ranks never hit Hub shard resolution with a partially visible cache (common
+    on NFS when multiple processes used ``from_pretrained`` on the repo id).
+    """
+    expanded = os.path.expanduser(repo_or_path)
+    if os.path.isdir(expanded):
+        return expanded
+
+    from huggingface_hub import snapshot_download
+
+    if not is_dist:
+        return repo_or_path
+
+    import torch.distributed as dist
+
+    if local_rank == 0:
+        snapshot_download(repo_id=repo_or_path)
+    dist.barrier()
+    return snapshot_download(repo_id=repo_or_path, local_files_only=True)
+
+
 def load_processor(config: ReInspectionConfig):
-    return AutoProcessor.from_pretrained(config.processor_path)
+    """Load processor; under distributed, rank 0 populates the HF cache first to avoid shard races."""
+    import torch.distributed as dist
+
+    path = config.processor_path
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    is_dist = dist.is_available() and dist.is_initialized()
+    resolved = _resolve_pretrained_local_path(path, local_rank=local_rank, is_dist=is_dist)
+    return AutoProcessor.from_pretrained(resolved)
 
 
 def load_model(
@@ -474,11 +522,17 @@ def load_model(
     processor=None,
 ) -> InternVL3WithReInspection:
     """Load InternVL3-8B and wrap it with the re-inspection module."""
+    import torch.distributed as dist
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    is_dist = dist.is_available() and dist.is_initialized()
+    dtype = torch.bfloat16 if config.bf16 else torch.float32
+    repo = config.model_name_or_path
+    resolved = _resolve_pretrained_local_path(repo, local_rank=local_rank, is_dist=is_dist)
     base_model = InternVLForConditionalGeneration.from_pretrained(
-        config.model_name_or_path,
-        torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
-        device_map=device_map,
+        resolved, torch_dtype=dtype, device_map=device_map
     )
+
     return InternVL3WithReInspection(
         config=config,
         base_model=base_model,
