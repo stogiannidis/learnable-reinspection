@@ -21,11 +21,11 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoProcessor
 
-from reinspection_vlm.attn_loss import compute_attn_loss_focal, compute_attn_loss_kl
-from reinspection_vlm.bbox_head import BboxHead, compute_grounding_loss
-from reinspection_vlm.config import ReInspectionConfig
-from reinspection_vlm.data.refcoco import RefCOCODataset
-from reinspection_vlm.data.spatial_dataset import build_spatial_dataset
+from src.attn_loss import compute_attn_loss_focal, compute_attn_loss_kl
+from src.bbox_head import BboxHead, compute_grounding_loss
+from src.config import ReInspectionConfig
+from src.data.refcoco import RefCOCODataset
+from src.data.spatial_dataset import build_spatial_dataset
 
 _CONCAT_KEYS = {"pixel_values", "image_grid_thw", "video_grid_thw"}
 _VARLEN_FLOAT_PAD_KEYS = {"attn_target_mask", "bbox_norm"}
@@ -216,7 +216,7 @@ def _log_code_artifact() -> None:
         art = wandb.Artifact("source-code", type="code", metadata=_git_info())
         code_dir = os.path.join(os.path.dirname(__file__))
         if os.path.isdir(code_dir):
-            art.add_dir(code_dir, name="reinspection_vlm")
+            art.add_dir(code_dir, name="src")
         wandb.log_artifact(art)
     except Exception:
         pass
@@ -338,7 +338,7 @@ def _attach_bbox_head(model, config: ReInspectionConfig) -> None:
 
 
 def _setup_model_qwen_stage1(config: ReInspectionConfig):
-    from reinspection_vlm.backends.qwen3vl import load_model
+    from src.backends.qwen3vl import load_model
 
     model = load_model(config, device_map=None)
     for param in model.base_model.parameters():
@@ -354,7 +354,7 @@ def _setup_model_qwen_stage1(config: ReInspectionConfig):
 
 
 def _setup_model_qwen_stage2(config: ReInspectionConfig):
-    from reinspection_vlm.backends.qwen3vl import load_model
+    from src.backends.qwen3vl import load_model
 
     model = load_model(config, device_map=None)
     if config.stage1_checkpoint:
@@ -388,7 +388,7 @@ def _setup_model_qwen_stage2(config: ReInspectionConfig):
 
 
 def _setup_model_intern_stage1(config: ReInspectionConfig, processor):
-    from reinspection_vlm.backends.internvl3 import load_model
+    from src.backends.internvl3 import load_model
 
     model = load_model(config, device_map=None, processor=processor)
     for parameter in model.base_model.parameters():
@@ -413,7 +413,7 @@ def _setup_model_intern_stage1(config: ReInspectionConfig, processor):
 
 
 def _setup_model_intern_stage2(config: ReInspectionConfig, processor, stage1_checkpoint: Optional[str]):
-    from reinspection_vlm.backends.internvl3 import load_model
+    from src.backends.internvl3 import load_model
 
     model = load_model(config, device_map=None, processor=processor)
     if stage1_checkpoint:
@@ -451,7 +451,7 @@ def _setup_model_intern_stage2(config: ReInspectionConfig, processor, stage1_che
 # ---- Qwen2.5-VL setup (same architecture as Qwen3VL) ----
 
 def _setup_model_qwen25_stage1(config: ReInspectionConfig):
-    from reinspection_vlm.backends.qwen25vl import load_model
+    from src.backends.qwen25vl import load_model
 
     model = load_model(config, device_map=None)
     for param in model.base_model.parameters():
@@ -467,7 +467,7 @@ def _setup_model_qwen25_stage1(config: ReInspectionConfig):
 
 
 def _setup_model_qwen25_stage2(config: ReInspectionConfig):
-    from reinspection_vlm.backends.qwen25vl import load_model
+    from src.backends.qwen25vl import load_model
 
     model = load_model(config, device_map=None)
     if config.stage1_checkpoint:
@@ -503,7 +503,7 @@ def _setup_model_qwen25_stage2(config: ReInspectionConfig):
 # ---- Gemma4 setup ----
 
 def _setup_model_gemma4_stage1(config: ReInspectionConfig, processor):
-    from reinspection_vlm.backends.gemma4 import load_model
+    from src.backends.gemma4 import load_model
 
     model = load_model(config, device_map=None, processor=processor)
     for parameter in model.base_model.parameters():
@@ -519,7 +519,7 @@ def _setup_model_gemma4_stage1(config: ReInspectionConfig, processor):
 
 
 def _setup_model_gemma4_stage2(config: ReInspectionConfig, processor, stage1_checkpoint: Optional[str]):
-    from reinspection_vlm.backends.gemma4 import load_model
+    from src.backends.gemma4 import load_model
 
     model = load_model(config, device_map=None, processor=processor)
     if stage1_checkpoint:
@@ -808,11 +808,11 @@ def run_training(config: ReInspectionConfig) -> None:
 
     processor = None
     if backend == "internvl3":
-        from reinspection_vlm.backends.internvl3 import load_processor
+        from src.backends.internvl3 import load_processor
 
         processor = load_processor(config)
     elif backend == "gemma4":
-        from reinspection_vlm.backends.gemma4 import load_processor as load_gemma4_proc
+        from src.backends.gemma4 import load_processor as load_gemma4_proc
 
         processor = load_gemma4_proc(config)
     _init_wandb(config)
@@ -1024,7 +1024,8 @@ def run_training(config: ReInspectionConfig) -> None:
                 metrics[f"{pfx}/system/gpu_mem_allocated_gb"] = torch.cuda.memory_allocated(device) / (1024 ** 3)
                 metrics[f"{pfx}/system/gpu_mem_reserved_gb"] = torch.cuda.memory_reserved(device) / (1024 ** 3)
 
-            _log_wandb(metrics, global_step)
+            if global_step % config.wandb_log_interval == 0:
+                _log_wandb(metrics, global_step)
 
             if global_step == 1:
                 log(
@@ -1066,7 +1067,11 @@ def run_training(config: ReInspectionConfig) -> None:
             + aux_msg
         )
 
-        save_dir = os.path.join(config.output_dir, backend, f"stage{stage}", f"epoch_{epoch + 1}")
+        parts = [config.output_dir, backend]
+        if config.experiment_name:
+            parts.append(config.experiment_name)
+        parts.extend([f"stage{stage}", f"epoch_{epoch + 1}"])
+        save_dir = os.path.join(*parts)
         _save_checkpoint(
             ds_engine,
             save_dir=save_dir,

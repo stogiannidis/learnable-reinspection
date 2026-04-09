@@ -122,7 +122,7 @@ with expansion factor $m = 4$: $W_1 \in \mathbb{R}^{d_r \times m \cdot d_r}$, $W
 
 ## 4. ReInspectionModule Architecture
 
-**Source:** `reinspection_vlm/reinspection_module.py`
+**Source:** `src/reinspection_module.py`
 
 ### Component Inventory
 
@@ -174,7 +174,7 @@ def forward(
 
 ### 5.1 Qwen3-VL Integration
 
-**Source:** `reinspection_vlm/backends/qwen3vl.py`
+**Source:** `src/backends/qwen3vl.py`
 
 **Class:** `Qwen3VLWithReInspection(nn.Module)` -- wraps (does not subclass) `Qwen3VLForConditionalGeneration`.
 
@@ -226,7 +226,7 @@ DeepStack injects per-layer vision features into specific LLM layers. The `visua
 
 ### 5.2 InternVL3 Integration
 
-**Source:** `reinspection_vlm/backends/internvl3.py`
+**Source:** `src/backends/internvl3.py`
 
 **Class:** `InternVL3WithReInspection(nn.Module)` -- wraps `InternVLForConditionalGeneration`.
 
@@ -258,7 +258,7 @@ At initialization, the wrapper probes the tokenizer to detect the generation pro
 
 ## 6. Training Pipeline
 
-**Source:** `reinspection_vlm/train_common.py`
+**Source:** `src/train_common.py`
 
 ### 6.1 Two-Stage Training Strategy
 
@@ -398,7 +398,7 @@ Console logging every 50 steps.
 
 ## 7. Attention Supervision Losses
 
-**Source:** `reinspection_vlm/attn_loss.py`
+**Source:** `src/attn_loss.py`
 
 Stage 1 training uses attention supervision to guide the visual cross-attention heads toward bounding box regions. Two loss functions are supported:
 
@@ -469,7 +469,7 @@ if target.shape[-1] != n_v:
 
 ### 8.1 RefCOCO Dataset (Stage 1)
 
-**Source:** `reinspection_vlm/data/refcoco.py`
+**Source:** `src/data/refcoco.py`
 
 Loads annotations from RefCOCO, RefCOCO+, and RefCOCOg with unified preprocessing.
 
@@ -534,7 +534,7 @@ Maps to InternVL's fixed 16x16 patch grid:
 
 ### 8.2 Spatial VQA Dataset (Stage 2)
 
-**Source:** `reinspection_vlm/data/spatial_dataset.py`
+**Source:** `src/data/spatial_dataset.py`
 
 #### Benchmarks
 
@@ -620,7 +620,7 @@ Handles heterogeneous tensor shapes across a batch:
 
 ## 9. Evaluation Framework
 
-**Source:** `reinspection_vlm/evaluate.py`
+**Source:** `src/evaluate.py`
 
 ### 9.1 Evaluation Conditions
 
@@ -716,7 +716,7 @@ Mean           |  59.1%  |   64.3%   |    68.9%
 
 ## 10. Configuration Reference
 
-**Source:** `reinspection_vlm/config.py`
+**Source:** `src/config.py`
 
 ### ReInspectionConfig Dataclass
 
@@ -804,7 +804,7 @@ All fields with their defaults and per-backend overrides:
 
 ### YAML Configuration Files
 
-**Hydra:** `reinspection_vlm/configs/config.yaml` composes `backend/*.yaml` (e.g. `internvl3`, `qwen3vl`) and `stage/*.yaml` (e.g. `stage1`, `stage2`, `eval`). Override with `key=value` on the CLI.
+**Hydra:** `src/configs/config.yaml` composes `backend/*.yaml` (e.g. `internvl3`, `qwen3vl`) and `stage/*.yaml` (e.g. `stage1`, `stage2`, `eval`). Override with `key=value` on the CLI.
 
 **DeepSpeed JSON** (paths referenced from backend YAML):
 
@@ -850,7 +850,7 @@ Key environment variables set in the image:
 
 ### 11.2 DeepSpeed Configuration
 
-**Files:** `reinspection_vlm/configs/{qwen3vl,internvl3}/deepspeed_z3.json`
+**Files:** `src/configs/{qwen3vl,internvl3}/deepspeed_z3.json`
 
 Both backends use identical ZeRO-3 configs:
 
@@ -905,7 +905,7 @@ Resource requests:
 
 ### 11.4 Shell Scripts
 
-**Directory:** `reinspection_vlm/scripts/`
+**Directory:** `src/scripts/`
 
 | Script | Purpose | Launcher |
 |--------|---------|----------|
@@ -976,7 +976,7 @@ All scripts:
 
 ## Appendix A: Output Dataclass
 
-**Source:** `reinspection_vlm/outputs.py`
+**Source:** `src/outputs.py`
 
 ```python
 @dataclass
@@ -996,12 +996,12 @@ class ReInspectionOutput(ModelOutput):
 
 ```
 learnable-reinspection/
-    reinspection_vlm/
+    src/
         __init__.py
         config.py                    # ReInspectionConfig dataclass
         reinspection_module.py       # Core module (BottleneckCrossAttention, ReInspectionModule)
         outputs.py                   # ReInspectionOutput dataclass
-        train.py                     # Hydra entry (deepspeed --module reinspection_vlm.train …)
+        train.py                     # Hydra entry (deepspeed --module src.train …)
         hydra_util.py                # e.g. strip --local_rank for Hydra
         train_common.py              # Shared training loop, optimizer setup, checkpointing
         evaluate.py                  # Benchmark evaluation with comparison tables

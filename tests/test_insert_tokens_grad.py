@@ -2,8 +2,8 @@
 
 import torch
 
-from reinspection_vlm.config import ReInspectionConfig
-from reinspection_vlm.reinspection_module import ReInspectionModule
+from src.config import ReInspectionConfig
+from src.reinspection_module import ReInspectionModule
 
 
 def _stack_insert_embeds(

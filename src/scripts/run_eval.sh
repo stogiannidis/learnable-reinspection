@@ -4,4 +4,4 @@
 set -euo pipefail
 cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
-python -m reinspection_vlm.evaluate stage=eval "$@"
+python -m src.evaluate stage=eval "$@"

@@ -17,6 +17,8 @@ class ReInspectionConfig:
     stage1_checkpoint: Optional[str] = None
     wandb_project: Optional[str] = None
     wandb_run_name: Optional[str] = None
+    wandb_log_interval: int = 300
+    experiment_name: Optional[str] = None
     num_workers: int = 4
 
     # Eval-specific

@@ -10,9 +10,9 @@ import torch.nn as nn
 from typing import Optional, Tuple
 from transformers import AutoProcessor, InternVLForConditionalGeneration
 
-from reinspection_vlm.config import ReInspectionConfig
-from reinspection_vlm.outputs import ReInspectionOutput
-from reinspection_vlm.reinspection_module import ReInspectionModule
+from src.config import ReInspectionConfig
+from src.outputs import ReInspectionOutput
+from src.reinspection_module import ReInspectionModule
 
 
 def _chunked_cross_entropy(

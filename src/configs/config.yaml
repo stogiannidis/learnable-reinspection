@@ -14,4 +14,6 @@ hydra:
 data_root: /data/datasets
 output_dir: models
 wandb_run_name: null
-num_workers: 4
+wandb_log_interval: 300
+experiment_name: null
+num_workers: 16

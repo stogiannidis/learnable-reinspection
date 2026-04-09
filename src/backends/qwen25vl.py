@@ -13,9 +13,9 @@ import torch.nn.functional as F
 from typing import Optional, List, Tuple
 from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
-from reinspection_vlm.config import ReInspectionConfig
-from reinspection_vlm.outputs import ReInspectionOutput
-from reinspection_vlm.reinspection_module import ReInspectionModule
+from src.config import ReInspectionConfig
+from src.outputs import ReInspectionOutput
+from src.reinspection_module import ReInspectionModule
 
 
 class Qwen25VLWithReInspection(nn.Module):

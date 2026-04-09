@@ -9,9 +9,9 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor
 
-from reinspection_vlm.backends.qwen3vl import load_model
-from reinspection_vlm.config import ReInspectionConfig
-from reinspection_vlm.data.utils import build_chat_messages
+from src.backends.qwen3vl import load_model
+from src.config import ReInspectionConfig
+from src.data.utils import build_chat_messages
 
 
 def plot_attention_heatmap(

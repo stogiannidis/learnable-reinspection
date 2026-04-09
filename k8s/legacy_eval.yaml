@@ -23,7 +23,7 @@ spec:
           - -c
           - |
             mkdir -p logs models
-            bash reinspection_vlm/scripts/run_eval.sh backend=internvl3_legacy 2>&1 | tee logs/internvl_legacy_eval.log
+            bash src/scripts/run_eval.sh backend=internvl3_legacy 2>&1 | tee logs/internvl_legacy_eval.log
         terminationMessagePath: "/tmp/my-log"
         terminationMessagePolicy: File
         imagePullPolicy: "Always"

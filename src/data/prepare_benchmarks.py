@@ -1,8 +1,8 @@
 """Download and convert external benchmarks to the standard {image, question, answer} JSON format.
 
 Usage:
-    python -m reinspection_vlm.data.prepare_benchmarks --output_dir /data/datasets --benchmarks all
-    python -m reinspection_vlm.data.prepare_benchmarks --output_dir /data/datasets --benchmarks 3dsrbench blink
+    python -m src.data.prepare_benchmarks --output_dir /data/datasets --benchmarks all
+    python -m src.data.prepare_benchmarks --output_dir /data/datasets --benchmarks 3dsrbench blink
 """
 
 from __future__ import annotations
@@ -501,7 +501,7 @@ def main() -> None:
             PREPARE_FNS[bm](args.output_dir)
 
     print("\nDone! Run evaluation with:")
-    print(f"  python -m reinspection_vlm.evaluate stage=eval benchmarks='[{','.join(benchmarks)}]'")
+    print(f"  python -m src.evaluate stage=eval benchmarks='[{','.join(benchmarks)}]'")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 # @package _global_
 backend: internvl3
 model_name_or_path: OpenGVLab/InternVL3-8B-hf
-deepspeed_config: reinspection_vlm/configs/deepspeed_z3.json
+deepspeed_config: src/configs/deepspeed_z3.json
 wandb_project: reinspection-internvl3
 
 # Re-Inspection Module
@@ -22,7 +22,7 @@ stage1_warmup_ratio: 0.03
 stage1_aux_loss: attn
 stage1_attn_loss_weight: 0.5
 stage1_train_projector: false
-stage1_attn_loss_type: focal
+stage1_attn_loss_type: grounding
 
 # Stage 2
 stage2_lr_module: 5.0e-5

@@ -1,6 +1,6 @@
 """Unified spatial-benchmark evaluation for Qwen3-VL, Qwen2.5-VL, InternVL3 and Gemma4 backends.
 
-Entry point is Hydra-only: ``python -m reinspection_vlm.evaluate stage=eval [overrides]``.
+Entry point is Hydra-only: ``python -m src.evaluate stage=eval [overrides]``.
 """
 
 from __future__ import annotations
@@ -31,13 +31,13 @@ from transformers import (
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
-from reinspection_vlm.config import ReInspectionConfig
-from reinspection_vlm.data.chat_template import build_chat_messages as intern_build_chat
-from reinspection_vlm.data.gemma4_chat import build_chat_messages as gemma4_build_chat
-from reinspection_vlm.data.spatial_dataset import SpatialVQADataset
-from reinspection_vlm.data.utils import build_chat_messages as qwen_build_chat
-from reinspection_vlm.hydra_util import strip_deepspeed_local_rank_argv
-from reinspection_vlm.train_common import _env_info, _git_info
+from src.config import ReInspectionConfig
+from src.data.chat_template import build_chat_messages as intern_build_chat
+from src.data.gemma4_chat import build_chat_messages as gemma4_build_chat
+from src.data.spatial_dataset import SpatialVQADataset
+from src.data.utils import build_chat_messages as qwen_build_chat
+from src.hydra_util import strip_deepspeed_local_rank_argv
+from src.train_common import _env_info, _git_info
 
 strip_deepspeed_local_rank_argv()
 
@@ -385,7 +385,7 @@ def load_condition_model(
         )
 
     if backend == "qwen3vl":
-        from reinspection_vlm.backends.qwen3vl import load_model as load_qwen_ri
+        from src.backends.qwen3vl import load_model as load_qwen_ri
 
         if condition == "reinspection":
             model = load_qwen_ri(config, device_map="auto")
@@ -401,7 +401,7 @@ def load_condition_model(
         return model, False
 
     if backend == "qwen25vl":
-        from reinspection_vlm.backends.qwen25vl import load_model as load_qwen25_ri
+        from src.backends.qwen25vl import load_model as load_qwen25_ri
 
         if condition == "reinspection":
             model = load_qwen25_ri(config, device_map="auto")
@@ -417,7 +417,7 @@ def load_condition_model(
         return model, False
 
     if backend == "gemma4":
-        from reinspection_vlm.backends.gemma4 import load_model as load_gemma4_ri
+        from src.backends.gemma4 import load_model as load_gemma4_ri
 
         if condition == "reinspection":
             model = load_gemma4_ri(config, device_map="auto", processor=processor)
@@ -432,7 +432,7 @@ def load_condition_model(
             _load_lora_only(model, checkpoint_dir, lora_checkpoint_dir)
         return model, False
 
-    from reinspection_vlm.backends.internvl3 import load_model as load_intern_ri
+    from src.backends.internvl3 import load_model as load_intern_ri
 
     if condition == "reinspection":
         model = load_intern_ri(config, device_map="auto", processor=processor)
@@ -485,8 +485,8 @@ def evaluate_benchmark(
     device = model_device(model)
     model.eval()
 
-    from reinspection_vlm.backends.internvl3 import InternVL3WithReInspection
-    from reinspection_vlm.backends.gemma4 import Gemma4WithReInspection
+    from src.backends.internvl3 import InternVL3WithReInspection
+    from src.backends.gemma4 import Gemma4WithReInspection
 
     _QWEN_BACKENDS = ("qwen3vl", "qwen25vl")
     _PROMPT_LEN_BACKENDS = ("internvl3", "gemma4")
@@ -616,11 +616,11 @@ def main(cfg: DictConfig) -> None:
 
     processor = None
     if backend == "internvl3":
-        from reinspection_vlm.backends.internvl3 import load_processor
+        from src.backends.internvl3 import load_processor
 
         processor = load_processor(config)
     elif backend == "gemma4":
-        from reinspection_vlm.backends.gemma4 import load_processor as load_gemma4_proc
+        from src.backends.gemma4 import load_processor as load_gemma4_proc
 
         processor = load_gemma4_proc(config)
     else:

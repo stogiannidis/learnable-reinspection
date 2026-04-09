@@ -2,4 +2,4 @@
 stage: 1
 output_dir: models
 stage1_checkpoint: null
-wandb_run_name: internvl-stage1
+wandb_run_name: internvl-stage1-grounding

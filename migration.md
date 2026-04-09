@@ -4,11 +4,11 @@
 
 | File | Change |
 |------|--------|
-| `reinspection_vlm/configs/qwen3vl/deepspeed_z3.json` | New ZeRO-3 config |
-| `reinspection_vlm/configs/internvl3/deepspeed_z3.json` | New ZeRO-3 config |
-| `reinspection_vlm/train_common.py` | `_save_checkpoint` uses `GatheredParameters` for ZeRO-3 |
-| `reinspection_vlm/scripts/run_stage1.sh` | Opt-in `DEEPSPEED_CONFIG` env var |
-| `reinspection_vlm/scripts/run_stage2.sh` | Opt-in `DEEPSPEED_CONFIG` env var |
+| `src/configs/qwen3vl/deepspeed_z3.json` | New ZeRO-3 config |
+| `src/configs/internvl3/deepspeed_z3.json` | New ZeRO-3 config |
+| `src/train_common.py` | `_save_checkpoint` uses `GatheredParameters` for ZeRO-3 |
+| `src/scripts/run_stage1.sh` | Opt-in `DEEPSPEED_CONFIG` env var |
+| `src/scripts/run_stage2.sh` | Opt-in `DEEPSPEED_CONFIG` env var |
 | `k8s/stage1.yaml`, `k8s/stage2.yaml` | `DEEPSPEED_CONFIG` set to qwen3vl z3 config |
 | `k8s/internvl_stage1.yaml`, `k8s/internvl_stage2.yaml` | `DEEPSPEED_CONFIG` set to internvl3 z3 config |
 
@@ -41,16 +41,16 @@ All ranks must enter the `with` block (collective op). Only rank 0 writes to dis
 ### Local / interactive
 ```bash
 # Qwen Stage 1 with ZeRO-3
-DEEPSPEED_CONFIG=reinspection_vlm/configs/qwen3vl/deepspeed_z3.json \
-  bash reinspection_vlm/scripts/run_stage1.sh
+DEEPSPEED_CONFIG=src/configs/qwen3vl/deepspeed_z3.json \
+  bash src/scripts/run_stage1.sh
 
 # InternVL Stage 2 with ZeRO-3
 BACKEND=internvl3 \
-DEEPSPEED_CONFIG=reinspection_vlm/configs/internvl3/deepspeed_z3.json \
-  bash reinspection_vlm/scripts/run_stage2.sh
+DEEPSPEED_CONFIG=src/configs/internvl3/deepspeed_z3.json \
+  bash src/scripts/run_stage2.sh
 
 # Without DeepSpeed (plain DDP, unchanged behaviour)
-bash reinspection_vlm/scripts/run_stage1.sh
+bash src/scripts/run_stage1.sh
 ```
 
 ### Kubernetes

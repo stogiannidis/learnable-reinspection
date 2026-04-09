@@ -4,4 +4,4 @@
 set -euo pipefail
 cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
-deepspeed --module reinspection_vlm.train stage=stage2 "$@"
+deepspeed --module src.train stage=stage2 "$@"

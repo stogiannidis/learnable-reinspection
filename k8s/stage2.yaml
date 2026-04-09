@@ -23,7 +23,7 @@ spec:
           - -c
           - |
             mkdir -p logs models
-            bash reinspection_vlm/scripts/run_stage2.sh 2>&1 | tee logs/internvl_stage2.log
+            bash src/scripts/run_stage2.sh 2>&1 | tee logs/internvl_stage2.log
         terminationMessagePath: "/tmp/my-log"
         terminationMessagePolicy: File
         imagePullPolicy: "Always"

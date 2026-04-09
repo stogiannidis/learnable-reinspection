@@ -41,7 +41,7 @@ COPY requirements.vlm.txt .
 
 RUN uv pip install --system --no-cache --break-system-packages -r requirements.vlm.txt
 
-COPY reinspection_vlm/ reinspection_vlm/
+COPY src/ src/
 
 RUN mkdir -p \
         /data/Huggingface \

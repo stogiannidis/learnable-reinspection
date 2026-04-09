@@ -1,7 +1,7 @@
 # @package _global_
 backend: qwen3vl
 model_name_or_path: Qwen/Qwen3-VL-8B-Instruct
-deepspeed_config: reinspection_vlm/configs/deepspeed_z3.json
+deepspeed_config: src/configs/deepspeed_z3.json
 wandb_project: reinspection-qwen3vl
 
 # Re-Inspection Module
