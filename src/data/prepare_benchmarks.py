@@ -401,34 +401,30 @@ def prepare_blink(output_dir: str, subtasks: Optional[List[str]] = None) -> None
 # SRBench (Mind the Gap)                                                       #
 # --------------------------------------------------------------------------- #
 def prepare_srbench(output_dir: str) -> None:
-    """Download stogiannidis/srbench from HuggingFace and convert.
+    """Download stogian/srbenchv3 from HuggingFace and convert.
 
     Format: {image (PIL), question (str), answer (str)}
     This is already in our target format; we just need to save images to disk.
     """
     from datasets import load_dataset
 
-    print("\n=== Preparing SRBench ===")
+    print("\n=== Preparing SRBench (v3) ===")
     bench_dir = _ensure_dir(os.path.join(output_dir, "srbench"))
     img_dir = _ensure_dir(os.path.join(bench_dir, "images"))
 
     try:
-        ds = load_dataset("stogiannidis/srbench", split="test")
-    except Exception:
-        # Try alternative name
+        ds = load_dataset("stogian/srbenchv3", split="test")
+    except Exception as e:
+        print(f"  Failed to load stogian/srbenchv3: {e}")
+        print("  Trying all available splits...")
         try:
-            ds = load_dataset("stogian/srbench", split="test")
-        except Exception as e:
-            print(f"  Failed to load SRBench: {e}")
-            print("  Trying all available splits...")
-            try:
-                ds_dict = load_dataset("stogiannidis/srbench")
-                split_name = list(ds_dict.keys())[0]
-                ds = ds_dict[split_name]
-                print(f"  Using split: {split_name}")
-            except Exception as e2:
-                print(f"  Could not load SRBench from HuggingFace: {e2}")
-                return
+            ds_dict = load_dataset("stogian/srbenchv3")
+            split_name = list(ds_dict.keys())[0]
+            ds = ds_dict[split_name]
+            print(f"  Using split: {split_name}")
+        except Exception as e2:
+            print(f"  Could not load SRBench v3 from HuggingFace: {e2}")
+            return
 
     samples = []
     for i, row in enumerate(tqdm(ds, desc="SRBench")):

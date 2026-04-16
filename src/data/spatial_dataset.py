@@ -236,6 +236,18 @@ def build_spatial_dataset(
             "data_file": os.path.join(data_root, "spatialbench", f"{split}.json"),
             "image_root": os.path.join(data_root, "spatialbench", "images"),
         },
+        "rel3d": {
+            "data_file": os.path.join(data_root, "rel3d", f"{split}.json"),
+            "image_root": os.path.join(data_root, "rel3d", "images"),
+        },
+        "cambrian_spatial": {
+            "data_file": os.path.join(data_root, "cambrian_spatial", f"{split}.json"),
+            "image_root": os.path.join(data_root, "cambrian_spatial", "images"),
+        },
+        "clevr_spatial": {
+            "data_file": os.path.join(data_root, "clevr_spatial", f"{split}.json"),
+            "image_root": os.path.join(data_root, "clevr_spatial", "images"),
+        },
     }
 
     all_datasets = []
