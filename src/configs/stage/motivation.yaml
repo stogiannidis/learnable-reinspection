@@ -1,0 +1,12 @@
+# @package _global_
+# Motivation experiment: spatial minimal-pair flip consistency + attention divergence
+#
+# Usage:
+#   python -m src.motivation stage=motivation backend=qwen3vl
+#   python -m src.motivation stage=motivation backend=qwen3vl checkpoint_dir=models/qwen3vl/stage2/epoch_10
+#   python -m src.motivation stage=motivation backend=internvl3 max_samples=200
+
+stage: 2
+output_file: outputs/motivation/motivation_results.json
+eval_condition: frozen
+max_samples: -1
