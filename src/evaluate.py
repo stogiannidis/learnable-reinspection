@@ -31,6 +31,7 @@ from transformers import (
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
+from src.backends.hf_hub_utils import resolve_pretrained_local_path
 from src.config import ReInspectionConfig
 from src.data.chat_template import build_chat_messages as intern_build_chat
 from src.data.gemma4_chat import build_chat_messages as gemma4_build_chat
@@ -258,16 +259,18 @@ def match_answer(generated: str, ground_truth: str) -> bool:
     gen_norm = normalize_answer(generated)
     gt_norm = normalize_answer(ground_truth)
 
-    # Direct match or substring
-    if gen_norm == gt_norm or gt_norm in gen_norm:
-        return True
-
-    # MCQ letter matching: if ground truth is a single letter (A-D),
-    # try to extract a letter from the generated text
-    if gt_norm.upper() in {"A", "B", "C", "D"}:
+    # Single-letter MCQ (A–D): never use substring — e.g. gt "A" must not match
+    # the character "a" inside "space" / "shape" in long free-form answers.
+    if len(gt_norm) == 1 and gt_norm.upper() in {"A", "B", "C", "D"}:
+        if gen_norm == gt_norm:
+            return True
         gen_letter = _extract_mcq_letter(generated)
         if gen_letter is not None:
             return gen_letter == gt_norm.upper()
+        return False
+
+    if gen_norm == gt_norm or gt_norm in gen_norm:
+        return True
 
     return False
 
@@ -277,10 +280,12 @@ def print_comparison_table(all_results: list, output_file: Optional[str] = None)
     if not all_results:
         return
 
-    # {condition: {benchmark: accuracy}}
+    # {condition: {benchmark: accuracy}} and totals for mean (exclude 0-sample runs)
     table: Dict[str, Dict[str, float]] = defaultdict(dict)
+    totals: Dict[str, Dict[str, int]] = defaultdict(dict)
     for r in all_results:
         table[r["condition"]][r["benchmark"]] = r["accuracy"]
+        totals[r["condition"]][r["benchmark"]] = int(r.get("total", 0))
 
     conditions = list(dict.fromkeys(r["condition"] for r in all_results))
     benchmarks = list(dict.fromkeys(r["benchmark"] for r in all_results))
@@ -306,7 +311,11 @@ def print_comparison_table(all_results: list, output_file: Optional[str] = None)
 
     means: Dict[str, Optional[float]] = {}
     for c in conditions:
-        vals = [table[c][b] for b in benchmarks if b in table[c]]
+        vals = [
+            table[c][b]
+            for b in benchmarks
+            if b in table[c] and totals[c].get(b, 0) > 0
+        ]
         means[c] = float(np.mean(vals)) if vals else None
 
     lines.append(
@@ -391,8 +400,9 @@ def load_condition_model(
             model = load_qwen_ri(config, device_map="auto")
             _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir)
             return model, True
+        resolved = resolve_pretrained_local_path(config.model_name_or_path)
         model = Qwen3VLForConditionalGeneration.from_pretrained(
-            config.model_name_or_path,
+            resolved,
             torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
             device_map="auto",
         )
@@ -407,8 +417,9 @@ def load_condition_model(
             model = load_qwen25_ri(config, device_map="auto")
             _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir)
             return model, True
+        resolved = resolve_pretrained_local_path(config.model_name_or_path)
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            config.model_name_or_path,
+            resolved,
             torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
             device_map="auto",
         )
@@ -423,8 +434,9 @@ def load_condition_model(
             model = load_gemma4_ri(config, device_map="auto", processor=processor)
             _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir)
             return model, True
+        resolved = resolve_pretrained_local_path(config.model_name_or_path)
         model = Gemma4ForConditionalGeneration.from_pretrained(
-            config.model_name_or_path,
+            resolved,
             torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
             device_map="auto",
         )
@@ -439,8 +451,9 @@ def load_condition_model(
         _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir)
         return model, True
 
+    resolved = resolve_pretrained_local_path(config.model_name_or_path)
     model = InternVLForConditionalGeneration.from_pretrained(
-        config.model_name_or_path,
+        resolved,
         torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
         device_map="auto",
     )
@@ -624,8 +637,9 @@ def main(cfg: DictConfig) -> None:
 
         processor = load_gemma4_proc(config)
     else:
+        resolved = resolve_pretrained_local_path(config.model_name_or_path)
         processor = AutoProcessor.from_pretrained(
-            config.model_name_or_path,
+            resolved,
             max_pixels=config.max_pixels,
             min_pixels=config.min_pixels,
         )

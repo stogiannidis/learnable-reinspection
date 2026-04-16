@@ -1,0 +1,11 @@
+# @package _global_
+# InternVL3 Stage 1 (grounding aux) + Stage 2 eval. Run: python -m src.evaluate stage=eval_grounding backend=internvl3 data_root=...
+stage: 2
+checkpoint_dir: models/internvl3/grounding/stage2/epoch_1
+lora_checkpoint_dir: null
+output_file: outputs/internvl3/eval_grounding_results.json
+benchmarks: [vsr, gqa_spatial, 3dsrbench, mindcube, blink, srbench]
+eval_condition: reinspection
+eval_compare: true
+max_samples: -1
+wandb_run_name: eval-internvl3-grounding
