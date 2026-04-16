@@ -11,12 +11,14 @@ Key differences from the Qwen backends:
     ``image_token_id`` and bracketed by ``boi_token_id`` / ``eoi_token_id``.
   - Generation passes pre-built ``inputs_embeds`` (like InternVL3).
 """
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 from transformers import AutoProcessor, Gemma4ForConditionalGeneration
 
+from src.backends.hf_hub_utils import resolve_pretrained_local_path
 from src.config import ReInspectionConfig
 from src.outputs import ReInspectionOutput
 from src.reinspection_module import ReInspectionModule
@@ -242,6 +244,7 @@ class Gemma4WithReInspection(nn.Module):
         position_ids: Optional[torch.LongTensor],
         labels: Optional[torch.LongTensor],
         input_ids: Optional[torch.LongTensor],
+        mm_token_type_ids: Optional[torch.LongTensor] = None,
     ) -> dict:
         """Insert R tokens and extend all sequence-aligned tensors.
 
@@ -302,6 +305,9 @@ class Gemma4WithReInspection(nn.Module):
                 raise ValueError(f"Unsupported position_ids rank: {position_ids.ndim}")
 
         new_mm_token_type_ids = None
+        if mm_token_type_ids is not None:
+            # R slots are text-type (0); matches Qwen path in qwen3vl.generate.
+            new_mm_token_type_ids = _insert_1d(mm_token_type_ids, 0, insert_positions)
 
         return {
             "inputs_embeds": new_embeds,
@@ -309,6 +315,7 @@ class Gemma4WithReInspection(nn.Module):
             "position_ids": new_position_ids,
             "labels": new_labels,
             "input_ids": new_input_ids,
+            "mm_token_type_ids": new_mm_token_type_ids,
         }
 
     # ------------------------------------------------------------------
@@ -329,7 +336,22 @@ class Gemma4WithReInspection(nn.Module):
                 pixel_values=pixel_values,
                 image_position_ids=image_position_ids,
             )
-            image_features = image_outputs.to(inputs_embeds.device, inputs_embeds.dtype)
+            # HF returns a ModelOutput (e.g. BaseModelOutputWithPooling), not a Tensor.
+            pooler = getattr(image_outputs, "pooler_output", None)
+            if pooler is not None:
+                image_features = pooler
+            else:
+                last_hs = getattr(image_outputs, "last_hidden_state", None)
+                if last_hs is None:
+                    raise TypeError(
+                        f"get_image_features returned {type(image_outputs)} without pooler_output or last_hidden_state"
+                    )
+                inner = getattr(self.base_model, "model", self.base_model)
+                embed_vision = getattr(inner, "embed_vision", None)
+                if embed_vision is None:
+                    raise TypeError("Gemma4 embed_vision is missing; cannot build image features")
+                image_features = embed_vision(inputs_embeds=last_hs)
+            image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
             image_mask = (input_ids == self._image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
             return inputs_embeds, image_features
@@ -352,6 +374,10 @@ class Gemma4WithReInspection(nn.Module):
     ) -> dict:
         if inputs_embeds is None:
             inputs_embeds = self.base_model.get_input_embeddings()(input_ids)
+
+        if mm_token_type_ids is None and self._image_token_id is not None:
+            # Processor should set this for Gemma4; mask is required for vision bidirectional attention.
+            mm_token_type_ids = (input_ids == self._image_token_id).long()
 
         inputs_embeds, image_features = self._encode_vision_and_scatter(
             input_ids=input_ids,
@@ -377,6 +403,7 @@ class Gemma4WithReInspection(nn.Module):
         inserted = self._insert_tokens(
             inputs_embeds, R, insert_positions,
             attention_mask, position_ids, labels, input_ids,
+            mm_token_type_ids=mm_token_type_ids,
         )
 
         return {
@@ -414,13 +441,20 @@ class Gemma4WithReInspection(nn.Module):
 
         prepared["inputs_embeds"] = prepared["inputs_embeds"].to(self.base_model.dtype)
 
-        outputs = self.base_model.model.language_model(
-            position_ids=prepared["position_ids"],
+        # Route through Gemma4Model (not language_model alone) so vision bidirectional
+        # masks are built from mm_token_type_ids; skipping that breaks activation
+        # checkpointing under use_bidirectional_attention="vision".
+        inner = self.base_model.model
+        inner_kw = {k: v for k, v in kwargs.items() if k != "return_dict"}
+        outputs = inner(
             inputs_embeds=prepared["inputs_embeds"],
             attention_mask=prepared["attention_mask"],
-            output_hidden_states=False,
+            position_ids=prepared["position_ids"],
+            mm_token_type_ids=prepared.get("mm_token_type_ids"),
+            pixel_values=None,
             use_cache=False,
-            **kwargs,
+            return_dict=True,
+            **inner_kw,
         )
 
         hidden_states = outputs.last_hidden_state
@@ -482,7 +516,8 @@ class Gemma4WithReInspection(nn.Module):
 
 
 def load_processor(config: ReInspectionConfig):
-    return AutoProcessor.from_pretrained(config.processor_path, padding_side="left")
+    resolved = resolve_pretrained_local_path(config.processor_path)
+    return AutoProcessor.from_pretrained(resolved, padding_side="left")
 
 
 def load_model(
@@ -491,8 +526,9 @@ def load_model(
     processor=None,
 ) -> Gemma4WithReInspection:
     """Load Gemma 4 and wrap with Re-Inspection Module."""
+    resolved = resolve_pretrained_local_path(config.model_name_or_path)
     base_model = Gemma4ForConditionalGeneration.from_pretrained(
-        config.model_name_or_path,
+        resolved,
         torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
         device_map=device_map,
     )

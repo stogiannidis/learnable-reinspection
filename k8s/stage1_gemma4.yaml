@@ -1,0 +1,82 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-gemma4-stage1-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-gemma4-stage1
+    spec:
+      containers:
+      - name: reinspection-gemma4-stage1
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            mkdir -p logs models
+            bash src/scripts/run_stage1.sh \
+              backend=gemma4 \
+              data_root=/data/datasets \
+              stage1_aux_loss=grounding \
+              experiment_name=grounding \
+              wandb_run_name=gemma4-stage1-grounding \
+              2>&1 | tee logs/gemma4_stage1.log
+        terminationMessagePath: "/tmp/my-log"
+        terminationMessagePolicy: File
+        imagePullPolicy: "Always"
+        env:
+          - name: HF_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: reinspection-secrets
+                key: HF_TOKEN
+          - name: WANDB_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: reinspection-secrets
+                key: WANDB_API_KEY
+          - name: OMP_NUM_THREADS
+            value: "4"
+          - name: HYDRA_FULL_ERROR
+            value: "1"
+          - name: HF_HOME
+            value: "/data/Huggingface"
+        resources:
+          requests:
+            cpu: 32
+            memory: "128Gi"
+            nvidia.com/gpu: 4
+          limits:
+            cpu: 32
+            memory: "128Gi"
+            nvidia.com/gpu: 4
+        volumeMounts:
+          - mountPath: /dev/shm
+            name: dshm
+          - mountPath: /data
+            name: nfs
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 30545
+        runAsGroup: 4451
+        runAsNonRoot: true
+      volumes:
+      - emptyDir:
+          medium: Memory
+          sizeLimit: "64Gi"
+        name: dshm
+      - name: nfs
+        nfs:
+          server: 10.24.6.66
+          path: /
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3

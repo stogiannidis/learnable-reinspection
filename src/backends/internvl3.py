@@ -4,12 +4,12 @@ Wraps `InternVLForConditionalGeneration`, inserting task-conditioned
 re-inspection tokens (R) into the prompt right before generation, or before the
 first supervised answer token during training.
 """
-import os
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple
 from transformers import AutoProcessor, InternVLForConditionalGeneration
 
+from src.backends.hf_hub_utils import resolve_pretrained_local_path
 from src.config import ReInspectionConfig
 from src.outputs import ReInspectionOutput
 from src.reinspection_module import ReInspectionModule
@@ -476,43 +476,9 @@ class InternVL3WithReInspection(nn.Module):
         )
 
 
-def _resolve_pretrained_local_path(
-    repo_or_path: str,
-    *,
-    local_rank: int,
-    is_dist: bool,
-) -> str:
-    """Resolve a Hub model id to a local snapshot path for safe multi-GPU loads.
-
-    Rank 0 downloads; all ranks then use ``local_files_only=True`` so non-zero
-    ranks never hit Hub shard resolution with a partially visible cache (common
-    on NFS when multiple processes used ``from_pretrained`` on the repo id).
-    """
-    expanded = os.path.expanduser(repo_or_path)
-    if os.path.isdir(expanded):
-        return expanded
-
-    from huggingface_hub import snapshot_download
-
-    if not is_dist:
-        return repo_or_path
-
-    import torch.distributed as dist
-
-    if local_rank == 0:
-        snapshot_download(repo_id=repo_or_path)
-    dist.barrier()
-    return snapshot_download(repo_id=repo_or_path, local_files_only=True)
-
-
 def load_processor(config: ReInspectionConfig):
     """Load processor; under distributed, rank 0 populates the HF cache first to avoid shard races."""
-    import torch.distributed as dist
-
-    path = config.processor_path
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    is_dist = dist.is_available() and dist.is_initialized()
-    resolved = _resolve_pretrained_local_path(path, local_rank=local_rank, is_dist=is_dist)
+    resolved = resolve_pretrained_local_path(config.processor_path)
     return AutoProcessor.from_pretrained(resolved)
 
 
@@ -522,13 +488,8 @@ def load_model(
     processor=None,
 ) -> InternVL3WithReInspection:
     """Load InternVL3-8B and wrap it with the re-inspection module."""
-    import torch.distributed as dist
-
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    is_dist = dist.is_available() and dist.is_initialized()
     dtype = torch.bfloat16 if config.bf16 else torch.float32
-    repo = config.model_name_or_path
-    resolved = _resolve_pretrained_local_path(repo, local_rank=local_rank, is_dist=is_dist)
+    resolved = resolve_pretrained_local_path(config.model_name_or_path)
     base_model = InternVLForConditionalGeneration.from_pretrained(
         resolved, torch_dtype=dtype, device_map=device_map
     )

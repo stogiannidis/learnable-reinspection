@@ -1,11 +1,11 @@
 # @package _global_
 backend: gemma4
-model_name_or_path: google/gemma-4-12b-it
+model_name_or_path: google/gemma-4-26B-A4B-it
 deepspeed_config: src/configs/deepspeed_z3.json
 wandb_project: reinspection-gemma4
 
-# Re-Inspection Module
-d_model: 3840
+# Re-Inspection Module (text hidden_size for this checkpoint)
+d_model: 2816
 d_bottleneck: 512
 n_queries: 64
 n_heads: 8
@@ -21,6 +21,7 @@ stage1_grad_accum: 16
 stage1_warmup_ratio: 0.03
 stage1_attn_loss_weight: 0.5
 stage1_attn_loss_type: focal
+stage1_aux_loss: both  # attn | grounding | both
 
 # Stage 2
 stage2_lr_module: 5.0e-5

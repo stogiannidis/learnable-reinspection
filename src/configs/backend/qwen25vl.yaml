@@ -21,6 +21,7 @@ stage1_grad_accum: 8
 stage1_warmup_ratio: 0.03
 stage1_attn_loss_weight: 10.0
 stage1_attn_loss_type: focal
+stage1_aux_loss: both  # attn | grounding | both
 
 # Stage 2
 stage2_lr_module: 5.0e-5

@@ -21,6 +21,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoProcessor
 
+from src.backends.hf_hub_utils import resolve_pretrained_local_path
 from src.attn_loss import compute_attn_loss_focal, compute_attn_loss_kl
 from src.bbox_head import BboxHead, compute_grounding_loss
 from src.config import ReInspectionConfig
@@ -871,8 +872,9 @@ def run_training(config: ReInspectionConfig) -> None:
     model = ds_engine
 
     if backend in ("qwen3vl", "qwen25vl"):
+        resolved = resolve_pretrained_local_path(config.model_name_or_path)
         processor = AutoProcessor.from_pretrained(
-            config.model_name_or_path,
+            resolved,
             max_pixels=config.max_pixels,
             min_pixels=config.min_pixels,
         )

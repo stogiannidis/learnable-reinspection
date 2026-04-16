@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from typing import Optional, List, Tuple
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
+from src.backends.hf_hub_utils import resolve_pretrained_local_path
 from src.config import ReInspectionConfig
 from src.outputs import ReInspectionOutput
 from src.reinspection_module import ReInspectionModule
@@ -687,8 +688,9 @@ class Qwen3VLWithReInspection(nn.Module):
 
 def load_model(config: ReInspectionConfig, device_map: str = "auto") -> Qwen3VLWithReInspection:
     """Load Qwen3-VL-8B and wrap with Re-Inspection Module."""
+    resolved = resolve_pretrained_local_path(config.model_name_or_path)
     base_model = Qwen3VLForConditionalGeneration.from_pretrained(
-        config.model_name_or_path,
+        resolved,
         torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
         device_map=device_map,
     )
