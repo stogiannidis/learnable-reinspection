@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  generateName: reinspection-stage1-
+  generateName: reinspection-internvl-stage1-
   namespace: eidf098ns
   labels:
     kueue.x-k8s.io/queue-name: eidf098ns-user-queue
@@ -12,30 +12,22 @@ spec:
   backoffLimit: 0
   template:
     metadata:
-      name: reinspection-stage1
+      name: reinspection-internvl-stage1
     spec:
       containers:
-      - name: reinspection-stage1
+      - name: reinspection-internvl-stage1
         image: stogian/l_reinspection:latest
         workingDir: /data/users/stogian/learnable-reinspection
         command:
           - bash
           - -c
           - |
-            mkdir -p logs outputs
-            bash reinspection_qwen3vl/scripts/run_stage1.sh 2>&1 | tee logs/qwen_stage1.log
+            mkdir -p logs models
+            bash src/scripts/run_stage1.sh 2>&1 | tee logs/stage1_grounding.log
         terminationMessagePath: "/tmp/my-log"
         terminationMessagePolicy: File
         imagePullPolicy: "Always"
         env:
-          - name: DATA_ROOT
-            value: "/data/datasets"
-          - name: OUTPUT_DIR
-            value: "outputs/qwen3vl"
-          - name: NUM_GPUS
-            value: "2"
-          - name: WANDB_RUN_NAME
-            value: "stage1-refcoco"
           - name: HF_TOKEN
             valueFrom:
               secretKeyRef:
@@ -46,23 +38,21 @@ spec:
               secretKeyRef:
                 name: reinspection-secrets
                 key: WANDB_API_KEY
-          - name: USER
-            value: "stogian_ph"
           - name: OMP_NUM_THREADS
             value: "4"
-          - name: NCCL_P2P_DISABLE
-            value: "0"
-          - name: NCCL_IB_DISABLE
+          - name: HYDRA_FULL_ERROR
             value: "1"
+          - name: HF_HOME
+            value: "/data/Huggingface"
         resources:
           requests:
-            cpu: 16
+            cpu: 32
             memory: "128Gi"
-            nvidia.com/gpu: 2
+            nvidia.com/gpu: 4
           limits:
-            cpu: 16
+            cpu: 32
             memory: "128Gi"
-            nvidia.com/gpu: 2
+            nvidia.com/gpu: 4
         volumeMounts:
           - mountPath: /dev/shm
             name: dshm

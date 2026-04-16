@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  generateName: reinspection-internvl-eval-
+  generateName: reinspection-internvl-eval-grounding-
   namespace: eidf098ns
   labels:
     kueue.x-k8s.io/queue-name: eidf098ns-user-queue
@@ -12,18 +12,22 @@ spec:
   backoffLimit: 0
   template:
     metadata:
-      name: reinspection-internvl-eval
+      name: reinspection-internvl-eval-grounding
     spec:
       containers:
-      - name: reinspection-internvl-eval
+      - name: reinspection-internvl-eval-grounding
         image: stogian/l_reinspection:latest
         workingDir: /data/users/stogian/learnable-reinspection
         command:
           - bash
           - -c
           - |
-            mkdir -p logs models
-            bash src/scripts/run_eval.sh 2>&1 | tee logs/internvl_eval.log
+            mkdir -p logs models outputs/internvl3
+            bash src/scripts/run_eval.sh \
+              stage=eval_grounding \
+              backend=internvl3 \
+              data_root=/data/datasets \
+              2>&1 | tee logs/internvl_eval_grounding.log
         terminationMessagePath: "/tmp/my-log"
         terminationMessagePolicy: File
         imagePullPolicy: "Always"

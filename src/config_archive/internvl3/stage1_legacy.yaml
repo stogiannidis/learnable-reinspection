@@ -1,0 +1,39 @@
+# Stage 1 legacy: grounding warm-up on RefCOCO
+# Matches checkpoints trained with d_bottleneck=256, n_queries=32, n_heads=4
+# Trainable: ReInspectionModule (+ optional projector)
+# Loss: L_CE + lambda * L_attn
+#
+# Reference copy (not Hydra defaults). For training/eval with Hydra prefer:
+#   backend=internvl3_legacy stage=stage1
+# Or merge fields into custom YAML under configs/backend/ or configs/stage/.
+
+# Re-Inspection Module
+model_name_or_path: "OpenGVLab/InternVL3-8B-hf"
+d_model: 3584
+d_bottleneck: 256
+n_queries: 32
+n_heads: 4
+ffn_mult: 4
+dropout: 0.0
+
+# Stage 1 training
+stage1_lr_module: 1.0e-4
+stage1_lr_projector: 1.0e-5
+stage1_epochs: 5
+stage1_batch_size: 4
+stage1_grad_accum: 16
+stage1_warmup_ratio: 0.03
+stage1_attn_loss_weight: 0.4
+stage1_train_projector: false
+stage1_attn_loss_type: "kl"
+
+# Image processing
+max_pixels: 1003520  # 1280 * 28 * 28
+min_pixels: 3136     # 4 * 28 * 28
+crop_to_patches_stage1: false
+
+# Misc
+seed: 42
+bf16: true
+gradient_checkpointing: true
+output_dir: "outputs"

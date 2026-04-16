@@ -1,0 +1,47 @@
+# @package _global_
+backend: qwen25vl
+model_name_or_path: Qwen/Qwen2.5-VL-7B-Instruct
+deepspeed_config: src/configs/deepspeed_z3.json
+wandb_project: reinspection-qwen25vl
+
+# Re-Inspection Module
+d_model: 3584
+d_bottleneck: 512
+n_queries: 64
+n_heads: 8
+ffn_mult: 4
+dropout: 0.0
+
+# Stage 1
+stage1_lr_module: 1.0e-4
+stage1_lr_merger: 1.0e-5
+stage1_epochs: 5
+stage1_batch_size: 8
+stage1_grad_accum: 8
+stage1_warmup_ratio: 0.03
+stage1_attn_loss_weight: 10.0
+stage1_attn_loss_type: focal
+stage1_aux_loss: both  # attn | grounding | both
+
+# Stage 2
+stage2_lr_module: 5.0e-5
+stage2_lr_lora: 2.0e-5
+stage2_epochs: 10
+stage2_batch_size: 8
+stage2_grad_accum: 8
+stage2_warmup_ratio: 0.03
+lora_r: 16
+lora_alpha: 32
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+
+# Data
+max_pixels: 1003520
+min_pixels: 3136
+crop_to_patches_stage1: false
+crop_to_patches_stage2: true
+
+# Misc
+seed: 42
+bf16: true
+gradient_checkpointing: true
+max_grad_norm: 1.0

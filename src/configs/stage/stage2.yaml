@@ -1,0 +1,5 @@
+# @package _global_
+stage: 2
+output_dir: models
+stage1_checkpoint: models/internvl3/stage1/epoch_5/reinspection_module.pt
+wandb_run_name: internvl-stage2

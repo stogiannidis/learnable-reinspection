@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  generateName: reinspection-internvl-eval-
+  generateName: reinspection-internvl-stage2-grounding-
   namespace: eidf098ns
   labels:
     kueue.x-k8s.io/queue-name: eidf098ns-user-queue
@@ -12,10 +12,10 @@ spec:
   backoffLimit: 0
   template:
     metadata:
-      name: reinspection-internvl-eval
+      name: reinspection-internvl-stage2-grounding
     spec:
       containers:
-      - name: reinspection-internvl-eval
+      - name: reinspection-internvl-stage2-grounding
         image: stogian/l_reinspection:latest
         workingDir: /data/users/stogian/learnable-reinspection
         command:
@@ -23,7 +23,7 @@ spec:
           - -c
           - |
             mkdir -p logs models
-            bash src/scripts/run_eval.sh 2>&1 | tee logs/internvl_eval.log
+            bash src/scripts/run_stage2.sh stage1_checkpoint=models/internvl3/grounding/epoch_2/reinspection_module.pt experiment_name=grounding wandb_run_name=internvl-stage2-grounding 2>&1 | tee logs/stage2_grounding.log
         terminationMessagePath: "/tmp/my-log"
         terminationMessagePolicy: File
         imagePullPolicy: "Always"
@@ -44,13 +44,13 @@ spec:
             value: "/data/Huggingface"
         resources:
           requests:
-            cpu: 8
-            memory: "64Gi"
-            nvidia.com/gpu: 1
+            cpu: 16
+            memory: "128Gi"
+            nvidia.com/gpu: 4
           limits:
-            cpu: 8
-            memory: "64Gi"
-            nvidia.com/gpu: 1
+            cpu: 16
+            memory: "128Gi"
+            nvidia.com/gpu: 4
         volumeMounts:
           - mountPath: /dev/shm
             name: dshm
@@ -64,11 +64,11 @@ spec:
       volumes:
       - emptyDir:
           medium: Memory
-          sizeLimit: "16Gi"
+          sizeLimit: "64Gi"
         name: dshm
       - name: nfs
         nfs:
           server: 10.24.6.66
           path: /
       nodeSelector:
-        nvidia.com/gpu.product: NVIDIA-H200
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3

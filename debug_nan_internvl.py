@@ -32,7 +32,7 @@ def debug_nan():
     
     # Just need one valid sample
     from reinspection_internvl3.data.spatial_vqa import VSRDataset
-    dataset = VSRDataset("/data/datasets", processor, "train")
+    dataset = VSRDataset("/data/datasets/vision_text", processor, "train")
     
     loader = DataLoader(dataset, batch_size=1, collate_fn=collate_fn)
     batch = next(iter(loader))

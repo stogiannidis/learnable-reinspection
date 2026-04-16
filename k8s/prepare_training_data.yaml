@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  generateName: reinspection-internvl-eval-
+  generateName: reinspection-prepare-training-data-
   namespace: eidf098ns
   labels:
     kueue.x-k8s.io/queue-name: eidf098ns-user-queue
@@ -12,18 +12,26 @@ spec:
   backoffLimit: 0
   template:
     metadata:
-      name: reinspection-internvl-eval
+      name: reinspection-prepare-training-data
     spec:
       containers:
-      - name: reinspection-internvl-eval
+      - name: reinspection-prepare-training-data
         image: stogian/l_reinspection:latest
         workingDir: /data/users/stogian/learnable-reinspection
         command:
           - bash
           - -c
           - |
-            mkdir -p logs models
-            bash src/scripts/run_eval.sh 2>&1 | tee logs/internvl_eval.log
+            set -euo pipefail
+            mkdir -p logs
+            python -m src.data.prepare_training_data \
+              --output_dir /data/datasets \
+              --datasets all \
+              --grit_max_samples 200000 \
+              --cambrian_max_samples 100000 \
+              --clevr_num_scenes 50000 \
+              --seed 42 \
+              2>&1 | tee logs/prepare_training_data.log
         terminationMessagePath: "/tmp/my-log"
         terminationMessagePolicy: File
         imagePullPolicy: "Always"
@@ -33,27 +41,18 @@ spec:
               secretKeyRef:
                 name: reinspection-secrets
                 key: HF_TOKEN
-          - name: WANDB_API_KEY
-            valueFrom:
-              secretKeyRef:
-                name: reinspection-secrets
-                key: WANDB_API_KEY
           - name: OMP_NUM_THREADS
-            value: "4"
+            value: "8"
           - name: HF_HOME
             value: "/data/Huggingface"
         resources:
           requests:
             cpu: 8
             memory: "64Gi"
-            nvidia.com/gpu: 1
           limits:
             cpu: 8
             memory: "64Gi"
-            nvidia.com/gpu: 1
         volumeMounts:
-          - mountPath: /dev/shm
-            name: dshm
           - mountPath: /data
             name: nfs
       restartPolicy: Never
@@ -62,13 +61,7 @@ spec:
         runAsGroup: 4451
         runAsNonRoot: true
       volumes:
-      - emptyDir:
-          medium: Memory
-          sizeLimit: "16Gi"
-        name: dshm
       - name: nfs
         nfs:
           server: 10.24.6.66
           path: /
-      nodeSelector:
-        nvidia.com/gpu.product: NVIDIA-H200
