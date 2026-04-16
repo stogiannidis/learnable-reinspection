@@ -1,0 +1,67 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-prepare-training-data-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-prepare-training-data
+    spec:
+      containers:
+      - name: reinspection-prepare-training-data
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            mkdir -p logs
+            python -m src.data.prepare_training_data \
+              --output_dir /data/datasets \
+              --datasets all \
+              --grit_max_samples 200000 \
+              --cambrian_max_samples 100000 \
+              --clevr_num_scenes 50000 \
+              --seed 42 \
+              2>&1 | tee logs/prepare_training_data.log
+        terminationMessagePath: "/tmp/my-log"
+        terminationMessagePolicy: File
+        imagePullPolicy: "Always"
+        env:
+          - name: HF_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: reinspection-secrets
+                key: HF_TOKEN
+          - name: OMP_NUM_THREADS
+            value: "8"
+          - name: HF_HOME
+            value: "/data/Huggingface"
+        resources:
+          requests:
+            cpu: 8
+            memory: "64Gi"
+          limits:
+            cpu: 8
+            memory: "64Gi"
+        volumeMounts:
+          - mountPath: /data
+            name: nfs
+      restartPolicy: Never
+      securityContext:
+        runAsUser: 30545
+        runAsGroup: 4451
+        runAsNonRoot: true
+      volumes:
+      - name: nfs
+        nfs:
+          server: 10.24.6.66
+          path: /
