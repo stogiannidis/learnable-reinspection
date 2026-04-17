@@ -26,7 +26,7 @@ spec:
             mkdir -p logs
             python -m src.data.prepare_training_data \
               --output_dir /data/datasets \
-              --datasets all \
+              --datasets cambrian clevr_spatial \
               --grit_max_samples 200000 \
               --cambrian_max_samples 100000 \
               --clevr_num_scenes 50000 \

@@ -359,64 +359,70 @@ def prepare_cambrian(
     skipped = 0
     buffer_multiplier = 3  # collect more, then subsample
 
-    for row in tqdm(ds, desc="Cambrian", total=max_samples * buffer_multiplier):
-        if len(samples) >= max_samples * buffer_multiplier:
-            break
+    try:
+        for row in tqdm(ds, desc="Cambrian", total=max_samples * buffer_multiplier):
+            if len(samples) >= max_samples * buffer_multiplier:
+                break
 
-        source = row.get("source", row.get("dataset", "")).lower()
-        question = row.get("question", row.get("conversations", [{}])[0].get("value", ""))
-        answer = row.get("answer", "")
+            source = row.get("source", row.get("dataset", "")).lower()
+            question = row.get("question", row.get("conversations", [{}])[0].get("value", ""))
+            answer = row.get("answer", "")
 
-        # Extract from conversations format if needed
-        convs = row.get("conversations", [])
-        if not question and len(convs) >= 2:
-            question = convs[0].get("value", "")
-            answer = convs[1].get("value", "")
+            # Extract from conversations format if needed
+            convs = row.get("conversations", [])
+            if not question and len(convs) >= 2:
+                question = convs[0].get("value", "")
+                answer = convs[1].get("value", "")
 
-        if not question or not answer:
-            continue
-
-        # Filter for spatial content
-        source_match = any(s in source for s in _CAMBRIAN_SPATIAL_SOURCES)
-        spatial_match = _is_spatial_question(question)
-
-        if not (source_match and spatial_match):
-            # For non-source-match, require strong spatial signal
-            if not spatial_match:
-                skipped += 1
+            if not question or not answer:
                 continue
 
-        # Handle image
-        img = row.get("image", None)
-        image_filename = f"cambrian_{images_saved:06d}.jpg"
-        image_path = os.path.join(img_dir, image_filename)
+            # Filter for spatial content
+            source_match = any(s in source for s in _CAMBRIAN_SPATIAL_SOURCES)
+            spatial_match = _is_spatial_question(question)
 
-        if not os.path.exists(image_path):
-            if isinstance(img, Image.Image):
-                img.convert("RGB").save(image_path)
-            elif isinstance(img, str):
-                if os.path.exists(img):
-                    Image.open(img).convert("RGB").save(image_path)
-                elif img.startswith("http"):
-                    if not _download_image(img, image_path):
+            if not (source_match and spatial_match):
+                # For non-source-match, require strong spatial signal
+                if not spatial_match:
+                    skipped += 1
+                    continue
+
+            # Handle image
+            img = row.get("image", None)
+            image_filename = f"cambrian_{images_saved:06d}.jpg"
+            image_path = os.path.join(img_dir, image_filename)
+
+            if not os.path.exists(image_path):
+                if isinstance(img, Image.Image):
+                    img.convert("RGB").save(image_path)
+                elif isinstance(img, str):
+                    if os.path.exists(img):
+                        Image.open(img).convert("RGB").save(image_path)
+                    elif img.startswith("http"):
+                        if not _download_image(img, image_path):
+                            continue
+                    else:
                         continue
                 else:
                     continue
-            else:
-                continue
 
-        images_saved += 1
+            images_saved += 1
 
-        # Clean question: remove <image> tokens if present
-        question_clean = question.replace("<image>", "").replace("<image>\n", "").strip()
+            # Clean question: remove <image> tokens if present
+            question_clean = question.replace("<image>", "").replace("<image>\n", "").strip()
 
-        samples.append({
-            "image": image_filename,
-            "question": question_clean,
-            "answer": answer.strip(),
-            "split": "train",
-            "source": source,
-        })
+            samples.append({
+                "image": image_filename,
+                "question": question_clean,
+                "answer": answer.strip(),
+                "split": "train",
+                "source": source,
+            })
+    except Exception as e:
+        print(f"  Cambrian-10M stream failed during iteration: {e}")
+        print("  Falling back to individual source datasets ...")
+        _prepare_cambrian_fallback(output_dir, max_samples, seed)
+        return
 
     # Subsample to target size
     rng = random.Random(seed)
@@ -444,39 +450,57 @@ def _prepare_cambrian_fallback(
     samples = []
 
     # --- GQA balanced (spatial subset) ---
+    # lmms-lab/GQA splits images vs QA into *_images / *_instructions configs; merge on imageId.
     print("  Loading GQA (spatial subset) ...")
     try:
-        gqa_ds = load_dataset("lmms-lab/GQA", "balanced_val", split="testdev")
         per_source = max_samples // 2
         gqa_count = 0
 
-        for row in tqdm(gqa_ds, desc="GQA spatial"):
-            if gqa_count >= per_source:
-                break
-            question = row.get("question", "")
-            answer = row.get("answer", "")
+        def _gqa_merge_split(split: str) -> None:
+            nonlocal gqa_count
+            img_ds = load_dataset(
+                "lmms-lab/GQA",
+                f"{split}_balanced_images",
+                split=split,
+            )
+            id_to_image = {row["id"]: row["image"] for row in img_ds}
+            inst_ds = load_dataset(
+                "lmms-lab/GQA",
+                f"{split}_balanced_instructions",
+                split=split,
+            )
+            for row in tqdm(inst_ds, desc=f"GQA spatial ({split})"):
+                if gqa_count >= per_source:
+                    break
+                question = row.get("question", "") or ""
+                answer = row.get("answer", "") or row.get("fullAnswer", "") or ""
+                img = id_to_image.get(row.get("imageId"))
 
-            if not _is_spatial_question(question):
-                continue
-
-            img = row.get("image")
-            image_filename = f"gqa_{gqa_count:06d}.jpg"
-            image_path = os.path.join(img_dir, image_filename)
-
-            if not os.path.exists(image_path):
-                if isinstance(img, Image.Image):
-                    img.convert("RGB").save(image_path)
-                else:
+                if not question or not answer or img is None:
+                    continue
+                if not _is_spatial_question(question):
                     continue
 
-            samples.append({
-                "image": image_filename,
-                "question": question,
-                "answer": answer,
-                "split": "train",
-                "source": "gqa",
-            })
-            gqa_count += 1
+                image_filename = f"gqa_{gqa_count:06d}.jpg"
+                image_path = os.path.join(img_dir, image_filename)
+
+                if not os.path.exists(image_path):
+                    if isinstance(img, Image.Image):
+                        img.convert("RGB").save(image_path)
+                    else:
+                        continue
+
+                samples.append({
+                    "image": image_filename,
+                    "question": question,
+                    "answer": answer,
+                    "split": "train",
+                    "source": "gqa",
+                })
+                gqa_count += 1
+
+        # testdev is small (~400 images, ~12k QA); train_balanced_images is ~72k/~10GB — avoid full merge here
+        _gqa_merge_split("testdev")
 
         print(f"    Extracted {gqa_count} spatial questions from GQA")
     except Exception as e:
@@ -485,7 +509,13 @@ def _prepare_cambrian_fallback(
     # --- Visual Genome relationships ---
     print("  Loading Visual Genome relationships (spatial subset) ...")
     try:
-        vg_ds = load_dataset("visual_genome", "relationships_v1.2.0", split="train", streaming=True)
+        vg_ds = load_dataset(
+            "visual_genome",
+            "relationships_v1.2.0",
+            split="train",
+            streaming=True,
+            trust_remote_code=True,
+        )
         per_source = max_samples // 2
         vg_count = 0
 

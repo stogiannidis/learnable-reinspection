@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import sys
 import warnings
 from collections import defaultdict
@@ -41,6 +42,23 @@ from src.hydra_util import strip_deepspeed_local_rank_argv
 from src.train_common import _env_info, _git_info
 
 strip_deepspeed_local_rank_argv()
+
+
+def _set_eval_reproducibility(seed: int) -> None:
+    """Fix random seeds for eval; cudnn deterministic mode for more stable CUDA results."""
+    try:
+        from transformers import set_seed as _hf_set_seed
+
+        _hf_set_seed(seed)
+    except Exception:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 
 # Silence noisy third-party loggers (pad_token_id spam is WARNING from transformers.generation.utils)
 for _logger_name in ("httpx", "httpcore", "urllib3"):
@@ -625,6 +643,7 @@ def evaluate_benchmark(
 @hydra.main(config_path="configs", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
     config = ReInspectionConfig(**OmegaConf.to_container(cfg, resolve=True))
+    _set_eval_reproducibility(config.seed)
     backend = config.backend
 
     processor = None
@@ -652,6 +671,7 @@ def main(cfg: DictConfig) -> None:
         (present if os.path.exists(path) else missing).append(bm)
     print(f"\n{'=' * 60}")
     print(f"Evaluation: {backend} | model: {config.model_name_or_path}")
+    print(f"seed={config.seed} (greedy decode; cudnn deterministic)")
     print(f"Benchmarks ({len(present)} available): {', '.join(present) or '(none)'}")
     if missing:
         print(f"Benchmarks skipped (data not found): {', '.join(missing)}")

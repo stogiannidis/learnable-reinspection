@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  generateName: reinspection-motivation-
+  generateName: reinspection-motivation-internvl-
   namespace: eidf098ns
   labels:
     kueue.x-k8s.io/queue-name: eidf098ns-user-queue
@@ -12,10 +12,10 @@ spec:
   backoffLimit: 0
   template:
     metadata:
-      name: reinspection-motivation
+      name: reinspection-motivation-internvl
     spec:
       containers:
-      - name: reinspection-motivation
+      - name: reinspection-motivation-internvl
         image: stogian/l_reinspection:latest
         workingDir: /data/users/stogian/learnable-reinspection
         command:
@@ -23,11 +23,17 @@ spec:
           - -c
           - |
             mkdir -p logs outputs/motivation
-            bash src/scripts/run_motivation.sh \
-              backend=qwen3vl \
+            # Stage-2 dir with reinspection_module.pt (+ lora_weights/ if present). Override with CKPT_DIR.
+            CKPT_DIR="${CKPT_DIR:-models/internvl3/focal/stage2/epoch_1}"
+            set -- \
+              backend=internvl3 \
               data_root=/data/datasets \
-              output_file=outputs/motivation/motivation_results.json \
-              2>&1 | tee logs/motivation_qwen3vl.log
+              output_file=outputs/motivation/internvl3_motivation_results.json \
+              checkpoint_dir="${CKPT_DIR}"
+            # If LoRA lives elsewhere (e.g. eval: module=stage1, lora=stage2), set LORA_CKPT_DIR.
+            [[ -n "${LORA_CKPT_DIR:-}" ]] && set -- "$@" "lora_checkpoint_dir=${LORA_CKPT_DIR}"
+            bash src/scripts/run_motivation.sh "$@" \
+              2>&1 | tee logs/motivation_internvl3.log
         terminationMessagePath: "/tmp/my-log"
         terminationMessagePolicy: File
         imagePullPolicy: "Always"

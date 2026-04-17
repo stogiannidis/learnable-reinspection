@@ -91,6 +91,7 @@ def _generate_with_attention(
     config: ReInspectionConfig,
     is_reinspection: bool,
     return_grid_info: bool = False,
+    capture_base_vision_attn: bool = False,
 ) -> Dict:
     """Run a single question through the model and return answer + attention info.
 
@@ -118,7 +119,7 @@ def _generate_with_attention(
     try:
         return _generate_with_attention_inner(
             model, processor, image_path, question, backend, config,
-            is_reinspection, return_grid_info,
+            is_reinspection, return_grid_info, capture_base_vision_attn,
         )
     finally:
         if _tmp_file is not None:
@@ -128,7 +129,7 @@ def _generate_with_attention(
 @torch.no_grad()
 def _generate_with_attention_inner(
     model, processor, image_path, question, backend, config,
-    is_reinspection, return_grid_info,
+    is_reinspection, return_grid_info, capture_base_vision_attn=False,
 ) -> Dict:
     device = model_device(model)
 
@@ -185,6 +186,7 @@ def _generate_with_attention_inner(
     # We extract the last hidden state at the position just before generation
     # by running a forward pass with output_hidden_states=True.
     base_last_hidden = None
+    base_vision_attn = None
     try:
         fwd_model = model.base_model if hasattr(model, "base_model") else model
         with torch.no_grad():
@@ -197,6 +199,26 @@ def _generate_with_attention_inner(
             # Last hidden state at the final input position
             hs = fwd_out.hidden_states[-1]  # (B, L, D)
             base_last_hidden = hs[0, -1, :].cpu().float().numpy()  # (D,)
+
+            # Vision attention proxy for the frozen condition: cosine similarity
+            # between each vision token's hidden state and the last text position.
+            # Used for side-by-side comparison with re-inspection A_vis.
+            if capture_base_vision_attn and not is_reinspection:
+                # Qwen: mm_token_type_ids marks vision positions; InternVL3: image_token_id
+                if "mm_token_type_ids" in inputs:
+                    vis_mask = inputs["mm_token_type_ids"][0].bool()
+                else:
+                    _base = getattr(model, "base_model", model)
+                    _img_tok = getattr(getattr(_base, "config", None), "image_token_id", None)
+                    vis_mask = (inputs["input_ids"][0] == _img_tok) if _img_tok is not None else None
+                if vis_mask is not None and vis_mask.any():
+                    query_hs = hs[0, -1, :].float()
+                    vis_hs = hs[0][vis_mask].float()  # (N_vis, D)
+                    q_norm = query_hs / (query_hs.norm() + 1e-8)
+                    v_norm = vis_hs / (vis_hs.norm(dim=-1, keepdim=True) + 1e-8)
+                    sims = (v_norm @ q_norm).cpu().numpy()  # (N_vis,)
+                    sims_exp = np.exp(sims - sims.max())
+                    base_vision_attn = sims_exp / (sims_exp.sum() + 1e-8)
     except Exception:
         pass  # Not critical — skip silently
 
@@ -204,10 +226,20 @@ def _generate_with_attention_inner(
         "generated_text": generated_text,
         "reinspection_attn_vis": ri_attn_vis,
         "base_last_hidden": base_last_hidden,
+        "base_vision_attn": base_vision_attn,
     }
 
     if return_grid_info and "image_grid_thw" in inputs:
         result["image_grid_thw"] = inputs["image_grid_thw"][0].tolist()
+    elif return_grid_info and backend == "internvl3":
+        # Derive approximate square grid from vision-token count in input_ids
+        _base = getattr(model, "base_model", model)
+        _img_tok = getattr(getattr(_base, "config", None), "image_token_id", None)
+        if _img_tok is not None:
+            n_vis = int((inputs["input_ids"][0] == _img_tok).sum().item())
+            if n_vis > 0:
+                side = max(1, int(n_vis ** 0.5))
+                result["vision_grid_hw"] = [side, side]
 
     return result
 
@@ -557,90 +589,116 @@ ATTN_VIS_EXAMPLES = [
 ]
 
 
-@torch.no_grad()
-def run_attention_visualization(
-    model,
-    processor,
-    pairs: List[MinimalPair],
-    backend: str,
-    config: ReInspectionConfig,
-    image_root: str,
-    output_dir: str,
-    n_examples: int = 6,
-) -> None:
-    """Generate attention heatmap data for side-by-side visualisation.
-
-    For each selected minimal pair, extracts the re-inspection module's A_vis
-    attention maps for both questions and saves per-example .npz files plus a
-    composite figure.
-
-    Only meaningful for the reinspection condition (base model doesn't expose
-    per-vision-token attention).  Qwen backends provide ``image_grid_thw`` for
-    mapping attention back to a spatial grid; other backends are skipped.
-    """
-    if backend not in ("qwen3vl", "qwen25vl"):
-        print("  Attention visualisation currently supported for Qwen backends only — skipping.")
-        return
-
-    fig_dir = os.path.join(output_dir, "attention_figures")
-    os.makedirs(fig_dir, exist_ok=True)
-
-    # Try to match hand-picked examples; fall back to first N pairs
+def _select_vis_examples(
+    pairs: List[MinimalPair], image_root: str, n_examples: int = 6,
+) -> List[MinimalPair]:
+    """Select canonical visualization examples, shared across conditions."""
     selected: List[MinimalPair] = []
     example_images = {img for img, *_ in ATTN_VIS_EXAMPLES}
     for pair in pairs:
         if pair.image in example_images and len(selected) < n_examples:
-            selected.append(pair)
+            # Only include if image actually exists
+            if os.path.isfile(os.path.join(image_root, pair.image)):
+                selected.append(pair)
     if len(selected) < n_examples:
         for pair in pairs:
-            if pair not in selected:
+            if pair not in selected and os.path.isfile(os.path.join(image_root, pair.image)):
                 selected.append(pair)
             if len(selected) >= n_examples:
                 break
+    return selected
+
+
+@torch.no_grad()
+def run_attention_visualization(
+    model,
+    processor,
+    selected_pairs: List[MinimalPair],
+    backend: str,
+    config: ReInspectionConfig,
+    image_root: str,
+    output_dir: str,
+    condition: str,
+) -> List[str]:
+    """Collect attention heatmap data for the given condition. Returns saved .npz paths.
+
+    For ``condition='reinspection'``: uses the module's A_vis maps.
+    For ``condition='frozen'``: uses a cosine-similarity proxy between each vision
+    token's last-layer hidden state and the last text position (question-conditioned).
+
+    Qwen backends use ``image_grid_thw``; InternVL3 derives an approximate square grid
+    from the vision-token count in ``input_ids``.
+    """
+    if backend not in ("qwen3vl", "qwen25vl", "internvl3"):
+        print(f"  Attention visualisation not supported for backend={backend} — skipping.")
+        return []
+
+    is_ri = condition == "reinspection"
+    fig_dir = os.path.join(output_dir, "attention_figures")
+    os.makedirs(fig_dir, exist_ok=True)
 
     model.eval()
-    saved_data = []
+    saved_paths: List[str] = []
 
-    for i, pair in enumerate(selected):
+    for i, pair in enumerate(selected_pairs):
         image_path = os.path.join(image_root, pair.image)
-        if not os.path.isfile(image_path):
-            continue
 
         try:
             out_a = _generate_with_attention(
                 model, processor, image_path, pair.question_a,
-                backend, config, True, return_grid_info=True,
+                backend, config, is_ri, return_grid_info=True,
+                capture_base_vision_attn=(not is_ri),
             )
             out_b = _generate_with_attention(
                 model, processor, image_path, pair.question_b,
-                backend, config, True, return_grid_info=True,
+                backend, config, is_ri, return_grid_info=True,
+                capture_base_vision_attn=(not is_ri),
             )
         except Exception as e:
-            print(f"  skip attn vis example {i}: {e}")
+            print(f"  skip attn vis [{condition}] example {i}: {e}")
             continue
 
-        attn_a = out_a.get("reinspection_attn_vis")
-        attn_b = out_b.get("reinspection_attn_vis")
-        grid_thw = out_a.get("image_grid_thw")
+        if "image_grid_thw" in out_a:
+            # Qwen: (T, H, W) before spatial merge
+            _, h, w = out_a["image_grid_thw"]
+            h_merged = h // 2
+            w_merged = w // 2
+        elif "vision_grid_hw" in out_a:
+            # InternVL3: approximate square from vision-token count
+            h_merged, w_merged = out_a["vision_grid_hw"]
+        else:
+            print(f"  skip attn vis [{condition}] example {i}: missing grid info")
+            continue
+        n_spatial = h_merged * w_merged
 
-        if attn_a is None or attn_b is None or grid_thw is None:
-            print(f"  skip attn vis example {i}: missing attention or grid info")
+        if is_ri:
+            raw_a = out_a.get("reinspection_attn_vis")
+            raw_b = out_b.get("reinspection_attn_vis")
+            if raw_a is None or raw_b is None:
+                print(f"  skip attn vis [{condition}] example {i}: missing A_vis")
+                continue
+            # (B, N_q, N_vis) → mean over queries → (N_vis,)
+            agg_a = raw_a[0].mean(axis=0)
+            agg_b = raw_b[0].mean(axis=0)
+        else:
+            agg_a = out_a.get("base_vision_attn")
+            agg_b = out_b.get("base_vision_attn")
+            if agg_a is None or agg_b is None:
+                print(f"  skip attn vis [{condition}] example {i}: missing vision proxy")
+                continue
+
+        # Guard: need at least n_spatial values to reshape
+        if len(agg_a) < n_spatial or len(agg_b) < n_spatial:
+            print(f"  skip attn vis [{condition}] example {i}: "
+                  f"attn length {len(agg_a)} < {n_spatial}")
             continue
 
-        _, h, w = grid_thw
-        spatial_merge = 2
-        h_merged = h // spatial_merge
-        w_merged = w // spatial_merge
-
-        # Average across queries: (B, N_q, N_vis) → (N_vis,)
-        agg_a = attn_a[0].mean(axis=0)[:h_merged * w_merged]
-        agg_b = attn_b[0].mean(axis=0)[:h_merged * w_merged]
-        # Normalise to sum to 1
+        agg_a = agg_a[:n_spatial]
+        agg_b = agg_b[:n_spatial]
         agg_a = agg_a / (agg_a.sum() + 1e-8)
         agg_b = agg_b / (agg_b.sum() + 1e-8)
 
-        # Save per-example data
-        npz_path = os.path.join(fig_dir, f"attn_pair_{i}.npz")
+        npz_path = os.path.join(fig_dir, f"{condition}_attn_pair_{i}.npz")
         np.savez(
             npz_path,
             attn_a=agg_a, attn_b=agg_b,
@@ -650,76 +708,137 @@ def run_attention_visualization(
             answer_a=out_a["generated_text"], answer_b=out_b["generated_text"],
             gt_a=pair.answer_a, gt_b=pair.answer_b,
             relation=pair.relation,
+            condition=condition,
         )
+        saved_paths.append(npz_path)
+        print(f"  [{condition}] Saved attention data: {npz_path}")
 
-        saved_data.append({
-            "npz": npz_path,
-            "image": pair.image,
-            "relation": pair.relation,
-        })
-
-        print(f"  Saved attention data: {npz_path}")
-
-    # Generate composite figure
-    if saved_data:
-        _plot_attention_comparison(saved_data, fig_dir)
+    return saved_paths
 
 
-def _plot_attention_comparison(saved_data: List[Dict], fig_dir: str) -> None:
-    """Render a composite attention comparison figure from saved .npz files."""
+def _plot_single_condition_figure(npz_paths: List[str], fig_dir: str, condition: str) -> None:
+    """Render a 3-column attention figure (image | Q_A | Q_B) for one condition."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-
     from src.visualize_attention import plot_attention_heatmap
 
-    n = len(saved_data)
+    cmap = "hot" if condition == "reinspection" else "Blues"
+    n = len(npz_paths)
     fig, axes = plt.subplots(n, 3, figsize=(14, 4 * n))
     if n == 1:
         axes = axes[np.newaxis, :]
 
-    for row, entry in enumerate(saved_data):
-        data = np.load(entry["npz"], allow_pickle=True)
+    for row, npz_path in enumerate(npz_paths):
+        data = np.load(npz_path, allow_pickle=True)
         image = Image.open(str(data["image_path"])).convert("RGB")
-        h_m = int(data["h_merged"])
-        w_m = int(data["w_merged"])
-        q_a = str(data["question_a"])
-        q_b = str(data["question_b"])
-        ans_a = str(data["answer_a"])
-        ans_b = str(data["answer_b"])
-        gt_a = str(data["gt_a"])
-        gt_b = str(data["gt_b"])
+        h_m, w_m = int(data["h_merged"]), int(data["w_merged"])
+        q_a, q_b = str(data["question_a"]), str(data["question_b"])
+        ans_a, ans_b = str(data["answer_a"]), str(data["answer_b"])
+        gt_a, gt_b = str(data["gt_a"]), str(data["gt_b"])
 
-        # Column 0: original image
         axes[row, 0].imshow(image)
-        axes[row, 0].set_title(f"Image: {entry['image']}\nRelation: {entry['relation']}",
-                                fontsize=9)
+        axes[row, 0].set_title(
+            f"{os.path.basename(str(data['image_path']))}\n{str(data['relation'])}",
+            fontsize=9,
+        )
         axes[row, 0].axis("off")
 
-        # Column 1: attention for question A
         a_ok = "Y" if ans_a.strip().lower() == gt_a.strip().lower() else "N"
         plot_attention_heatmap(
             image, data["attn_a"], h_m, w_m,
             title=f"Q: ...{q_a[-50:]}\nA: {ans_a} (GT={gt_a}) [{a_ok}]",
-            ax=axes[row, 1], cmap="hot", alpha=0.5,
+            ax=axes[row, 1], cmap=cmap, alpha=0.5,
         )
-
-        # Column 2: attention for question B
         b_ok = "Y" if ans_b.strip().lower() == gt_b.strip().lower() else "N"
         plot_attention_heatmap(
             image, data["attn_b"], h_m, w_m,
             title=f"Q: ...{q_b[-50:]}\nA: {ans_b} (GT={gt_b}) [{b_ok}]",
-            ax=axes[row, 2], cmap="hot", alpha=0.5,
+            ax=axes[row, 2], cmap=cmap, alpha=0.5,
         )
 
-    fig.suptitle("Re-Inspection Attention: Question A vs. Question B",
-                 fontsize=14, fontweight="bold", y=1.01)
+    label = "Re-Inspection A_vis" if condition == "reinspection" else "Frozen (hidden-state proxy)"
+    fig.suptitle(f"{label}: Question A vs. Question B", fontsize=14, fontweight="bold", y=1.01)
     plt.tight_layout()
-    out_path = os.path.join(fig_dir, "attention_comparison.pdf")
+    out_path = os.path.join(fig_dir, f"{condition}_attention_comparison.pdf")
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     fig.savefig(out_path.replace(".pdf", ".png"), dpi=200, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved attention comparison figure: {out_path}")
+    print(f"  Saved {condition} attention figure: {out_path}")
+
+
+def _plot_combined_attention_comparison(
+    vis_npzs: Dict[str, List[str]], fig_dir: str,
+) -> None:
+    """Render a 5-column combined figure: image | frozen Q_A | frozen Q_B | RI Q_A | RI Q_B.
+
+    Pairs are matched by example index (filename suffix), so only pairs present
+    in both conditions are shown.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from src.visualize_attention import plot_attention_heatmap
+
+    def _idx(path: str) -> int:
+        return int(os.path.basename(path).split("_pair_")[-1].split(".")[0])
+
+    frozen_by_idx = {_idx(p): p for p in vis_npzs.get("frozen", [])}
+    ri_by_idx = {_idx(p): p for p in vis_npzs.get("reinspection", [])}
+    common = sorted(set(frozen_by_idx) & set(ri_by_idx))
+
+    if not common:
+        print("  No matching pairs between frozen and reinspection — skipping combined figure.")
+        return
+
+    n = len(common)
+    fig, axes = plt.subplots(n, 5, figsize=(22, 4 * n))
+    if n == 1:
+        axes = axes[np.newaxis, :]
+
+    col_titles = ["Image", "Frozen Q_A", "Frozen Q_B", "Re-Insp Q_A", "Re-Insp Q_B"]
+    for col, title in enumerate(col_titles):
+        axes[0, col].set_title(title, fontsize=10, fontweight="bold")
+
+    def _label(q, ans, gt):
+        ok = "Y" if str(ans).strip().lower() == str(gt).strip().lower() else "N"
+        return f"Q: {str(q)[-50:]}\nA: {ans} (GT={gt}) [{ok}]"
+
+    for row, idx in enumerate(common):
+        fd = np.load(frozen_by_idx[idx], allow_pickle=True)
+        rd = np.load(ri_by_idx[idx], allow_pickle=True)
+        image = Image.open(str(fd["image_path"])).convert("RGB")
+        h_m, w_m = int(fd["h_merged"]), int(fd["w_merged"])
+
+        axes[row, 0].imshow(image)
+        axes[row, 0].set_title(
+            f"{os.path.basename(str(fd['image_path']))}\n{str(fd['relation'])}", fontsize=8,
+        )
+        axes[row, 0].axis("off")
+
+        plot_attention_heatmap(image, fd["attn_a"], h_m, w_m,
+                               title=_label(fd["question_a"], fd["answer_a"], fd["gt_a"]),
+                               ax=axes[row, 1], cmap="Blues", alpha=0.5)
+        plot_attention_heatmap(image, fd["attn_b"], h_m, w_m,
+                               title=_label(fd["question_b"], fd["answer_b"], fd["gt_b"]),
+                               ax=axes[row, 2], cmap="Blues", alpha=0.5)
+        plot_attention_heatmap(image, rd["attn_a"], h_m, w_m,
+                               title=_label(rd["question_a"], rd["answer_a"], rd["gt_a"]),
+                               ax=axes[row, 3], cmap="hot", alpha=0.5)
+        plot_attention_heatmap(image, rd["attn_b"], h_m, w_m,
+                               title=_label(rd["question_b"], rd["answer_b"], rd["gt_b"]),
+                               ax=axes[row, 4], cmap="hot", alpha=0.5)
+
+    fig.suptitle(
+        "Frozen VLM (blue) vs. Re-Inspection (red): Question-Conditioned Visual Attention",
+        fontsize=14, fontweight="bold", y=1.01,
+    )
+    plt.tight_layout()
+    out_path = os.path.join(fig_dir, "combined_attention_comparison.pdf")
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    fig.savefig(out_path.replace(".pdf", ".png"), dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved combined attention comparison: {out_path}")
 
 
 # ------------------------------------------------------------------ #
@@ -965,8 +1084,12 @@ def main(cfg: DictConfig) -> None:
     flip_results: Dict[str, Dict] = {}
     mirror_results: Dict[str, Dict] = {}
     div_results: Dict[str, Dict] = {}
+    vis_npzs: Dict[str, List[str]] = {}
 
     max_pairs = config.max_samples
+
+    # Select visualization examples once so both conditions use the same images.
+    vis_selected = _select_vis_examples(inv_pairs, image_root)
 
     for condition in conditions:
         print(f"\n{'='*60}")
@@ -1045,16 +1168,26 @@ def main(cfg: DictConfig) -> None:
         with open(div_samples_file, "w", encoding="utf-8") as f:
             json.dump(div_res.pop("samples", []), f, indent=2)
 
-        # --- Prong 4: Attention Visualization (reinspection only) ---
-        if is_ri:
-            print(f"\n--- Prong 4: Attention Map Visualisation ---")
-            run_attention_visualization(
-                model, processor, inv_pairs, backend, config,
-                image_root=image_root, output_dir=out_dir,
+        # --- Prong 4: Attention Map Visualisation (both conditions) ---
+        if backend in ("qwen3vl", "qwen25vl", "internvl3"):
+            print(f"\n--- Prong 4: Attention Map Visualisation ({condition}) ---")
+            npzs = run_attention_visualization(
+                model, processor, vis_selected, backend, config,
+                image_root=image_root, output_dir=out_dir, condition=condition,
             )
+            if npzs:
+                vis_npzs[condition] = npzs
+                _plot_single_condition_figure(
+                    npzs, os.path.join(out_dir, "attention_figures"), condition,
+                )
 
         del model
         torch.cuda.empty_cache()
+
+    # --- Combined attention figure (if both conditions ran) ---
+    if len(vis_npzs) >= 2:
+        print("\n--- Generating combined attention comparison figure ---")
+        _plot_combined_attention_comparison(vis_npzs, os.path.join(out_dir, "attention_figures"))
 
     # --- Summary ---
     print_flip_summary(flip_results, os.path.join(out_dir, "flip_consistency_table.txt"))

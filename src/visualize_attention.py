@@ -1,17 +1,86 @@
-"""Attention map visualization for Qwen3-VL + Re-Inspection (unified package)."""
+"""Attention map visualization for VLM + Re-Inspection (Qwen3-VL / InternVL3)."""
 
 import argparse
+import importlib
 import os
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from PIL import Image
-from transformers import AutoProcessor
 
-from src.backends.qwen3vl import load_model
 from src.config import ReInspectionConfig
-from src.data.utils import build_chat_messages
+
+
+def _load_backend(backend: str):
+    """Return (load_model_fn, build_chat_messages_fn) for the requested backend."""
+    if backend in ("qwen3vl", "qwen25vl"):
+        backend_mod = importlib.import_module(f"src.backends.{backend}")
+        chat_mod = importlib.import_module("src.data.utils")
+    elif backend == "internvl3":
+        backend_mod = importlib.import_module("src.backends.internvl3")
+        chat_mod = importlib.import_module("src.data.chat_template")
+    elif backend == "gemma4":
+        backend_mod = importlib.import_module("src.backends.gemma4")
+        chat_mod = importlib.import_module("src.data.gemma4_chat")
+    else:
+        raise ValueError(f"Unsupported backend: {backend}")
+    return backend_mod.load_model, chat_mod.build_chat_messages
+
+
+def _load_processor(backend: str, config: ReInspectionConfig):
+    from transformers import AutoProcessor
+
+    path = config.processor_path
+    if backend in ("qwen3vl", "qwen25vl"):
+        return AutoProcessor.from_pretrained(
+            path, max_pixels=config.max_pixels, min_pixels=config.min_pixels
+        )
+    return AutoProcessor.from_pretrained(path)
+
+
+def _process_inputs(backend: str, processor, text: str, image_path: str, config: ReInspectionConfig):
+    kwargs = dict(text=[text], images=[image_path], return_tensors="pt")
+    if backend in ("qwen3vl", "qwen25vl"):
+        kwargs["max_pixels"] = config.max_pixels
+        kwargs["min_pixels"] = config.min_pixels
+    elif backend == "internvl3":
+        kwargs["crop_to_patches"] = config.crop_to_patches_stage2
+    return processor(**kwargs)
+
+
+def _vision_grid(backend: str, model, inputs, attn_n_kv: int):
+    """Return (h_merged, w_merged) for the vision token grid."""
+    if backend in ("qwen3vl", "qwen25vl") and "image_grid_thw" in inputs:
+        _, h, w = inputs["image_grid_thw"][0].tolist()
+        spatial_merge = 2
+        return h // spatial_merge, w // spatial_merge
+
+    base = getattr(model, "base_model", model)
+    img_tok = getattr(getattr(base, "config", None), "image_token_id", None)
+    if img_tok is not None:
+        n_vis = int((inputs["input_ids"][0] == img_tok).sum().item())
+    else:
+        n_vis = attn_n_kv
+    side = max(1, int(round(n_vis ** 0.5)))
+    return side, side
+
+
+def _decode_generation(backend: str, model, processor, inputs, generated_ids, n_queries: int) -> str:
+    if backend in ("qwen3vl", "qwen25vl"):
+        input_len = inputs["input_ids"].shape[1] + n_queries
+    elif (
+        hasattr(model, "last_generation_prompt_lengths")
+        and model.last_generation_prompt_lengths is not None
+    ):
+        input_len = int(model.last_generation_prompt_lengths[0].item())
+    else:
+        input_len = int(inputs["input_ids"].shape[1])
+    return processor.batch_decode(
+        generated_ids[:, input_len:],
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=False,
+    )[0].strip()
 
 
 def plot_attention_heatmap(
@@ -27,14 +96,18 @@ def plot_attention_heatmap(
     if ax is None:
         _, ax = plt.subplots(1, 1, figsize=(6, 6))
 
-    attn_2d = attn_map.reshape(h_patches, w_patches)
+    attn_2d = np.asarray(attn_map, dtype=np.float32).reshape(h_patches, w_patches)
     img_w, img_h = image.size
     attn_resized = np.array(
-        Image.fromarray(attn_2d).resize((img_w, img_h), Image.BILINEAR)
+        Image.fromarray(attn_2d, mode="F").resize((img_w, img_h), Image.BILINEAR)
     )
 
+    vmax = float(attn_resized.max())
+    if vmax <= 0:
+        vmax = 1.0
+
     ax.imshow(image)
-    ax.imshow(attn_resized, cmap=cmap, alpha=alpha, vmin=0, vmax=attn_resized.max())
+    ax.imshow(attn_resized, cmap=cmap, alpha=alpha, vmin=0, vmax=vmax)
     ax.set_title(title, fontsize=12)
     ax.axis("off")
 
@@ -79,6 +152,8 @@ def visualize_single(
     image_path: str,
     question: str,
     config: ReInspectionConfig,
+    backend: str,
+    build_chat_messages,
     save_dir: str = "figures",
     sample_name: str = "sample",
 ):
@@ -89,39 +164,26 @@ def visualize_single(
         messages, tokenize=False, add_generation_prompt=True
     )
 
-    inputs = processor(
-        text=[text],
-        images=[image_path],
-        return_tensors="pt",
-        max_pixels=config.max_pixels,
-        min_pixels=config.min_pixels,
-    )
+    inputs = _process_inputs(backend, processor, text, image_path, config)
     inputs = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
     generated_ids = model.generate(**inputs, max_new_tokens=64, do_sample=False)
-    input_len = inputs["input_ids"].shape[1] + config.n_queries
-    generated_text = processor.batch_decode(
-        generated_ids[:, input_len:],
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=False,
-    )[0].strip()
+    generated_text = _decode_generation(backend, model, processor, inputs, generated_ids, config.n_queries)
 
-    attn_task, attn_vis = model.get_attention_maps()
-
+    _, attn_vis = model.get_attention_maps()
     if attn_vis is None:
         print("No attention maps available")
         return
 
-    image_grid_thw = inputs["image_grid_thw"][0]
-    _, h, w = image_grid_thw.tolist()
-    spatial_merge = 2
-    h_merged = h // spatial_merge
-    w_merged = w // spatial_merge
+    # Always pull off GPU and upcast bf16 → float32 before NumPy.
+    attn_vis = attn_vis.detach().float().cpu()
+
+    h_merged, w_merged = _vision_grid(backend, model, inputs, attn_vis.shape[-1])
+    n_patches = h_merged * w_merged
 
     image = Image.open(image_path).convert("RGB")
 
-    attn_agg = attn_vis[0].mean(dim=0).cpu().numpy()
-    attn_agg = attn_agg[:h_merged * w_merged]
+    attn_agg = attn_vis[0].mean(dim=0).numpy()[:n_patches]
     attn_agg = attn_agg / (attn_agg.sum() + 1e-8)
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 6))
@@ -141,7 +203,7 @@ def visualize_single(
     print(f"Saved: {save_path}")
     plt.close()
 
-    attn_per_query = attn_vis[0].cpu().numpy()[:, :h_merged * w_merged]
+    attn_per_query = attn_vis[0].numpy()[:, :n_patches]
     plot_per_query_attention(
         image, attn_per_query, h_merged, w_merged,
         save_path=os.path.join(save_dir, f"{sample_name}_per_query.pdf"),
@@ -160,6 +222,12 @@ def main():
     parser.add_argument("--output_dir", type=str, default="figures")
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--sample_name", type=str, default="sample")
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="qwen3vl",
+        choices=["qwen3vl", "qwen25vl", "internvl3", "gemma4"],
+    )
     args = parser.parse_args()
 
     config = ReInspectionConfig()
@@ -172,7 +240,9 @@ def main():
             if hasattr(config, k):
                 setattr(config, k, v)
 
-    model = load_model(config, device_map="auto")
+    load_model_fn, build_chat_messages = _load_backend(args.backend)
+    model = load_model_fn(config, device_map="auto")
+
     reinspection_path = os.path.join(args.checkpoint_dir, "reinspection_module.pt")
     if os.path.exists(reinspection_path):
         state_dict = torch.load(reinspection_path, map_location="cpu", weights_only=True)
@@ -186,17 +256,15 @@ def main():
             model.base_model.model.language_model, lora_path
         )
 
-    processor = AutoProcessor.from_pretrained(
-        config.model_name_or_path,
-        max_pixels=config.max_pixels,
-        min_pixels=config.min_pixels,
-    )
+    processor = _load_processor(args.backend, config)
 
     visualize_single(
         model, processor,
         image_path=args.image,
         question=args.question,
         config=config,
+        backend=args.backend,
+        build_chat_messages=build_chat_messages,
         save_dir=args.output_dir,
         sample_name=args.sample_name,
     )
