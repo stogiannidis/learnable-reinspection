@@ -81,6 +81,68 @@ def _jsd(p: np.ndarray, q: np.ndarray, eps: float = 1e-10) -> float:
 #  Core generation + attention capture                                #
 # ------------------------------------------------------------------ #
 
+def _decoder_image_attention(
+    sequences: torch.Tensor,
+    attentions,
+    image_token_id: int,
+    h_merged: int,
+    w_merged: int,
+    tokenizer=None,
+) -> Optional[np.ndarray]:
+    """Mean decoder self-attention from generated tokens → image-token columns.
+
+    `attentions` is `GenerateDecoderOnlyOutput.attentions`:
+      tuple (per-step) of tuple (per-layer) of [B, heads, q_len, k_len].
+    Step 0 (prefill): last row produces first generated token.
+    Step t > 0: only row is the attention producing token t.
+
+    Averages over heads and layers, selects columns at image-token positions,
+    reshapes to (h_merged, w_merged), then averages over all non-special
+    generated tokens. Returns a normalized (N_vis,) numpy vector, or None if
+    extraction fails (e.g. None attentions from SDPA).
+    """
+    if attentions is None or len(attentions) == 0 or attentions[0][0] is None:
+        print("  [decoder-attn] attentions missing — is attn_implementation='eager'?")
+        return None
+
+    seq0 = sequences[0]
+    img_positions = (seq0 == image_token_id).nonzero(as_tuple=True)[0]
+    n_img = img_positions.numel()
+    if n_img != h_merged * w_merged:
+        print(f"  [decoder-attn] image-token count {n_img} != grid {h_merged}×{w_merged}="
+              f"{h_merged*w_merged}")
+        return None
+
+    prefill_len = attentions[0][0].shape[-1]
+    if int(img_positions.max().item()) >= prefill_len:
+        print(f"  [decoder-attn] image pos {int(img_positions.max())} ≥ prefill {prefill_len}")
+        return None
+
+    num_gen = len(attentions)
+    gen_ids = seq0[prefill_len: prefill_len + num_gen].tolist()
+    special_ids = set(getattr(tokenizer, "all_special_ids", []) or []) if tokenizer is not None else set()
+
+    accum: List[np.ndarray] = []
+    for t, layer_attns in enumerate(attentions):
+        tok = gen_ids[t] if t < len(gen_ids) else None
+        if tok is not None:
+            if tok in special_ids:
+                continue
+            if tokenizer is not None and not tokenizer.decode([tok], skip_special_tokens=False).strip():
+                continue
+        layer_rows = []
+        for la in layer_attns:
+            row = la[0, :, -1, :] if t == 0 else la[0, :, 0, :]
+            layer_rows.append(row[:, img_positions].float().mean(dim=0))
+        accum.append(torch.stack(layer_rows, dim=0).mean(dim=0).cpu().numpy())
+
+    if not accum:
+        return None
+    mean_attn = np.stack(accum, axis=0).mean(axis=0)
+    mean_attn = mean_attn / (mean_attn.sum() + 1e-8)
+    return mean_attn
+
+
 @torch.no_grad()
 def _generate_with_attention(
     model,
@@ -92,6 +154,7 @@ def _generate_with_attention(
     is_reinspection: bool,
     return_grid_info: bool = False,
     capture_base_vision_attn: bool = False,
+    capture_decoder_attn: bool = False,
 ) -> Dict:
     """Run a single question through the model and return answer + attention info.
 
@@ -120,6 +183,7 @@ def _generate_with_attention(
         return _generate_with_attention_inner(
             model, processor, image_path, question, backend, config,
             is_reinspection, return_grid_info, capture_base_vision_attn,
+            capture_decoder_attn=capture_decoder_attn,
         )
     finally:
         if _tmp_file is not None:
@@ -130,6 +194,7 @@ def _generate_with_attention(
 def _generate_with_attention_inner(
     model, processor, image_path, question, backend, config,
     is_reinspection, return_grid_info, capture_base_vision_attn=False,
+    capture_decoder_attn=False,
 ) -> Dict:
     device = model_device(model)
 
@@ -156,10 +221,18 @@ def _generate_with_attention_inner(
     inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
     # --- Generate ---
-    generated_ids = model.generate(
-        **inputs, max_new_tokens=16, do_sample=False,
-        **_generate_extra_kw(processor),
-    )
+    gen_kwargs = dict(max_new_tokens=16, do_sample=False, **_generate_extra_kw(processor))
+    if capture_decoder_attn:
+        gen_kwargs.update(output_attentions=True, return_dict_in_generate=True)
+
+    gen_out = model.generate(**inputs, **gen_kwargs)
+
+    if capture_decoder_attn:
+        generated_ids = gen_out.sequences
+        decoder_attentions = gen_out.attentions
+    else:
+        generated_ids = gen_out
+        decoder_attentions = None
 
     # Determine input length for decoding
     if backend in ("qwen3vl", "qwen25vl"):
@@ -222,11 +295,27 @@ def _generate_with_attention_inner(
     except Exception:
         pass  # Not critical — skip silently
 
+    # --- Decoder self-attention over image tokens (optional) ---
+    decoder_image_attn = None
+    if capture_decoder_attn and decoder_attentions is not None:
+        _base = getattr(model, "base_model", model)
+        img_tok = getattr(_base, "_image_token_id", None) or getattr(
+            getattr(_base, "config", None), "image_token_id", None
+        )
+        if img_tok is not None and "image_grid_thw" in inputs:
+            _, _h, _w = inputs["image_grid_thw"][0].tolist()
+            h_m, w_m = _h // 2, _w // 2
+            tokenizer = getattr(processor, "tokenizer", None)
+            decoder_image_attn = _decoder_image_attention(
+                generated_ids, decoder_attentions, img_tok, h_m, w_m, tokenizer=tokenizer,
+            )
+
     result = {
         "generated_text": generated_text,
         "reinspection_attn_vis": ri_attn_vis,
         "base_last_hidden": base_last_hidden,
         "base_vision_attn": base_vision_attn,
+        "decoder_image_attn": decoder_image_attn,
     }
 
     if return_grid_info and "image_grid_thw" in inputs:
@@ -634,6 +723,10 @@ def run_attention_visualization(
         return []
 
     is_ri = condition == "reinspection"
+    # Decoder-attention capture: proper VLM attention (generated → image tokens).
+    # Qwen3-VL only for now (requires attn_implementation="eager" at load time).
+    use_decoder_attn = (backend == "qwen3vl")
+
     fig_dir = os.path.join(output_dir, "attention_figures")
     os.makedirs(fig_dir, exist_ok=True)
 
@@ -647,12 +740,14 @@ def run_attention_visualization(
             out_a = _generate_with_attention(
                 model, processor, image_path, pair.question_a,
                 backend, config, is_ri, return_grid_info=True,
-                capture_base_vision_attn=(not is_ri),
+                capture_base_vision_attn=(not is_ri) and (not use_decoder_attn),
+                capture_decoder_attn=use_decoder_attn,
             )
             out_b = _generate_with_attention(
                 model, processor, image_path, pair.question_b,
                 backend, config, is_ri, return_grid_info=True,
-                capture_base_vision_attn=(not is_ri),
+                capture_base_vision_attn=(not is_ri) and (not use_decoder_attn),
+                capture_decoder_attn=use_decoder_attn,
             )
         except Exception as e:
             print(f"  skip attn vis [{condition}] example {i}: {e}")
@@ -671,7 +766,13 @@ def run_attention_visualization(
             continue
         n_spatial = h_merged * w_merged
 
-        if is_ri:
+        if use_decoder_attn:
+            agg_a = out_a.get("decoder_image_attn")
+            agg_b = out_b.get("decoder_image_attn")
+            if agg_a is None or agg_b is None:
+                print(f"  skip attn vis [{condition}] example {i}: missing decoder attention")
+                continue
+        elif is_ri:
             raw_a = out_a.get("reinspection_attn_vis")
             raw_b = out_b.get("reinspection_attn_vis")
             if raw_a is None or raw_b is None:
@@ -698,6 +799,13 @@ def run_attention_visualization(
         agg_a = agg_a / (agg_a.sum() + 1e-8)
         agg_b = agg_b / (agg_b.sum() + 1e-8)
 
+        if use_decoder_attn:
+            attn_source = "decoder"
+        elif is_ri:
+            attn_source = "a_vis"
+        else:
+            attn_source = "hidden_cosine"
+
         npz_path = os.path.join(fig_dir, f"{condition}_attn_pair_{i}.npz")
         np.savez(
             npz_path,
@@ -709,6 +817,7 @@ def run_attention_visualization(
             gt_a=pair.answer_a, gt_b=pair.answer_b,
             relation=pair.relation,
             condition=condition,
+            attn_source=attn_source,
         )
         saved_paths.append(npz_path)
         print(f"  [{condition}] Saved attention data: {npz_path}")
@@ -757,7 +866,17 @@ def _plot_single_condition_figure(npz_paths: List[str], fig_dir: str, condition:
             ax=axes[row, 2], cmap=cmap, alpha=0.5,
         )
 
-    label = "Re-Inspection A_vis" if condition == "reinspection" else "Frozen (hidden-state proxy)"
+    # Pick a label based on the recorded attention source of the first npz.
+    first = np.load(npz_paths[0], allow_pickle=True)
+    source = str(first["attn_source"]) if "attn_source" in first.files else (
+        "a_vis" if condition == "reinspection" else "hidden_cosine"
+    )
+    _src_label = {
+        "decoder": "LLM decoder → image",
+        "a_vis": "Re-Inspection A_vis",
+        "hidden_cosine": "Frozen (hidden-state cosine proxy)",
+    }.get(source, source)
+    label = f"{condition} · {_src_label}"
     fig.suptitle(f"{label}: Question A vs. Question B", fontsize=14, fontweight="bold", y=1.01)
     plt.tight_layout()
     out_path = os.path.join(fig_dir, f"{condition}_attention_comparison.pdf")
@@ -829,10 +948,17 @@ def _plot_combined_attention_comparison(
                                title=_label(rd["question_b"], rd["answer_b"], rd["gt_b"]),
                                ax=axes[row, 4], cmap="hot", alpha=0.5)
 
-    fig.suptitle(
-        "Frozen VLM (blue) vs. Re-Inspection (red): Question-Conditioned Visual Attention",
-        fontsize=14, fontweight="bold", y=1.01,
-    )
+    # If both sides used decoder-attention, both heatmaps are the same signal
+    # (generated → image tokens); reflect that in the title.
+    fd0 = np.load(list(frozen_by_idx.values())[0], allow_pickle=True)
+    rd0 = np.load(list(ri_by_idx.values())[0], allow_pickle=True)
+    src_fr = str(fd0["attn_source"]) if "attn_source" in fd0.files else "hidden_cosine"
+    src_ri = str(rd0["attn_source"]) if "attn_source" in rd0.files else "a_vis"
+    if src_fr == "decoder" and src_ri == "decoder":
+        suptitle = "Frozen VLM vs. Re-Inspection: LLM decoder attention over image tokens"
+    else:
+        suptitle = "Frozen VLM (blue) vs. Re-Inspection (red): Question-Conditioned Visual Attention"
+    fig.suptitle(suptitle, fontsize=14, fontweight="bold", y=1.01)
     plt.tight_layout()
     out_path = os.path.join(fig_dir, "combined_attention_comparison.pdf")
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
@@ -1096,10 +1222,14 @@ def main(cfg: DictConfig) -> None:
         print(f"Condition: {condition}")
         print(f"{'='*60}")
 
+        # Eager attention is required for output_attentions=True in generate().
+        # Only plumbed for Qwen3-VL right now; other backends use their defaults.
+        attn_impl = "eager" if backend == "qwen3vl" else None
         model, is_ri = load_condition_model(
             backend, condition, config, processor,
             checkpoint_dir=config.checkpoint_dir,
             lora_checkpoint_dir=config.lora_checkpoint_dir,
+            attn_implementation=attn_impl,
         )
         model.eval()
 

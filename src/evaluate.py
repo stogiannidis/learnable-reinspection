@@ -383,7 +383,14 @@ def load_condition_model(
     processor,
     checkpoint_dir: Optional[str] = None,
     lora_checkpoint_dir: Optional[str] = None,
+    attn_implementation: Optional[str] = None,
 ):
+    """Load a model for a motivation / eval condition.
+
+    `attn_implementation` is currently plumbed through for Qwen3-VL only; pass
+    `"eager"` to enable `output_attentions=True` at generation time. Other
+    backends ignore it and use their defaults.
+    """
     def _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir):
         """Load reinspection weights and optional LoRA into a *WithReInspection wrapper."""
         if checkpoint_dir:
@@ -414,8 +421,9 @@ def load_condition_model(
     if backend == "qwen3vl":
         from src.backends.qwen3vl import load_model as load_qwen_ri
 
+        qwen_attn = attn_implementation or "sdpa"
         if condition == "reinspection":
-            model = load_qwen_ri(config, device_map="auto")
+            model = load_qwen_ri(config, device_map="auto", attn_implementation=qwen_attn)
             _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir)
             return model, True
         resolved = resolve_pretrained_local_path(config.model_name_or_path)
@@ -423,6 +431,7 @@ def load_condition_model(
             resolved,
             torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
             device_map="auto",
+            attn_implementation=qwen_attn,
         )
         if condition == "lora_only":
             _load_lora_only(model, checkpoint_dir, lora_checkpoint_dir)

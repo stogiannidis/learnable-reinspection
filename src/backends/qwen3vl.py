@@ -686,12 +686,21 @@ class Qwen3VLWithReInspection(nn.Module):
             handle.remove()
 
 
-def load_model(config: ReInspectionConfig, device_map: str = "auto") -> Qwen3VLWithReInspection:
-    """Load Qwen3-VL-8B and wrap with Re-Inspection Module."""
+def load_model(
+    config: ReInspectionConfig,
+    device_map: str = "auto",
+    attn_implementation: str = "sdpa",
+) -> Qwen3VLWithReInspection:
+    """Load Qwen3-VL-8B and wrap with Re-Inspection Module.
+
+    Pass `attn_implementation="eager"` to enable `output_attentions=True` at
+    generation time (SDPA silently returns None).
+    """
     resolved = resolve_pretrained_local_path(config.model_name_or_path)
     base_model = Qwen3VLForConditionalGeneration.from_pretrained(
         resolved,
         torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
         device_map=device_map,
+        attn_implementation=attn_implementation,
     )
     return Qwen3VLWithReInspection(config, base_model)
