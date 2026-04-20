@@ -38,8 +38,8 @@ from src.data.chat_template import build_chat_messages as intern_build_chat
 from src.data.gemma4_chat import build_chat_messages as gemma4_build_chat
 from src.data.spatial_dataset import SpatialVQADataset
 from src.data.utils import build_chat_messages as qwen_build_chat
-from src.hydra_util import strip_deepspeed_local_rank_argv
-from src.train_common import _env_info, _git_info
+from src.utils.hydra_util import strip_deepspeed_local_rank_argv
+from src.training.trainer import _env_info, _git_info
 
 strip_deepspeed_local_rank_argv()
 
@@ -387,9 +387,9 @@ def load_condition_model(
 ):
     """Load a model for a motivation / eval condition.
 
-    `attn_implementation` is currently plumbed through for Qwen3-VL only; pass
-    `"eager"` to enable `output_attentions=True` at generation time. Other
-    backends ignore it and use their defaults.
+    `attn_implementation`: pass "eager" for Qwen3-VL or InternVL3 to enable
+    ``output_attentions=True`` at generation time. Other backends ignore it and
+    use their defaults.
     """
     def _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir):
         """Load reinspection weights and optional LoRA into a *WithReInspection wrapper."""
@@ -473,8 +473,14 @@ def load_condition_model(
 
     from src.backends.internvl3 import load_model as load_intern_ri
 
+    intern_attn_kw = {}
+    if attn_implementation is not None:
+        intern_attn_kw["attn_implementation"] = attn_implementation
+
     if condition == "reinspection":
-        model = load_intern_ri(config, device_map="auto", processor=processor)
+        model = load_intern_ri(
+            config, device_map="auto", processor=processor, **intern_attn_kw
+        )
         _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir)
         return model, True
 
@@ -483,6 +489,7 @@ def load_condition_model(
         resolved,
         torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
         device_map="auto",
+        **intern_attn_kw,
     )
     if condition == "lora_only":
         _load_lora_only(model, checkpoint_dir, lora_checkpoint_dir)

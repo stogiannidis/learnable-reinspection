@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import ReInspectionConfig
+from src.config import ReInspectionConfig
 
 
 class BottleneckCrossAttention(nn.Module):

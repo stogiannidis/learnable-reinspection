@@ -11,8 +11,8 @@ from transformers import AutoProcessor, InternVLForConditionalGeneration
 
 from src.backends.hf_hub_utils import resolve_pretrained_local_path
 from src.config import ReInspectionConfig
-from src.outputs import ReInspectionOutput
-from src.reinspection_module import ReInspectionModule
+from src.model.outputs import ReInspectionOutput
+from src.model.reinspection_module import ReInspectionModule
 
 
 def _chunked_cross_entropy(
@@ -486,13 +486,15 @@ def load_model(
     config: ReInspectionConfig,
     device_map: str = "auto",
     processor=None,
+    attn_implementation: Optional[str] = None,
 ) -> InternVL3WithReInspection:
     """Load InternVL3-8B and wrap it with the re-inspection module."""
     dtype = torch.bfloat16 if config.bf16 else torch.float32
     resolved = resolve_pretrained_local_path(config.model_name_or_path)
-    base_model = InternVLForConditionalGeneration.from_pretrained(
-        resolved, torch_dtype=dtype, device_map=device_map
-    )
+    load_kw = dict(torch_dtype=dtype, device_map=device_map)
+    if attn_implementation is not None:
+        load_kw["attn_implementation"] = attn_implementation
+    base_model = InternVLForConditionalGeneration.from_pretrained(resolved, **load_kw)
 
     return InternVL3WithReInspection(
         config=config,

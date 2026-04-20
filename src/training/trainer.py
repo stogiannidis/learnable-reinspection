@@ -22,8 +22,8 @@ from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoProcessor
 
 from src.backends.hf_hub_utils import resolve_pretrained_local_path
-from src.attn_loss import compute_attn_loss_focal, compute_attn_loss_kl
-from src.bbox_head import BboxHead, compute_grounding_loss
+from src.model.attn_loss import compute_attn_loss_focal, compute_attn_loss_kl
+from src.model.bbox_head import BboxHead, compute_grounding_loss
 from src.config import ReInspectionConfig
 from src.data.refcoco import RefCOCODataset
 from src.data.spatial_dataset import build_spatial_dataset
@@ -215,7 +215,7 @@ def _log_code_artifact() -> None:
             return
 
         art = wandb.Artifact("source-code", type="code", metadata=_git_info())
-        code_dir = os.path.join(os.path.dirname(__file__))
+        code_dir = os.path.join(os.path.dirname(__file__), "..")
         if os.path.isdir(code_dir):
             art.add_dir(code_dir, name="src")
         wandb.log_artifact(art)
@@ -612,7 +612,11 @@ def _save_checkpoint(ds_engine, save_dir: str, save_lora: bool = False) -> None:
                 )
 
     if save_lora:
-        lora_params = list(unwrapped.base_model.model.language_model.parameters())
+        lora_params = [
+            p
+            for p in unwrapped.base_model.model.language_model.parameters()
+            if p.requires_grad
+        ]
         with deepspeed.zero.GatheredParameters(lora_params, modifier_rank=0):
             if is_main_process():
                 unwrapped.base_model.model.language_model.save_pretrained(

@@ -20,8 +20,8 @@ from transformers import AutoProcessor, Gemma4ForConditionalGeneration
 
 from src.backends.hf_hub_utils import resolve_pretrained_local_path
 from src.config import ReInspectionConfig
-from src.outputs import ReInspectionOutput
-from src.reinspection_module import ReInspectionModule
+from src.model.outputs import ReInspectionOutput
+from src.model.reinspection_module import ReInspectionModule
 
 
 def _chunked_cross_entropy(

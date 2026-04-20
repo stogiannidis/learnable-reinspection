@@ -20,18 +20,13 @@ spec:
         workingDir: /data/users/stogian/learnable-reinspection
         command:
           - bash
-          - -c
-          - |
-            mkdir -p logs outputs/motivation
-            bash src/scripts/run_motivation.sh \
-              backend=gemma4 \
-              data_root=/data/datasets \
-              output_file=outputs/motivation/gemma4_motivation_results.json \
-              2>&1 | tee logs/motivation_gemma4.log
+          - src/scripts/run_motivation.sh
         terminationMessagePath: "/tmp/my-log"
         terminationMessagePolicy: File
         imagePullPolicy: "Always"
         env:
+          - name: MOTIVATION_PROFILE
+            value: gemma4
           - name: HF_TOKEN
             valueFrom:
               secretKeyRef:

@@ -10,8 +10,9 @@ Produces two complementary views:
      This shows what the bottleneck module focuses on in its own latent
      space — it is *not* the same signal as the decoder's attention.
 
-The decoder view is currently implemented for Qwen3-VL only (other backends
-pre-build `inputs_embeds` in different ways; scope them separately).
+The decoder view is implemented for Qwen3-VL and InternVL3 (requires
+``attn_implementation="eager"``). Other backends pre-build ``inputs_embeds``
+in different ways; scope them separately.
 """
 
 import argparse
@@ -349,7 +350,7 @@ def visualize_single(
     inputs = _process_inputs(backend, processor, text, image_path, config)
     inputs = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
-    capture_decoder = (backend == "qwen3vl")
+    capture_decoder = backend in ("qwen3vl", "internvl3")
 
     gen_kwargs = dict(max_new_tokens=max_new_tokens, do_sample=False)
     if capture_decoder:
@@ -463,7 +464,7 @@ def main():
     # Only Qwen3-VL's load_model currently plumbs this kwarg; other backends
     # fall back to their defaults (decoder viz is skipped for them).
     load_kwargs = dict(device_map="auto")
-    if args.backend == "qwen3vl":
+    if args.backend in ("qwen3vl", "internvl3"):
         load_kwargs["attn_implementation"] = "eager"
     model = load_model_fn(config, **load_kwargs)
 

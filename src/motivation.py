@@ -27,7 +27,7 @@ import warnings
 from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -50,7 +50,7 @@ from src.evaluate import (
     normalize_answer,
     _generate_extra_kw,
 )
-from src.hydra_util import strip_deepspeed_local_rank_argv
+from src.utils.hydra_util import strip_deepspeed_local_rank_argv
 
 strip_deepspeed_local_rank_argv()
 
@@ -75,6 +75,22 @@ def _jsd(p: np.ndarray, q: np.ndarray, eps: float = 1e-10) -> float:
     q /= q.sum()
     m = 0.5 * (p + q)
     return float(0.5 * (np.sum(p * np.log(p / m)) + np.sum(q * np.log(q / m))))
+
+
+def _internvl3_merged_hw(model) -> Optional[Tuple[int, int]]:
+    """Return (h, w) merged vision-token grid for single-tile InternVL3."""
+    _base = getattr(model, "base_model", model)
+    cfg = getattr(_base, "config", None)
+    if cfg is None:
+        return None
+    vcfg = getattr(cfg, "vision_config", None)
+    if vcfg is None:
+        return None
+    img_size = vcfg.image_size[0] if isinstance(vcfg.image_size, (list, tuple)) else vcfg.image_size
+    patch = vcfg.patch_size[0] if isinstance(vcfg.patch_size, (list, tuple)) else vcfg.patch_size
+    downsample = getattr(cfg, "downsample_ratio", 0.5)
+    side = int(round((img_size // patch) * downsample))
+    return side, side
 
 
 # ------------------------------------------------------------------ #
@@ -155,6 +171,7 @@ def _generate_with_attention(
     return_grid_info: bool = False,
     capture_base_vision_attn: bool = False,
     capture_decoder_attn: bool = False,
+    force_single_tile: bool = False,
 ) -> Dict:
     """Run a single question through the model and return answer + attention info.
 
@@ -184,6 +201,7 @@ def _generate_with_attention(
             model, processor, image_path, question, backend, config,
             is_reinspection, return_grid_info, capture_base_vision_attn,
             capture_decoder_attn=capture_decoder_attn,
+            force_single_tile=force_single_tile,
         )
     finally:
         if _tmp_file is not None:
@@ -194,7 +212,7 @@ def _generate_with_attention(
 def _generate_with_attention_inner(
     model, processor, image_path, question, backend, config,
     is_reinspection, return_grid_info, capture_base_vision_attn=False,
-    capture_decoder_attn=False,
+    capture_decoder_attn=False, force_single_tile: bool = False,
 ) -> Dict:
     device = model_device(model)
 
@@ -212,11 +230,17 @@ def _generate_with_attention_inner(
     else:
         messages = intern_build_chat(question=question, image_path=image_path, system_prompt=config.system_prompt)
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = processor(
-            text=[text], images=[image_path], return_tensors="pt",
-            max_pixels=config.max_pixels, min_pixels=config.min_pixels,
-            crop_to_patches=config.crop_to_patches_stage2,
-        )
+        if backend == "internvl3" and force_single_tile:
+            inputs = processor(
+                text=[text], images=[image_path], return_tensors="pt",
+                crop_to_patches=False,
+            )
+        else:
+            inputs = processor(
+                text=[text], images=[image_path], return_tensors="pt",
+                max_pixels=config.max_pixels, min_pixels=config.min_pixels,
+                crop_to_patches=config.crop_to_patches_stage2,
+            )
 
     inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
@@ -302,9 +326,15 @@ def _generate_with_attention_inner(
         img_tok = getattr(_base, "_image_token_id", None) or getattr(
             getattr(_base, "config", None), "image_token_id", None
         )
+        h_m, w_m = None, None
         if img_tok is not None and "image_grid_thw" in inputs:
             _, _h, _w = inputs["image_grid_thw"][0].tolist()
             h_m, w_m = _h // 2, _w // 2
+        elif img_tok is not None and backend == "internvl3":
+            grid = _internvl3_merged_hw(model)
+            if grid is not None:
+                h_m, w_m = grid
+        if img_tok is not None and h_m is not None and w_m is not None:
             tokenizer = getattr(processor, "tokenizer", None)
             decoder_image_attn = _decoder_image_attention(
                 generated_ids, decoder_attentions, img_tok, h_m, w_m, tokenizer=tokenizer,
@@ -320,15 +350,6 @@ def _generate_with_attention_inner(
 
     if return_grid_info and "image_grid_thw" in inputs:
         result["image_grid_thw"] = inputs["image_grid_thw"][0].tolist()
-    elif return_grid_info and backend == "internvl3":
-        # Derive approximate square grid from vision-token count in input_ids
-        _base = getattr(model, "base_model", model)
-        _img_tok = getattr(getattr(_base, "config", None), "image_token_id", None)
-        if _img_tok is not None:
-            n_vis = int((inputs["input_ids"][0] == _img_tok).sum().item())
-            if n_vis > 0:
-                side = max(1, int(n_vis ** 0.5))
-                result["vision_grid_hw"] = [side, side]
 
     return result
 
@@ -711,12 +732,13 @@ def run_attention_visualization(
 ) -> List[str]:
     """Collect attention heatmap data for the given condition. Returns saved .npz paths.
 
-    For ``condition='reinspection'``: uses the module's A_vis maps.
-    For ``condition='frozen'``: uses a cosine-similarity proxy between each vision
-    token's last-layer hidden state and the last text position (question-conditioned).
+    For ``condition='reinspection'``: uses the module's A_vis maps unless
+    ``use_decoder_attn`` (Qwen3-VL / InternVL3 with eager attention).
+    For ``condition='frozen'`` with Qwen3-VL or InternVL3: LLM decoder self-attention
+    to image tokens. Otherwise frozen uses a hidden-state cosine proxy over vision tokens.
 
-    Qwen backends use ``image_grid_thw``; InternVL3 derives an approximate square grid
-    from the vision-token count in ``input_ids``.
+    Qwen backends use ``image_grid_thw``; InternVL3 uses the merged patch grid from
+    ``vision_config`` (single-tile inputs via ``crop_to_patches=False``).
     """
     if backend not in ("qwen3vl", "qwen25vl", "internvl3"):
         print(f"  Attention visualisation not supported for backend={backend} — skipping.")
@@ -724,8 +746,9 @@ def run_attention_visualization(
 
     is_ri = condition == "reinspection"
     # Decoder-attention capture: proper VLM attention (generated → image tokens).
-    # Qwen3-VL only for now (requires attn_implementation="eager" at load time).
-    use_decoder_attn = (backend == "qwen3vl")
+    # Requires attn_implementation="eager" at load time (see main()).
+    use_decoder_attn = backend in ("qwen3vl", "internvl3")
+    force_single_tile = backend == "internvl3"
 
     fig_dir = os.path.join(output_dir, "attention_figures")
     os.makedirs(fig_dir, exist_ok=True)
@@ -742,12 +765,14 @@ def run_attention_visualization(
                 backend, config, is_ri, return_grid_info=True,
                 capture_base_vision_attn=(not is_ri) and (not use_decoder_attn),
                 capture_decoder_attn=use_decoder_attn,
+                force_single_tile=force_single_tile,
             )
             out_b = _generate_with_attention(
                 model, processor, image_path, pair.question_b,
                 backend, config, is_ri, return_grid_info=True,
                 capture_base_vision_attn=(not is_ri) and (not use_decoder_attn),
                 capture_decoder_attn=use_decoder_attn,
+                force_single_tile=force_single_tile,
             )
         except Exception as e:
             print(f"  skip attn vis [{condition}] example {i}: {e}")
@@ -758,9 +783,12 @@ def run_attention_visualization(
             _, h, w = out_a["image_grid_thw"]
             h_merged = h // 2
             w_merged = w // 2
-        elif "vision_grid_hw" in out_a:
-            # InternVL3: approximate square from vision-token count
-            h_merged, w_merged = out_a["vision_grid_hw"]
+        elif backend == "internvl3":
+            grid = _internvl3_merged_hw(model)
+            if grid is None:
+                print(f"  skip attn vis [{condition}] example {i}: missing InternVL3 vision grid")
+                continue
+            h_merged, w_merged = grid
         else:
             print(f"  skip attn vis [{condition}] example {i}: missing grid info")
             continue
@@ -830,7 +858,7 @@ def _plot_single_condition_figure(npz_paths: List[str], fig_dir: str, condition:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from src.visualize_attention import plot_attention_heatmap
+    from src.utils.visualize_attention import plot_attention_heatmap
 
     cmap = "hot" if condition == "reinspection" else "Blues"
     n = len(npz_paths)
@@ -897,7 +925,7 @@ def _plot_combined_attention_comparison(
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from src.visualize_attention import plot_attention_heatmap
+    from src.utils.visualize_attention import plot_attention_heatmap
 
     def _idx(path: str) -> int:
         return int(os.path.basename(path).split("_pair_")[-1].split(".")[0])
@@ -1223,8 +1251,7 @@ def main(cfg: DictConfig) -> None:
         print(f"{'='*60}")
 
         # Eager attention is required for output_attentions=True in generate().
-        # Only plumbed for Qwen3-VL right now; other backends use their defaults.
-        attn_impl = "eager" if backend == "qwen3vl" else None
+        attn_impl = "eager" if backend in ("qwen3vl", "internvl3") else None
         model, is_ri = load_condition_model(
             backend, condition, config, processor,
             checkpoint_dir=config.checkpoint_dir,

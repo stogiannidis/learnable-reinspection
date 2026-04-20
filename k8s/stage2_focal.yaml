@@ -23,7 +23,7 @@ spec:
           - -c
           - |
             mkdir -p logs models
-            bash src/scripts/run_stage2.sh stage1_checkpoint=models/internvl3/focal/epoch_3/reinspection_module.pt experiment_name=focal wandb_run_name=internvl-stage2-focal 2>&1 | tee logs/stage2_focal.log
+            bash src/scripts/run_stage2.sh stage1_checkpoint=models/internvl3/focal/epoch_5/reinspection_module.pt experiment_name=focal wandb_run_name=internvl-stage2-focal 2>&1 | tee logs/stage2_focal.log
         terminationMessagePath: "/tmp/my-log"
         terminationMessagePolicy: File
         imagePullPolicy: "Always"

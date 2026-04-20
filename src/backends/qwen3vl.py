@@ -18,8 +18,8 @@ from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
 from src.backends.hf_hub_utils import resolve_pretrained_local_path
 from src.config import ReInspectionConfig
-from src.outputs import ReInspectionOutput
-from src.reinspection_module import ReInspectionModule
+from src.model.outputs import ReInspectionOutput
+from src.model.reinspection_module import ReInspectionModule
 
 
 class Qwen3VLWithReInspection(nn.Module):
