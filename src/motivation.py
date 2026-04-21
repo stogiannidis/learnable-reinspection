@@ -860,7 +860,7 @@ def _plot_single_condition_figure(npz_paths: List[str], fig_dir: str, condition:
     import matplotlib.pyplot as plt
     from src.utils.visualize_attention import plot_attention_heatmap
 
-    cmap = "hot" if condition == "reinspection" else "Blues"
+    cmap = "hot" if condition == "reinspection" else "cividis"
     n = len(npz_paths)
     fig, axes = plt.subplots(n, 3, figsize=(14, 4 * n))
     if n == 1:
@@ -965,10 +965,10 @@ def _plot_combined_attention_comparison(
 
         plot_attention_heatmap(image, fd["attn_a"], h_m, w_m,
                                title=_label(fd["question_a"], fd["answer_a"], fd["gt_a"]),
-                               ax=axes[row, 1], cmap="Blues", alpha=0.5)
+                               ax=axes[row, 1], cmap="cividis", alpha=0.5)
         plot_attention_heatmap(image, fd["attn_b"], h_m, w_m,
                                title=_label(fd["question_b"], fd["answer_b"], fd["gt_b"]),
-                               ax=axes[row, 2], cmap="Blues", alpha=0.5)
+                               ax=axes[row, 2], cmap="cividis", alpha=0.5)
         plot_attention_heatmap(image, rd["attn_a"], h_m, w_m,
                                title=_label(rd["question_a"], rd["answer_a"], rd["gt_a"]),
                                ax=axes[row, 3], cmap="hot", alpha=0.5)

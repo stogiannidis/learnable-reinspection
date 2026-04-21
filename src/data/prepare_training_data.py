@@ -13,6 +13,11 @@ Usage:
     python -m src.data.prepare_training_data --output_dir /data/datasets --datasets all
     python -m src.data.prepare_training_data --output_dir /data/datasets --datasets grit --grit_max_samples 200000
     python -m src.data.prepare_training_data --output_dir /data/datasets --datasets clevr_spatial --clevr_num_scenes 50000
+    python -m src.data.prepare_training_data --datasets cambrian --cambrian_source fallback
+
+Cambrian: nyu-visionx/Cambrian-10M via HuggingFace streaming often raises KeyError('jpg')
+    inside the WebDataset loader (inconsistent shards). Default --cambrian_source fallback
+    uses GQA + Visual Genome only; use auto to try HF first, or hf for HF-only (no fallback).
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ import json
 import math
 import os
 import random
+import warnings
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -324,105 +330,83 @@ def _is_spatial_question(question: str) -> bool:
     return any(kw in q_lower for kw in _SPATIAL_KEYWORDS)
 
 
-def prepare_cambrian(
+def _prepare_cambrian_hf_stream(
     output_dir: str,
-    max_samples: int = 100_000,
-    seed: int = 42,
+    max_samples: int,
+    seed: int,
 ) -> None:
-    """Build a Cambrian-style spatial VQA mix for Stage 2.
-
-    Strategy: stream nyu-visionx/Cambrian-10M, filter for spatially-relevant
-    samples from scene-graph and synthetic sources, subsample to target size.
-
-    Args:
-        output_dir: Root data directory.
-        max_samples: Target number of spatial VQA samples.
-        seed: Random seed.
-    """
+    """Stream nyu-visionx/Cambrian-10M and write train/val JSON. Raises on load/iter errors."""
     from datasets import load_dataset
 
-    print("\n=== Preparing Cambrian-style spatial VQA mix ===")
     camb_dir = _ensure_dir(os.path.join(output_dir, "cambrian_spatial"))
     img_dir = _ensure_dir(os.path.join(camb_dir, "images"))
 
     print("  Streaming from nyu-visionx/Cambrian-10M ...")
-    try:
-        ds = load_dataset("nyu-visionx/Cambrian-10M", split="train", streaming=True)
-    except Exception as e:
-        print(f"  Could not load Cambrian-10M: {e}")
-        print("  Falling back to individual source datasets ...")
-        _prepare_cambrian_fallback(output_dir, max_samples, seed)
-        return
+    ds = load_dataset("nyu-visionx/Cambrian-10M", split="train", streaming=True)
 
     samples = []
     images_saved = 0
     skipped = 0
     buffer_multiplier = 3  # collect more, then subsample
 
-    try:
-        for row in tqdm(ds, desc="Cambrian", total=max_samples * buffer_multiplier):
-            if len(samples) >= max_samples * buffer_multiplier:
-                break
+    for row in tqdm(ds, desc="Cambrian", total=max_samples * buffer_multiplier):
+        if len(samples) >= max_samples * buffer_multiplier:
+            break
 
-            source = row.get("source", row.get("dataset", "")).lower()
-            question = row.get("question", row.get("conversations", [{}])[0].get("value", ""))
-            answer = row.get("answer", "")
+        source = row.get("source", row.get("dataset", "")).lower()
+        question = row.get("question", row.get("conversations", [{}])[0].get("value", ""))
+        answer = row.get("answer", "")
 
-            # Extract from conversations format if needed
-            convs = row.get("conversations", [])
-            if not question and len(convs) >= 2:
-                question = convs[0].get("value", "")
-                answer = convs[1].get("value", "")
+        # Extract from conversations format if needed
+        convs = row.get("conversations", [])
+        if not question and len(convs) >= 2:
+            question = convs[0].get("value", "")
+            answer = convs[1].get("value", "")
 
-            if not question or not answer:
+        if not question or not answer:
+            continue
+
+        # Filter for spatial content
+        source_match = any(s in source for s in _CAMBRIAN_SPATIAL_SOURCES)
+        spatial_match = _is_spatial_question(question)
+
+        if not (source_match and spatial_match):
+            # For non-source-match, require strong spatial signal
+            if not spatial_match:
+                skipped += 1
                 continue
 
-            # Filter for spatial content
-            source_match = any(s in source for s in _CAMBRIAN_SPATIAL_SOURCES)
-            spatial_match = _is_spatial_question(question)
+        # Handle image
+        img = row.get("image", None)
+        image_filename = f"cambrian_{images_saved:06d}.jpg"
+        image_path = os.path.join(img_dir, image_filename)
 
-            if not (source_match and spatial_match):
-                # For non-source-match, require strong spatial signal
-                if not spatial_match:
-                    skipped += 1
-                    continue
-
-            # Handle image
-            img = row.get("image", None)
-            image_filename = f"cambrian_{images_saved:06d}.jpg"
-            image_path = os.path.join(img_dir, image_filename)
-
-            if not os.path.exists(image_path):
-                if isinstance(img, Image.Image):
-                    img.convert("RGB").save(image_path)
-                elif isinstance(img, str):
-                    if os.path.exists(img):
-                        Image.open(img).convert("RGB").save(image_path)
-                    elif img.startswith("http"):
-                        if not _download_image(img, image_path):
-                            continue
-                    else:
+        if not os.path.exists(image_path):
+            if isinstance(img, Image.Image):
+                img.convert("RGB").save(image_path)
+            elif isinstance(img, str):
+                if os.path.exists(img):
+                    Image.open(img).convert("RGB").save(image_path)
+                elif img.startswith("http"):
+                    if not _download_image(img, image_path):
                         continue
                 else:
                     continue
+            else:
+                continue
 
-            images_saved += 1
+        images_saved += 1
 
-            # Clean question: remove <image> tokens if present
-            question_clean = question.replace("<image>", "").replace("<image>\n", "").strip()
+        # Clean question: remove <image> tokens if present
+        question_clean = question.replace("<image>", "").replace("<image>\n", "").strip()
 
-            samples.append({
-                "image": image_filename,
-                "question": question_clean,
-                "answer": answer.strip(),
-                "split": "train",
-                "source": source,
-            })
-    except Exception as e:
-        print(f"  Cambrian-10M stream failed during iteration: {e}")
-        print("  Falling back to individual source datasets ...")
-        _prepare_cambrian_fallback(output_dir, max_samples, seed)
-        return
+        samples.append({
+            "image": image_filename,
+            "question": question_clean,
+            "answer": answer.strip(),
+            "split": "train",
+            "source": source,
+        })
 
     # Subsample to target size
     rng = random.Random(seed)
@@ -434,6 +418,48 @@ def prepare_cambrian(
     _save_json(samples[:split_idx], os.path.join(camb_dir, "train.json"))
     _save_json(samples[split_idx:], os.path.join(camb_dir, "val.json"))
     print(f"  Kept {len(samples)} spatial samples from {images_saved} images (skipped {skipped} non-spatial)")
+
+
+def prepare_cambrian(
+    output_dir: str,
+    max_samples: int = 100_000,
+    seed: int = 42,
+    source: str = "fallback",
+) -> None:
+    """Build a Cambrian-style spatial VQA mix for Stage 2.
+
+    By default uses GQA + Visual Genome only (``source="fallback"``), because
+    ``nyu-visionx/Cambrian-10M`` often fails inside HuggingFace's WebDataset
+    loader with ``KeyError('jpg')`` on inconsistent shards.
+
+    Args:
+        output_dir: Root data directory.
+        max_samples: Target number of spatial VQA samples.
+        seed: Random seed.
+        source: ``fallback`` — GQA + VG only; ``auto`` — try HF Cambrian-10M stream
+            then fallback on error; ``hf`` — HF stream only (raises if it fails).
+    """
+    print("\n=== Preparing Cambrian-style spatial VQA mix ===")
+    _ensure_dir(os.path.join(output_dir, "cambrian_spatial"))
+
+    if source == "fallback":
+        print(
+            "  Using --cambrian_source fallback: skipping nyu-visionx/Cambrian-10M "
+            "(HF WebDataset loader often raises KeyError('jpg') on bad shards). "
+            "Building from GQA + Visual Genome.",
+        )
+        _prepare_cambrian_fallback(output_dir, max_samples, seed)
+        return
+
+    try:
+        _prepare_cambrian_hf_stream(output_dir, max_samples, seed)
+    except Exception as e:
+        if source == "auto":
+            print(f"  Cambrian-10M HuggingFace stream failed: {e}")
+            print("  Falling back to individual source datasets ...")
+            _prepare_cambrian_fallback(output_dir, max_samples, seed)
+            return
+        raise
 
 
 def _prepare_cambrian_fallback(
@@ -509,13 +535,15 @@ def _prepare_cambrian_fallback(
     # --- Visual Genome relationships ---
     print("  Loading Visual Genome relationships (spatial subset) ...")
     try:
-        vg_ds = load_dataset(
-            "visual_genome",
-            "relationships_v1.2.0",
-            split="train",
-            streaming=True,
-            trust_remote_code=True,
-        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            vg_ds = load_dataset(
+                "visual_genome",
+                "relationships_v1.2.0",
+                split="train",
+                streaming=True,
+                trust_remote_code=True,
+            )
         per_source = max_samples // 2
         vg_count = 0
 
@@ -886,6 +914,13 @@ def main() -> None:
     # Cambrian options
     parser.add_argument("--cambrian_max_samples", type=int, default=100_000,
                         help="Max spatial VQA samples from Cambrian")
+    parser.add_argument(
+        "--cambrian_source",
+        choices=("fallback", "auto", "hf"),
+        default="fallback",
+        help="fallback=GQA+VG only (default; HF Cambrian-10M stream is often broken); "
+        "auto=try HF Cambrian-10M then fallback; hf=HF stream only (no fallback)",
+    )
 
     # CLEVR options
     parser.add_argument("--clevr_num_scenes", type=int, default=50_000,
@@ -909,7 +944,12 @@ def main() -> None:
         if ds_name == "grit":
             prepare_grit(args.output_dir, max_samples=args.grit_max_samples, seed=args.seed)
         elif ds_name == "cambrian":
-            prepare_cambrian(args.output_dir, max_samples=args.cambrian_max_samples, seed=args.seed)
+            prepare_cambrian(
+                args.output_dir,
+                max_samples=args.cambrian_max_samples,
+                seed=args.seed,
+                source=args.cambrian_source,
+            )
         elif ds_name == "clevr_spatial":
             prepare_clevr_spatial(
                 args.output_dir,
