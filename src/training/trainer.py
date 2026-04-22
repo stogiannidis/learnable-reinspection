@@ -1,4 +1,10 @@
-"""Shared training utilities for all VLM backends."""
+"""Distributed DeepSpeed training for re-inspection VLMs.
+
+Builds per-backend frozen-base + trainable-module setups, attaches optional
+stage-1 supervision (attention focal/KL, bounding-box head), runs the
+optimizer loop with cosine warmup scheduling, checkpointing, and optional
+Weights & Biases logging.
+"""
 
 from __future__ import annotations
 
@@ -37,6 +43,18 @@ _attn_target_vis_mismatch_logged = False
 
 
 def collate_fn(batch):
+    """Merge a list of dataset dicts into a batched tensor dictionary.
+
+    Concatenates image tensors that are listed in ``_CONCAT_KEYS``, pads
+    variable-length float tensors (attention targets, boxes), stacks fixed-shape
+    tensors, and uses ``-100`` padding for ``labels`` when sequence lengths differ.
+
+    Args:
+        batch: List of per-sample dicts from :func:`torch.utils.data.DataLoader`.
+
+    Returns:
+        Dict mapping each key to a batched tensor or list value.
+    """
     keys = batch[0].keys()
     collated = {}
     for key in keys:
@@ -60,15 +78,18 @@ def collate_fn(batch):
 
 
 def is_main_process() -> bool:
+    """True on rank 0 when distributed is initialized; True if single-process."""
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
 def log(message: str) -> None:
+    """Print ``message`` only on the main process (rank 0)."""
     if is_main_process():
         print(message, flush=True)
 
 
 def _setup_distributed() -> None:
+    """Initialize ``torch.distributed`` NCCL when ``RANK`` is set (DeepSpeed launch)."""
     if dist.is_initialized():
         return
     if "RANK" in os.environ:
@@ -81,6 +102,7 @@ def _setup_distributed() -> None:
 
 
 def _get_local_rank() -> int:
+    """Local GPU index from the launcher environment (defaults to 0)."""
     return int(os.environ.get("LOCAL_RANK", 0))
 
 
@@ -136,6 +158,15 @@ def _env_info() -> dict:
 
 
 def _file_hash(path: str, algo: str = "sha256") -> str:
+    """Streaming file digest for dataset reproducibility artifacts.
+
+    Args:
+        path: Readable file path.
+        algo: Hash algorithm name accepted by :func:`hashlib.new`.
+
+    Returns:
+        Lowercase hex digest string.
+    """
     h = hashlib.new(algo)
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
@@ -240,6 +271,7 @@ def _log_config_artifact(config: ReInspectionConfig) -> None:
 
 
 def _init_wandb(config: ReInspectionConfig) -> None:
+    """Start a W&B run on rank 0 with git/env metadata and config/code artifacts."""
     if not is_main_process():
         return
     try:
@@ -271,6 +303,7 @@ def _init_wandb(config: ReInspectionConfig) -> None:
 
 
 def _log_wandb(metrics: dict, step: int) -> None:
+    """Log a metrics dict to the active W&B run (rank 0 only; silently no-op if absent)."""
     if not is_main_process():
         return
     try:
@@ -833,6 +866,21 @@ class _CosineWarmupLR:
 
 
 def run_training(config: ReInspectionConfig) -> None:
+    """End-to-end training for one backend and stage from a resolved config.
+
+    Sets up distributed NCCL, loads the processor (when required), constructs the
+    wrapped model and optimizer groups, initializes DeepSpeed, builds train/val
+    dataloaders with :func:`collate_fn`, runs epochs with optional auxiliary
+    stage-1 losses, checkpoints to ``output_dir``, and tears down the process
+    group on exit.
+
+    Args:
+        config: Fully populated :class:`~src.config.ReInspectionConfig`.
+
+    Raises:
+        RuntimeError: If the training dataset resolves to zero samples.
+        ValueError: If DeepSpeed config path is missing.
+    """
     backend = config.backend
     stage = config.stage
     is_stage1 = stage == 1

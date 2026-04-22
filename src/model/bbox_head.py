@@ -1,4 +1,8 @@
-"""Auxiliary bounding-box regression head for Stage 1 grounding supervision."""
+"""Auxiliary bounding-box head and GIoU-based grounding loss for stage 1.
+
+The head pools bottleneck query states and predicts a normalized axis-aligned
+box; the composite loss combines L1 coordinate error with generalized IoU.
+"""
 
 from typing import Optional
 
@@ -7,9 +11,15 @@ import torch.nn as nn
 
 
 class BboxHead(nn.Module):
-    """3-layer MLP that predicts a normalized bounding box from pooled R_r."""
+    """Three-layer MLP mapping mean-pooled bottleneck states to ``[x1,y1,x2,y2]``."""
 
     def __init__(self, d_r: int, dtype: Optional[torch.dtype] = None):
+        """Create the MLP and Sigmoid output squashing coordinates to ``[0, 1]``.
+
+        Args:
+            d_r: Bottleneck dimension ``R_r`` (matches re-inspection width).
+            dtype: Optional module dtype for mixed precision.
+        """
         super().__init__()
         self.mlp = nn.Sequential(
             nn.Linear(d_r, d_r, dtype=dtype),
@@ -22,6 +32,7 @@ class BboxHead(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        """Xavier-initialize linear layers with zero bias."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -29,18 +40,24 @@ class BboxHead(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, R_r: torch.Tensor) -> torch.Tensor:
-        """
+        """Predict a single normalized box per batch item from query tokens.
+
         Args:
-            R_r: (B, N_q, d_r) bottleneck-space query representations.
+            R_r: Tensor of shape ``(B, N_q, d_r)`` — bottleneck query states.
+
         Returns:
-            bbox_pred: (B, 4) predicted normalized [x1, y1, x2, y2].
+            Tensor of shape ``(B, 4)`` with values in ``[0, 1]`` interpreted as
+            ``[x1, y1, x2, y2]`` in normalized image coordinates.
         """
         r_bar = R_r.float().mean(dim=1)
         return self.mlp(r_bar)
 
 
 def _giou_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Generalized IoU loss for [x1, y1, x2, y2] boxes in [0, 1]."""
+    """Mean ``1 - GIoU`` for axis-aligned boxes in normalized coordinates.
+
+    Enforces valid ordering by sorting each predicted corner pair before IoU.
+    """
     px1, py1, px2, py2 = pred.unbind(-1)
     gx1, gy1, gx2, gy2 = target.unbind(-1)
 
@@ -75,7 +92,17 @@ def compute_grounding_loss(
     l1_weight: float = 5.0,
     giou_weight: float = 2.0,
 ) -> torch.Tensor:
-    """L1 + GIoU grounding loss on normalized [x1, y1, x2, y2] boxes."""
+    """Weighted sum of L1 and GIoU between predicted and ground-truth boxes.
+
+    Args:
+        bbox_pred: Predicted boxes ``(B, 4)``.
+        bbox_gt: Ground-truth boxes ``(B, 4)``, same layout as predictions.
+        l1_weight: Multiplier on mean L1 coordinate error.
+        giou_weight: Multiplier on :func:`_giou_loss`.
+
+    Returns:
+        Scalar combined loss.
+    """
     pred = bbox_pred.float()
     gt = bbox_gt.float()
     l1 = nn.functional.l1_loss(pred, gt)
