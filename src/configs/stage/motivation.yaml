@@ -2,8 +2,8 @@
 # Motivation experiment: spatial minimal-pair flip consistency + attention divergence
 #
 # Usage:
-#   python -m src.motivation stage=motivation backend=qwen3vl
-#   python -m src.motivation stage=motivation backend=qwen3vl checkpoint_dir=models/qwen3vl/stage2/epoch_10
+#   python -m src.motivation stage=motivation backend=internvl3
+#   python -m src.motivation stage=motivation backend=internvl3 checkpoint_dir=models/internvl3/stage2/epoch_4
 #   python -m src.motivation stage=motivation backend=internvl3 max_samples=200
 
 stage: 2

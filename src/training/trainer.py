@@ -18,7 +18,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from peft import LoraConfig, TaskType, get_peft_model
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 from transformers import AutoProcessor
 
 from src.backends.hf_hub_utils import resolve_pretrained_local_path
@@ -338,56 +338,6 @@ def _attach_bbox_head(model, config: ReInspectionConfig) -> None:
     model.bbox_head = BboxHead(config.d_bottleneck, dtype=dtype)
 
 
-def _setup_model_qwen_stage1(config: ReInspectionConfig):
-    from src.backends.qwen3vl import load_model
-
-    model = load_model(config, device_map=None)
-    for param in model.base_model.parameters():
-        param.requires_grad = False
-    for param in model.reinspection.parameters():
-        param.requires_grad = True
-    optim_groups = [{"params": list(model.reinspection.parameters()), "lr": config.stage1_lr_module}]
-    if config.stage1_aux_loss in ("grounding", "both"):
-        _attach_bbox_head(model, config)
-        optim_groups.append({"params": list(model.bbox_head.parameters()), "lr": config.stage1_lr_module})
-    optimizer = torch.optim.AdamW(optim_groups, weight_decay=0.01)
-    return model, optimizer
-
-
-def _setup_model_qwen_stage2(config: ReInspectionConfig):
-    from src.backends.qwen3vl import load_model
-
-    model = load_model(config, device_map=None)
-    if config.stage1_checkpoint:
-        log(f"Loading Stage 1 checkpoint: {config.stage1_checkpoint}")
-        _load_stage1_weights(model, config.stage1_checkpoint)
-    for param in model.base_model.parameters():
-        param.requires_grad = False
-    for param in model.reinspection.parameters():
-        param.requires_grad = True
-    lora_config = LoraConfig(
-        r=config.lora_r,
-        lora_alpha=config.lora_alpha,
-        lora_dropout=config.lora_dropout,
-        target_modules=config.lora_target_modules,
-        bias="none",
-        task_type="FEATURE_EXTRACTION",
-    )
-    model.base_model.model.language_model = get_peft_model(
-        model.base_model.model.language_model, lora_config
-    )
-    reinspection_params = list(model.reinspection.parameters())
-    lora_params = [p for _, p in model.base_model.named_parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": reinspection_params, "lr": config.stage2_lr_module},
-            {"params": lora_params, "lr": config.stage2_lr_lora},
-        ],
-        weight_decay=0.01,
-    )
-    return model, optimizer
-
-
 def _setup_model_intern_stage1(config: ReInspectionConfig, processor):
     from src.backends.internvl3 import load_model
 
@@ -449,7 +399,7 @@ def _setup_model_intern_stage2(config: ReInspectionConfig, processor, stage1_che
     return model, optimizer
 
 
-# ---- Qwen2.5-VL setup (same architecture as Qwen3VL) ----
+# ---- Qwen2.5-VL setup ----
 
 def _setup_model_qwen25_stage1(config: ReInspectionConfig):
     from src.backends.qwen25vl import load_model
@@ -587,6 +537,95 @@ def _build_dataset(
     )
 
 
+def _split_train_val(dataset, val_ratio: float, seed: int):
+    """Deterministic train/val holdout. Returns (train_subset, val_subset_or_None)."""
+    n = len(dataset)
+    n_val = int(round(n * val_ratio))
+    if n_val == 0 or n_val >= n:
+        return dataset, None
+    g = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(n, generator=g).tolist()
+    val_idx, train_idx = perm[:n_val], perm[n_val:]
+    return Subset(dataset, train_idx), Subset(dataset, val_idx)
+
+
+def _run_validation(
+    ds_engine,
+    val_loader,
+    backend: str,
+    is_stage1: bool,
+    use_attn: bool,
+    use_grounding: bool,
+    config: ReInspectionConfig,
+    device,
+) -> dict:
+    """Run one validation epoch. All ranks must participate (collective all_reduce).
+
+    Returns averaged loss components as a dict of floats. Non-finite batches are
+    skipped (all_reduced MIN guard) and excluded from the average.
+    """
+    was_training = ds_engine.training
+    ds_engine.eval()
+
+    # Accumulators on device for cheap all_reduce.
+    ce_sum = torch.zeros((), device=device)
+    attn_sum = torch.zeros((), device=device)
+    ground_sum = torch.zeros((), device=device)
+    total_sum = torch.zeros((), device=device)
+    n_batches = torch.zeros((), device=device)
+
+    try:
+        with torch.inference_mode():
+            for batch in val_loader:
+                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                outputs = ds_engine(**_train_forward_kwargs(batch, backend, is_stage1))
+
+                ce_loss = outputs.loss
+                if ce_loss is None:
+                    ce_loss = torch.zeros((), device=device)
+
+                attn_loss = torch.zeros((), device=device)
+                grounding_loss = torch.zeros((), device=device)
+                if use_attn:
+                    attn_loss = _stage1_attn_loss(config, outputs, batch, device)
+                if use_grounding:
+                    grounding_loss = _stage1_grounding_loss(
+                        config, ds_engine, outputs, batch, device, global_step=10**9
+                    )
+
+                loss = ce_loss \
+                    + (config.stage1_attn_loss_weight * attn_loss if use_attn else 0.0) \
+                    + (config.stage1_grounding_loss_weight * grounding_loss if use_grounding else 0.0)
+
+                _finite = torch.tensor(float(torch.isfinite(loss)), device=device)
+                if dist.is_initialized():
+                    dist.all_reduce(_finite, op=dist.ReduceOp.MIN)
+                if _finite.item() < 0.5:
+                    continue
+
+                ce_sum = ce_sum + ce_loss.detach()
+                attn_sum = attn_sum + attn_loss.detach()
+                ground_sum = ground_sum + grounding_loss.detach()
+                total_sum = total_sum + loss.detach()
+                n_batches = n_batches + 1
+    finally:
+        if was_training:
+            ds_engine.train()
+
+    packed = torch.stack([ce_sum, attn_sum, ground_sum, total_sum, n_batches])
+    if dist.is_initialized():
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+    ce_s, attn_s, ground_s, total_s, n = packed.tolist()
+    denom = max(n, 1.0)
+    return {
+        "loss": total_s / denom,
+        "ce_loss": ce_s / denom,
+        "attn_loss": attn_s / denom,
+        "grounding_loss": ground_s / denom,
+        "num_batches": int(n),
+    }
+
+
 def _save_checkpoint(ds_engine, save_dir: str, save_lora: bool = False) -> None:
     import deepspeed
 
@@ -680,7 +719,7 @@ def _train_forward_kwargs(batch: dict, backend: str, is_stage1: bool) -> dict:
         "labels": batch["labels"],
         "return_attn_maps": is_stage1,
     }
-    if backend in ("qwen3vl", "qwen25vl"):
+    if backend == "qwen25vl":
         fwd["image_grid_thw"] = batch.get("image_grid_thw")
         fwd["video_grid_thw"] = batch.get("video_grid_thw")
     elif backend == "gemma4":
@@ -822,12 +861,7 @@ def run_training(config: ReInspectionConfig) -> None:
         processor = load_gemma4_proc(config)
     _init_wandb(config)
 
-    if backend == "qwen3vl":
-        if is_stage1:
-            model, optimizer = _setup_model_qwen_stage1(config)
-        else:
-            model, optimizer = _setup_model_qwen_stage2(config)
-    elif backend == "qwen25vl":
+    if backend == "qwen25vl":
         if is_stage1:
             model, optimizer = _setup_model_qwen25_stage1(config)
         else:
@@ -875,7 +909,7 @@ def run_training(config: ReInspectionConfig) -> None:
     )
     model = ds_engine
 
-    if backend in ("qwen3vl", "qwen25vl"):
+    if backend == "qwen25vl":
         resolved = resolve_pretrained_local_path(config.model_name_or_path)
         processor = AutoProcessor.from_pretrained(
             resolved,
@@ -883,17 +917,21 @@ def run_training(config: ReInspectionConfig) -> None:
             min_pixels=config.min_pixels,
         )
 
-    train_dataset = _build_dataset(backend, stage, config, config.data_root, processor)
-    if len(train_dataset) == 0:
+    full_dataset = _build_dataset(backend, stage, config, config.data_root, processor)
+    if len(full_dataset) == 0:
         raise RuntimeError(f"Dataset is empty. Check data_root={config.data_root}")
-    log(f"Training samples: {len(train_dataset)}")
+    train_dataset, val_dataset = _split_train_val(full_dataset, config.val_split_ratio, config.seed)
+    log(
+        f"Training samples: {len(train_dataset)}; "
+        f"validation samples: {len(val_dataset) if val_dataset is not None else 0}"
+    )
 
     # Keep all ranks aligned: rank-0-only W&B work must finish before any rank
     # enters the DataLoader/training loop (otherwise NCCL collectives deadlock).
     if dist.is_initialized():
         dist.barrier()
     if is_main_process():
-        _log_dataset_artifact(train_dataset, stage, backend, config.data_root)
+        _log_dataset_artifact(full_dataset, stage, backend, config.data_root)
     if dist.is_initialized():
         dist.barrier()
 
@@ -908,6 +946,24 @@ def run_training(config: ReInspectionConfig) -> None:
         num_workers=num_workers,
         pin_memory=True,
     )
+
+    val_loader = None
+    if val_dataset is not None:
+        val_batch = config.val_batch_size or batch_size
+        val_sampler = (
+            DistributedSampler(val_dataset, shuffle=False, drop_last=False)
+            if dist.is_initialized()
+            else None
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=val_batch,
+            shuffle=False,
+            sampler=val_sampler,
+            collate_fn=collate_fn,
+            num_workers=num_workers,
+            pin_memory=True,
+        )
 
     num_updates = max(1, len(train_loader) * n_epochs // grad_accum)
     warmup_override = config.stage1_warmup_steps if is_stage1 else config.stage2_warmup_steps
@@ -935,7 +991,7 @@ def run_training(config: ReInspectionConfig) -> None:
     model.train()
     global_step = 0
     update_step = 0
-    best_epoch_loss = float("inf")
+    best_val_loss = float("inf")
     pfx = f"{backend}_stage{stage}"
 
     log(
@@ -1073,6 +1129,36 @@ def run_training(config: ReInspectionConfig) -> None:
             + aux_msg
         )
 
+        val_loss = None
+        if val_loader is not None:
+            val_metrics = _run_validation(
+                ds_engine, val_loader, backend, is_stage1,
+                use_attn, use_grounding, config, device,
+            )
+            val_loss = val_metrics["loss"]
+            val_summary = {
+                f"{pfx}/val/loss": val_metrics["loss"],
+                f"{pfx}/val/ce_loss": val_metrics["ce_loss"],
+                f"{pfx}/val/epoch": epoch + 1,
+                f"{pfx}/val/num_batches": val_metrics["num_batches"],
+            }
+            if use_attn:
+                val_summary[f"{pfx}/val/attn_loss"] = val_metrics["attn_loss"]
+            if use_grounding:
+                val_summary[f"{pfx}/val/grounding_loss"] = val_metrics["grounding_loss"]
+            if is_stage1 and (use_attn or use_grounding):
+                sup = 0.0
+                if use_attn:
+                    sup += config.stage1_attn_loss_weight * val_metrics["attn_loss"]
+                if use_grounding:
+                    sup += config.stage1_grounding_loss_weight * val_metrics["grounding_loss"]
+                val_summary[f"{pfx}/val/stage1_supervision_loss"] = sup
+            _log_wandb(val_summary, global_step)
+            log(
+                f"Epoch {epoch + 1}/{n_epochs} val: loss={val_metrics['loss']:.4f} "
+                f"ce={val_metrics['ce_loss']:.4f}"
+            )
+
         parts = [config.output_dir, backend]
         if config.experiment_name:
             parts.append(config.experiment_name)
@@ -1084,9 +1170,10 @@ def run_training(config: ReInspectionConfig) -> None:
             save_lora=not is_stage1,
         )
 
-        is_best = avg_epoch_loss < best_epoch_loss
+        tracked_loss = val_loss if val_loss is not None else avg_epoch_loss
+        is_best = tracked_loss < best_val_loss
         if is_best:
-            best_epoch_loss = avg_epoch_loss
+            best_val_loss = tracked_loss
         _log_model_artifact(save_dir, stage, backend, epoch + 1, is_best=is_best)
 
     _finish_wandb()
