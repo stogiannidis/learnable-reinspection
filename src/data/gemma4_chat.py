@@ -15,6 +15,18 @@ def build_chat_messages(
     image_url: Optional[str] = None,
     system_prompt: Optional[str] = "You are a helpful assistant.",
 ) -> List[Dict]:
+    """Build Gemma 4 chat messages (assistant role is ``"model"``).
+
+    Args:
+        question: User question text.
+        answer: Optional assistant completion for SFT-style samples.
+        image_path: Local filesystem image reference.
+        image_url: Remote image URL (content uses the ``url`` key per Gemma schema).
+        system_prompt: Native Gemma system turn; disable with ``None``/empty.
+
+    Returns:
+        HF-format message list for ``apply_chat_template``.
+    """
     messages: List[Dict] = []
 
     if system_prompt:

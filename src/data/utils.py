@@ -1,4 +1,4 @@
-"""Qwen-oriented data utilities (shared by Qwen2.5-VL)."""
+"""Qwen2.5-VL data helpers: chat message layout and bbox-to-patch supervision."""
 
 import numpy as np
 import torch
@@ -10,7 +10,20 @@ def bbox_to_patch_mask(
     image_grid_thw: torch.LongTensor,
     spatial_merge_size: int = 2,
 ) -> torch.Tensor:
-    """Map a normalized bbox to Qwen merged patch supervision."""
+    """Convert a normalized box to a simplex mask over merged vision patches.
+
+    The mask is uniform over all spatiotemporal indices whose merged row/column
+    falls inside the bbox (clamped to grid bounds), then renormalized to sum to
+    1 when non-empty.
+
+    Args:
+        bbox: ``[x1, y1, x2, y2]`` in ``[0, 1]`` image coordinates.
+        image_grid_thw: Length-3 tensor ``(T, H, W)`` describing native patch grid.
+        spatial_merge_size: Integer merge factor along height/width.
+
+    Returns:
+        Float vector of length ``T * (H//m) * (W//m)`` aligned with Qwen tokens.
+    """
     t, h_patches, w_patches = image_grid_thw.tolist()
     h_merged = h_patches // spatial_merge_size
     w_merged = w_patches // spatial_merge_size
@@ -49,7 +62,21 @@ def build_chat_messages(
     image_path: Optional[str] = None,
     image_url: Optional[str] = None,
 ) -> List[Dict]:
-    """Build Qwen chat messages."""
+    """Construct Qwen ``apply_chat_template`` message list with optional vision.
+
+    Exactly one of ``image_path`` or ``image_url`` may be set to prepend an image
+    content block; when ``answer`` is provided, an assistant turn is appended for
+    supervised fine-tuning prompts.
+
+    Args:
+        question: User question text.
+        answer: Optional assistant reply for SFT formatting.
+        image_path: Local filesystem path for the image modality.
+        image_url: Remote URL for the image modality.
+
+    Returns:
+        Messages in HF multimodal chat schema (list of role/content dicts).
+    """
     content = []
 
     if image_path is not None:

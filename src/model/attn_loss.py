@@ -1,11 +1,27 @@
-"""Stage-1 attention supervision losses."""
+"""Stage-1 attention supervision losses for aligning query attention to targets.
+
+Provides KL-based matching (InternVL-style) and focal loss with optional
+per-query spatial diversification for Qwen patch grids.
+"""
 
 import torch
 import torch.nn.functional as F
 
 
 def compute_attn_loss_kl(attn_vis: torch.Tensor, attn_target: torch.Tensor) -> torch.Tensor:
-    """KL divergence between predicted and target attention (InternVL default)."""
+    """KL divergence between predicted and target attention over vision tokens.
+
+    Normalizes both distributions per query position, expands the target across
+    heads, and averages ``batchmean`` KL.  The loss is scaled by the number of
+    queries so magnitude stays stable as ``n_queries`` changes.
+
+    Args:
+        attn_vis: Predicted attention ``(B, Q, V)`` from the re-inspection module.
+        attn_target: Soft target mask ``(B, V)`` (sums need not be 1 before norm).
+
+    Returns:
+        Scalar KL loss averaged over the batch and queries.
+    """
     pred = attn_vis.float().clamp(min=1e-8)
     pred = pred / pred.sum(dim=-1, keepdim=True)
     target = attn_target.float().clamp(min=1e-8)
@@ -21,7 +37,20 @@ def _diversify_targets(
     image_grid_thw: torch.Tensor,
     spatial_merge_size: int = 2,
 ) -> torch.Tensor:
-    """Partition bbox into vertical strips per query (Qwen Stage 1)."""
+    """Partition positive patch rows into disjoint vertical strips per query.
+
+    Encourages different bottleneck queries to cover different spatial bands
+    derived from the ground-truth bounding box on the merged Qwen patch grid.
+
+    Args:
+        binary_target: ``(B, N_v)`` binary mask of supervised vision tokens.
+        n_queries: Number of re-inspection queries (strip count upper bound).
+        image_grid_thw: ``(B, 3)`` tensor ``(T, H, W)`` describing patch layout.
+        spatial_merge_size: Patch merge factor used by the vision tower.
+
+    Returns:
+        Tensor ``(B, n_queries, N_v)`` with per-query targets (zeros where no split).
+    """
     B, N_v = binary_target.shape
     per_query = binary_target.unsqueeze(1).expand(B, n_queries, N_v).clone()
 
@@ -65,7 +94,24 @@ def compute_attn_loss_focal(
     alpha: float = 0.25,
     gamma: float = 2.0,
 ) -> torch.Tensor:
-    """Binary focal loss with optional per-query diversified targets (Qwen Stage 1)."""
+    """Binary focal loss between predicted vision attention and soft targets.
+
+    When ``image_grid_thw`` is provided, targets are diversified per query via
+    :func:`_diversify_targets`; otherwise the same binary mask is broadcast to
+    all queries.  Probabilities are computed in float32 to avoid ``log(0)``
+    under bfloat16 rounding.
+
+    Args:
+        A_vis: Predicted attention logits or probabilities ``(B, Q, V)``.
+        attn_target: Non-negative supervision weights ``(B, V)``.
+        image_grid_thw: Optional Qwen grid tensor for diversification.
+        n_queries: Query count (must match ``A_vis``'s query dimension).
+        alpha: Focal balancing factor ``alpha`` in ``[0, 1]``.
+        gamma: Focusing exponent on ``(1 - p_t)``.
+
+    Returns:
+        Scalar mean focal loss over all entries.
+    """
     binary = (attn_target > 0).float()
 
     if image_grid_thw is not None:

@@ -1,4 +1,9 @@
-"""Backend-specific model wrappers (InternVL3, Qwen2.5-VL, Gemma4)."""
+"""Public exports for vision-language backends with re-inspection wrappers.
+
+Each submodule pairs a frozen (or PEFT-wrapped) base VLM with
+:class:`~src.model.reinspection_module.ReInspectionModule` and exposes
+``load_model`` / ``load_processor`` entry points used by training and evaluation.
+"""
 
 from .qwen25vl import Qwen25VLWithReInspection, load_model as load_qwen25_model
 from .internvl3 import InternVL3WithReInspection, load_model as load_internvl_model, load_processor

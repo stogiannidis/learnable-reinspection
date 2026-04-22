@@ -1,6 +1,12 @@
-"""Unified spatial-benchmark evaluation for InternVL3, Qwen2.5-VL and Gemma4 backends.
+"""Spatial-benchmark evaluation for InternVL3, Qwen2.5-VL, and Gemma 4.
 
-Entry point is Hydra-only: ``python -m src.evaluate stage=eval [overrides]``.
+Loads processors and condition-specific checkpoints (frozen base, LoRA-only, or
+full re-inspection), runs greedy decoding on JSON/JSONL benchmarks, scores
+answers with MCQ-aware matching, optionally logs attention entropy, and writes
+JSON plus human-readable comparison tables.
+
+Entry point: ``python -m src.evaluate`` with Hydra overrides (for example
+``stage=eval``, ``backend=internvl3``).
 """
 
 from __future__ import annotations
@@ -92,6 +98,7 @@ def _eval_tqdm_disable() -> bool:
 
 
 def _repo_root() -> Path:
+    """Return the repository root (parent of the ``src`` package directory)."""
     return Path(__file__).resolve().parent.parent
 
 
@@ -112,6 +119,15 @@ def _generate_extra_kw(processor) -> Dict[str, int]:
 
 
 def _resolve_path(path_like: str, base_dir: Optional[Path] = None) -> str:
+    """Resolve a path string against ``base_dir`` when relative.
+
+    Args:
+        path_like: User or config path (may be absolute).
+        base_dir: Directory used for relative resolution (defaults to ``cwd()``).
+
+    Returns:
+        Absolute path as a string.
+    """
     path = Path(path_like).expanduser()
     if path.is_absolute():
         return str(path)
@@ -120,7 +136,16 @@ def _resolve_path(path_like: str, base_dir: Optional[Path] = None) -> str:
 
 
 def _resolve_data_path(path_like: str, data_root: str) -> str:
-    """Resolve a data path with sensible fallbacks."""
+    """Resolve a benchmark-relative path, preferring ``data_root`` then repo cwd.
+
+    Args:
+        path_like: Relative path from a benchmark config (for example ``vsr/test.jsonl``).
+        data_root: Root directory containing unpacked benchmark folders.
+
+    Returns:
+        Existing file path when found; otherwise the ``data_root``-relative path
+        for clearer downstream ``FileNotFoundError`` messages.
+    """
     path = Path(path_like).expanduser()
     if path.is_absolute():
         return str(path)
@@ -138,6 +163,7 @@ def _resolve_data_path(path_like: str, data_root: str) -> str:
 
 
 def _init_wandb(config: ReInspectionConfig) -> None:
+    """Optionally initialize W&B for eval with config, git/env, and checkpoint artifact."""
     try:
         import wandb
 
@@ -174,6 +200,7 @@ def _init_wandb(config: ReInspectionConfig) -> None:
 
 
 def _log_wandb(metrics: dict, step: int = 0) -> None:
+    """Log metrics to W&B when a run is active (no-op on failure)."""
     try:
         import wandb
 
@@ -212,6 +239,7 @@ def _log_eval_results_artifact(output_file: str, all_results: list, backend: str
 
 
 def _finish_wandb() -> None:
+    """End the W&B run if one was started."""
     try:
         import wandb
 
@@ -249,6 +277,7 @@ def _log_wandb_summary(all_results, prefix: str) -> None:
 
 
 def normalize_answer(text: str) -> str:
+    """Lowercase, strip, and collapse internal whitespace for robust string compare."""
     return " ".join(text.strip().lower().split())
 
 
@@ -272,7 +301,19 @@ def _extract_mcq_letter(text: str) -> Optional[str]:
 
 
 def match_answer(generated: str, ground_truth: str) -> bool:
-    """Match generated answer against ground truth, with MCQ-aware logic."""
+    """Return True if the decoded answer matches the reference label.
+
+    Multiple-choice answers (single letter A–D) use strict letter extraction so
+    substring matches cannot succeed on unrelated text; free-form answers allow
+    equality or reference contained in the hypothesis after normalization.
+
+    Args:
+        generated: Raw decoded model string.
+        ground_truth: Dataset reference answer.
+
+    Returns:
+        Whether the pair is counted as correct for accuracy metrics.
+    """
     gen_norm = normalize_answer(generated)
     gt_norm = normalize_answer(ground_truth)
 
@@ -363,6 +404,14 @@ def print_comparison_table(all_results: list, output_file: Optional[str] = None)
 
 
 def compute_attention_entropy(attn_vis: torch.Tensor) -> float:
+    """Mean Shannon entropy of averaged vision attention across queries.
+
+    Args:
+        attn_vis: Attention tensor with a final dimension over vision positions.
+
+    Returns:
+        Scalar mean entropy (natural log) as a Python float.
+    """
     avg_attn = attn_vis.mean(dim=1).clamp(min=1e-8)
     avg_attn = avg_attn / avg_attn.sum(dim=-1, keepdim=True)
     entropy = -(avg_attn * avg_attn.log()).sum(dim=-1)
@@ -370,6 +419,7 @@ def compute_attention_entropy(attn_vis: torch.Tensor) -> float:
 
 
 def model_device(model) -> torch.device:
+    """Infer the device hosting model parameters (``model.device`` or first param)."""
     if hasattr(model, "device"):
         return model.device
     return next(model.parameters()).device
@@ -384,11 +434,27 @@ def load_condition_model(
     lora_checkpoint_dir: Optional[str] = None,
     attn_implementation: Optional[str] = None,
 ):
-    """Load a model for a motivation / eval condition.
+    """Load a base or wrapped model for one evaluation ``condition``.
 
-    `attn_implementation`: pass "eager" for InternVL3 to enable
-    ``output_attentions=True`` at generation time. Other backends ignore it and
-    use their defaults.
+    Args:
+        backend: One of ``internvl3``, ``qwen25vl``, ``gemma4``.
+        condition: ``reinspection`` (wrapper + checkpoint), ``frozen`` (base HF
+            model), or ``lora_only`` (base + LoRA adapter weights).
+        config: Run configuration (paths, dtype, module sizes).
+        processor: Loaded processor used by Gemma/InternVL wrapper paths.
+        checkpoint_dir: Directory containing ``reinspection_module.pt`` and/or
+            ``lora_weights`` for the re-inspection or LoRA-only conditions.
+        lora_checkpoint_dir: Optional separate LoRA directory when not colocated.
+        attn_implementation: Pass ``"eager"`` for InternVL3 to allow attention
+            maps at generation time; ignored elsewhere.
+
+    Returns:
+        Tuple ``(model, is_reinspection)`` where the boolean flags whether the
+        forward pass exposes re-inspection hooks (for example attention maps).
+
+    Raises:
+        ValueError: For ``lora_only`` without any checkpoint directory.
+        FileNotFoundError: When expected LoRA weights are missing on disk.
     """
     def _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir):
         """Load reinspection weights and optional LoRA into a *WithReInspection wrapper."""
@@ -488,6 +554,25 @@ def evaluate_benchmark(
     is_reinspection: bool,
     max_samples: int = -1,
 ) -> dict:
+    """Evaluate one benchmark split with greedy decoding and per-sample outputs.
+
+    Args:
+        backend: VLM backend id controlling chat template and tensor layout.
+        model: Loaded HF or custom wrapper model in eval mode (modified in-place).
+        processor: Matching processor for tokenization and decoding.
+        data_file: Path to JSON or JSONL annotations.
+        image_root: Directory containing image files referenced by samples.
+        benchmark_name: Short name used in logs and result dicts.
+        config: Pixel bounds, crop flags, system prompt, and ignore index for labels.
+        is_reinspection: Whether to slice generated tokens after inserted queries
+            and optionally collect attention entropy.
+        max_samples: Cap on evaluated items; ``<= 0`` means full split.
+
+    Returns:
+        Dict with keys ``benchmark``, ``accuracy``, ``correct``, ``total``,
+        ``skipped``, ``mean_attention_entropy`` (or None), and ``samples`` (list
+        of per-item records).
+    """
     ds = SpatialVQADataset(
         data_file=data_file,
         image_root=image_root,
@@ -638,6 +723,11 @@ def evaluate_benchmark(
 
 @hydra.main(config_path="configs", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
+    """Hydra entry: run configured benchmarks and write JSON + comparison table.
+
+    Args:
+        cfg: Merged Hydra configuration for evaluation (``stage=eval`` preset).
+    """
     config = ReInspectionConfig(**OmegaConf.to_container(cfg, resolve=True))
     _set_eval_reproducibility(config.seed)
     backend = config.backend

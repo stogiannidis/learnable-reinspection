@@ -1,4 +1,10 @@
-"""Unified configuration for Re-Inspection VLM training (InternVL3, Qwen2.5-VL, Gemma4)."""
+"""Unified configuration for Re-Inspection VLM training and evaluation.
+
+This module defines a single dataclass consumed by Hydra-resolved YAML plus
+CLI overrides.  Fields group runtime paths, model geometry (bottleneck
+attention), two-stage optimization hyperparameters, and data preprocessing
+flags shared across backends (InternVL3, Qwen2.5-VL, Gemma 4).
+"""
 
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -6,6 +12,18 @@ from typing import List, Optional
 
 @dataclass
 class ReInspectionConfig:
+    """Resolved experiment configuration for training or benchmark evaluation.
+
+    Attributes are intentionally flat so Hydra can override any field by name.
+    Stage 1 optimizes the re-inspection module (and optional grounding head) on
+    referring-expression data; stage 2 freezes the vision stack and attaches
+    LoRA to the language model while continuing to train the module.
+
+    The derived attribute ``d_head`` is computed in ``__post_init__`` and must
+    satisfy ``d_bottleneck % n_heads == 0`` for multi-head attention in the
+    bottleneck space.
+    """
+
     # ------------------------------------------------------------------ #
     # Runtime (set via Hydra overrides or config file)                    #
     # ------------------------------------------------------------------ #
@@ -114,6 +132,11 @@ class ReInspectionConfig:
     max_grad_norm: float = 1.0
 
     def __post_init__(self) -> None:
+        """Validate head divisibility and set per-head bottleneck width.
+
+        Raises:
+            ValueError: If ``d_bottleneck`` is not divisible by ``n_heads``.
+        """
         if self.d_bottleneck % self.n_heads != 0:
             raise ValueError(
                 f"d_bottleneck ({self.d_bottleneck}) must be divisible by n_heads ({self.n_heads})"
@@ -122,4 +145,9 @@ class ReInspectionConfig:
 
     @property
     def processor_path(self) -> str:
+        """Hugging Face id or local path used to load tokenizer/processor.
+
+        Falls back to ``model_name_or_path`` when a separate processor checkpoint
+        is not specified (typical for weight-tied processor bundles).
+        """
         return self.processor_name_or_path or self.model_name_or_path

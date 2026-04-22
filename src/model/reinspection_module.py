@@ -1,4 +1,10 @@
-"""Unified Re-Inspection Module (two-stage bottleneck cross-attention)."""
+"""Re-inspection module: two-stage bottleneck cross-attention over text then vision.
+
+Learned queries first attend to language tokens in a low-dimensional bottleneck,
+then to vision tokens, with residual FFN blocks.  This design biases the module
+toward question-conditioned visual aggregation before features are injected back
+into the language-model hidden states.
+"""
 
 import math
 from typing import Optional
@@ -11,7 +17,11 @@ from src.config import ReInspectionConfig
 
 
 class BottleneckCrossAttention(nn.Module):
-    """Multi-head cross-attention operating in bottleneck dimension d_r."""
+    """Multi-head cross-attention in the bottleneck width ``d_r``.
+
+    When ``need_weights`` is False, uses memory-efficient scaled dot-product
+    attention; otherwise materializes softmax weights for supervision or metrics.
+    """
 
     def __init__(
         self,
@@ -20,6 +30,14 @@ class BottleneckCrossAttention(nn.Module):
         dropout: float = 0.0,
         dtype: Optional[torch.dtype] = None,
     ):
+        """Build projection layers and attention dropout.
+
+        Args:
+            d_r: Bottleneck hidden size; must divide ``n_heads``.
+            n_heads: Number of attention heads.
+            dropout: Dropout probability on attention probabilities (training only).
+            dtype: Optional module dtype (for example ``torch.bfloat16``).
+        """
         super().__init__()
         assert d_r % n_heads == 0
         self.n_heads = n_heads
@@ -39,6 +57,18 @@ class BottleneckCrossAttention(nn.Module):
         kv_mask: Optional[torch.BoolTensor] = None,
         need_weights: bool = False,
     ):
+        """Apply cross-attention from queries ``q`` to key/value ``kv``.
+
+        Args:
+            q: Query tensor of shape ``(B, S_q, d_r)``.
+            kv: Key/value tensor of shape ``(B, S_kv, d_r)``.
+            kv_mask: Boolean mask with shape ``(B, S_kv)``; ``True`` keeps a position.
+            need_weights: If True, return attention weights; if False, use fused SDPA.
+
+        Returns:
+            Tuple ``(out, attn_weights)`` where ``out`` has shape ``(B, S_q, d_r)``
+            and ``attn_weights`` is ``None`` or ``(B, H, S_q, S_kv)``.
+        """
         B, S_q, _ = q.shape
         S_kv = kv.shape[1]
         H, Dh = self.n_heads, self.d_head
@@ -71,6 +101,7 @@ class BottleneckCrossAttention(nn.Module):
 
 
 def _make_ffn(d: int, mult: int, dropout: float, dtype: Optional[torch.dtype] = None):
+    """Two-layer GELU feed-forward with dropout, width ``d * mult`` hidden."""
     return nn.Sequential(
         nn.Linear(d, d * mult, dtype=dtype),
         nn.GELU(),
@@ -81,9 +112,15 @@ def _make_ffn(d: int, mult: int, dropout: float, dtype: Optional[torch.dtype] = 
 
 
 class ReInspectionModule(nn.Module):
-    """Two-stage cross-attention with bottleneck projections."""
+    """Two-stage cross-attention with down/up projections to the LM width ``d_model``."""
 
     def __init__(self, config: ReInspectionConfig, dtype: Optional[torch.dtype] = None):
+        """Allocate queries, projections, attention blocks, and FFNs from ``config``.
+
+        Args:
+            config: Global hyperparameters (widths, heads, FFN multiplier, query count).
+            dtype: Optional parameter dtype for mixed-precision training.
+        """
         super().__init__()
         d = config.d_model
         d_r = config.d_bottleneck
@@ -113,6 +150,7 @@ class ReInspectionModule(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
+        """Xavier-initialize linear layers; zero the up-projection for stable residuals."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -133,6 +171,23 @@ class ReInspectionModule(nn.Module):
         text_mask: Optional[torch.BoolTensor] = None,
         need_weights: bool = False,
     ):
+        """Run text-then-vision cross-attention and project back to ``d_model``.
+
+        Args:
+            V: Vision hidden states ``(B, S_v, d_model)``.
+            T: Text hidden states ``(B, S_t, d_model)``.
+            V_mask: Optional vision padding mask ``(B, S_v)`` (alias: ``vision_mask``).
+            T_mask: Optional text padding mask ``(B, S_t)`` (alias: ``text_mask``).
+            vision_mask: Deprecated alias for ``V_mask``; used if ``V_mask`` is None.
+            text_mask: Deprecated alias for ``T_mask``; used if ``T_mask`` is None.
+            need_weights: Whether to materialize attention distributions.
+
+        Returns:
+            Tuple ``(R, A_task, A_vis, R_r)`` where ``R`` is the residual in
+            ``d_model`` to add into the LM stream, ``A_*`` are mean-pooled
+            attention maps per head (or ``None``), and ``R_r`` is the bottleneck
+            representation ``(B, n_queries, d_bottleneck)`` before up-projection.
+        """
         if V_mask is None:
             V_mask = vision_mask
         if T_mask is None:
@@ -172,4 +227,5 @@ class ReInspectionModule(nn.Module):
         return R, A_task_out, A_vis_out, R_r
 
     def count_parameters(self):
+        """Return the number of trainable scalar parameters in this module."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

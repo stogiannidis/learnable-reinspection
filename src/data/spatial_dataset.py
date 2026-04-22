@@ -1,4 +1,10 @@
-"""Spatial VQA datasets for Stage 2 (unified, backend-specific)."""
+"""Spatial VQA datasets for stage-2 instruction tuning (multi-benchmark union).
+
+``SpatialVQADataset`` loads JSON/JSONL files, applies backend-specific chat
+templates and processors, and constructs causal LM labels by masking prompt
+tokens.  ``build_spatial_dataset`` concatenates available corpora under a data
+root into a single :class:`torch.utils.data.ConcatDataset`.
+"""
 
 import json
 import logging
@@ -22,6 +28,8 @@ _MAX_RETRIES = 10
 
 
 class _EmptyDataset(Dataset):
+    """Placeholder dataset when no benchmark files exist on disk."""
+
     def __len__(self):
         return 0
 
@@ -30,6 +38,7 @@ class _EmptyDataset(Dataset):
 
 
 def _squeeze_intern(batch: Dict) -> Dict:
+    """Remove batch dimension ``1`` from InternVL/Gemma processor outputs except images."""
     result = {}
     for key, value in batch.items():
         if not isinstance(value, torch.Tensor):
@@ -42,7 +51,7 @@ def _squeeze_intern(batch: Dict) -> Dict:
 
 
 class SpatialVQADataset(Dataset):
-    """JSON/JSONL spatial VQA for all supported backends."""
+    """Single-file spatial VQA with per-backend tokenization and label masking."""
 
     def __init__(
         self,
@@ -57,6 +66,23 @@ class SpatialVQADataset(Dataset):
         system_prompt: str = "You are a helpful assistant.",
         answer_ignore_index: int = -100,
     ):
+        """Load samples filtered by ``split`` and store preprocessing options.
+
+        Args:
+            data_file: Path to ``.json`` (list) or ``.jsonl`` (line-delimited) data.
+            image_root: Base directory for relative image paths in items.
+            processor: HF processor providing ``apply_chat_template`` and tensorization.
+            backend: ``internvl3``, ``qwen25vl``, or ``gemma4``.
+            split: Value of the optional ``split`` field to keep when present.
+            max_pixels: Upper bound on resized pixels (Qwen/InternVL).
+            min_pixels: Lower bound on resized pixels (Qwen/InternVL).
+            crop_to_patches: Whether to enable dynamic cropping (InternVL stage 2).
+            system_prompt: System message for templated backends.
+            answer_ignore_index: Label mask value for non-target tokens.
+
+        Raises:
+            ValueError: If ``backend`` is not supported.
+        """
         if backend not in _VALID_BACKENDS:
             raise ValueError(f"backend must be one of {_VALID_BACKENDS}, got {backend}")
         self.processor = processor
@@ -80,12 +106,19 @@ class SpatialVQADataset(Dataset):
             self.samples = [s for s in data if s.get("split", split) == split]
 
     def __len__(self):
+        """Number of samples after split filtering."""
         return len(self.samples)
 
     def _intern_proc_kwargs(self) -> Dict:
+        """Keyword arguments shared by InternVL-style processor calls."""
         return {"return_tensors": "pt"}
 
     def __getitem__(self, idx) -> Dict:
+        """Return a model input dict with ``labels`` for the sample at ``idx``.
+
+        InternVL/Gemma paths retry on corrupt images by resampling indices; Qwen
+        advances sequentially on read errors before failing hard.
+        """
         if self.backend in ("internvl3", "gemma4"):
             getter = self._getitem_gemma4 if self.backend == "gemma4" else self._getitem_intern
             for _ in range(_MAX_RETRIES):
@@ -106,6 +139,7 @@ class SpatialVQADataset(Dataset):
         raise RuntimeError("Too many unreadable images in a row.") from last_error
 
     def _getitem_qwen(self, idx: int) -> Dict:
+        """Build Qwen2.5-VL tensors with masked labels after the prompt span."""
         sample = self.samples[idx]
         question = sample["question"]
         answer = sample["answer"]
@@ -138,6 +172,7 @@ class SpatialVQADataset(Dataset):
         }
 
     def _getitem_intern(self, idx: int) -> Dict:
+        """Tokenize an InternVL sample from an on-disk RGB image."""
         sample = self.samples[idx]
         image_path = os.path.join(self.image_root, sample["image"])
         image = Image.open(image_path).convert("RGB")
@@ -171,6 +206,7 @@ class SpatialVQADataset(Dataset):
         return result
 
     def _getitem_gemma4(self, idx: int) -> Dict:
+        """Tokenize a Gemma 4 multimodal sample (same masking contract as InternVL)."""
         sample = self.samples[idx]
         image_path = os.path.join(self.image_root, sample["image"])
         image = Image.open(image_path).convert("RGB")
@@ -216,6 +252,24 @@ def build_spatial_dataset(
     system_prompt: str = "You are a helpful assistant.",
     answer_ignore_index: int = -100,
 ) -> Dataset:
+    """Concatenate all existing configured spatial datasets under ``data_root``.
+
+    Args:
+        data_root: Root folder containing per-benchmark subdirectories.
+        processor: HF processor passed through to each child dataset.
+        backend: VLM backend id forwarded to :class:`SpatialVQADataset`.
+        split: Train/test filter for samples that expose a ``split`` field.
+        datasets: Optional subset of benchmark names; defaults to a standard list.
+        max_pixels: Passed to each child (Qwen/InternVL resizing budget).
+        min_pixels: Minimum pixel budget for dynamic resizing.
+        crop_to_patches: InternVL dynamic patch cropping toggle for stage 2.
+        system_prompt: System string for templated backends.
+        answer_ignore_index: Mask value for prompt tokens in ``labels``.
+
+    Returns:
+        A :class:`torch.utils.data.ConcatDataset` over available splits, or an
+        :class:`_EmptyDataset` when nothing on disk matches the configuration.
+    """
     if datasets is None:
         datasets = ["vsr", "whatsup", "gqa_spatial", "spatialbench"]
 

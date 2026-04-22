@@ -1,4 +1,8 @@
-"""RefCOCO/RefCOCO+/RefCOCOg for Stage 1 (backend-specific processing)."""
+"""RefCOCO family loaders for stage-1 referring-expression grounding.
+
+Produces model inputs with masked labels, normalized bounding boxes, and
+backend-specific attention targets over vision tokens (patch grids).
+"""
 
 import json
 import math
@@ -18,6 +22,7 @@ _VALID_BACKENDS = ("qwen25vl", "internvl3", "gemma4")
 
 
 def _squeeze_intern(batch: Dict) -> Dict:
+    """Drop singleton batch dimensions from InternVL processor tensors except pixels."""
     result = {}
     for key, value in batch.items():
         if not isinstance(value, torch.Tensor):
@@ -34,7 +39,20 @@ def intern_bbox_to_patch_mask(
     num_image_patches: int,
     image_seq_length: int = 256,
 ) -> torch.Tensor:
-    """Map a normalized bbox to InternVL image-token supervision."""
+    """Map a normalized box to a probability mask over InternVL patch tokens.
+
+    Args:
+        bbox: ``[x1, y1, x2, y2]`` in normalized image coordinates.
+        num_image_patches: Number of visual crops (mask is tiled when ``> 1``).
+        image_seq_length: Square grid length ``side**2`` for patch indexing.
+
+    Returns:
+        Float tensor of length ``num_image_patches * image_seq_length`` summing
+        to 1 over positive entries (uniform mass inside the box).
+
+    Raises:
+        ValueError: If ``image_seq_length`` is not a perfect square.
+    """
     side = int(math.isqrt(image_seq_length))
     if side * side != image_seq_length:
         raise ValueError(f"image_seq_length={image_seq_length} is not a square grid")
@@ -62,7 +80,7 @@ def intern_bbox_to_patch_mask(
 
 
 class RefCOCODataset(Dataset):
-    """RefCOCO family loader for all supported backends."""
+    """Merged RefCOCO/+ /g splits with referring strings and bounding boxes."""
 
     def __init__(
         self,
@@ -77,6 +95,23 @@ class RefCOCODataset(Dataset):
         system_prompt: str = "You are a helpful assistant.",
         answer_ignore_index: int = -100,
     ):
+        """Scan annotation JSON files and build the in-memory sample list.
+
+        Args:
+            data_root: Directory containing ``refcoco`` (etc.) subfolders.
+            processor: HF processor (provides ``image_seq_length`` when present).
+            backend: ``internvl3``, ``qwen25vl``, or ``gemma4``.
+            split: Which JSON split filename to read (``train`` / ``val`` / ``test``).
+            dataset_names: Subset of dataset folder names; defaults to all three.
+            max_pixels: InternVL dynamic resize upper bound.
+            min_pixels: InternVL dynamic resize lower bound.
+            crop_to_patches: Whether to request patch cropping from the image processor.
+            system_prompt: System message for chat-templated backends.
+            answer_ignore_index: Label mask for prompt tokens.
+
+        Raises:
+            ValueError: If ``backend`` is not supported.
+        """
         if backend not in _VALID_BACKENDS:
             raise ValueError(f"backend must be one of {_VALID_BACKENDS}, got {backend}")
         self.processor = processor
