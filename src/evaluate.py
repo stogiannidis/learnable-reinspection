@@ -1,4 +1,4 @@
-"""Unified spatial-benchmark evaluation for Qwen3-VL, Qwen2.5-VL, InternVL3 and Gemma4 backends.
+"""Unified spatial-benchmark evaluation for InternVL3, Qwen2.5-VL and Gemma4 backends.
 
 Entry point is Hydra-only: ``python -m src.evaluate stage=eval [overrides]``.
 """
@@ -24,7 +24,6 @@ from tqdm import tqdm
 from transformers import (
     AutoProcessor,
     InternVLForConditionalGeneration,
-    Qwen3VLForConditionalGeneration,
     Qwen2_5_VLForConditionalGeneration,
     Gemma4ForConditionalGeneration,
 )
@@ -387,7 +386,7 @@ def load_condition_model(
 ):
     """Load a model for a motivation / eval condition.
 
-    `attn_implementation`: pass "eager" for Qwen3-VL or InternVL3 to enable
+    `attn_implementation`: pass "eager" for InternVL3 to enable
     ``output_attentions=True`` at generation time. Other backends ignore it and
     use their defaults.
     """
@@ -417,25 +416,6 @@ def load_condition_model(
         base_model.model.language_model = PeftModel.from_pretrained(
             base_model.model.language_model, lora_path
         )
-
-    if backend == "qwen3vl":
-        from src.backends.qwen3vl import load_model as load_qwen_ri
-
-        qwen_attn = attn_implementation or "sdpa"
-        if condition == "reinspection":
-            model = load_qwen_ri(config, device_map="auto", attn_implementation=qwen_attn)
-            _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir)
-            return model, True
-        resolved = resolve_pretrained_local_path(config.model_name_or_path)
-        model = Qwen3VLForConditionalGeneration.from_pretrained(
-            resolved,
-            torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
-            device_map="auto",
-            attn_implementation=qwen_attn,
-        )
-        if condition == "lora_only":
-            _load_lora_only(model, checkpoint_dir, lora_checkpoint_dir)
-        return model, False
 
     if backend == "qwen25vl":
         from src.backends.qwen25vl import load_model as load_qwen25_ri
@@ -535,7 +515,7 @@ def evaluate_benchmark(
     from src.backends.internvl3 import InternVL3WithReInspection
     from src.backends.gemma4 import Gemma4WithReInspection
 
-    _QWEN_BACKENDS = ("qwen3vl", "qwen25vl")
+    _QWEN_BACKENDS = ("qwen25vl",)
     _PROMPT_LEN_BACKENDS = ("internvl3", "gemma4")
 
     for i in tqdm(

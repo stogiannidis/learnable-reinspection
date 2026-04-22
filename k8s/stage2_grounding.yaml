@@ -23,7 +23,7 @@ spec:
           - -c
           - |
             mkdir -p logs models
-            bash src/scripts/run_stage2.sh stage1_checkpoint=models/internvl3/grounding/epoch_5/reinspection_module.pt experiment_name=grounding wandb_run_name=internvl-stage2-grounding 2>&1 | tee logs/stage2_grounding.log
+            bash src/scripts/run_stage2.sh stage1_checkpoint=models/internvl3/grounding/epoch_4/reinspection_module.pt experiment_name=grounding wandb_run_name=internvl-stage2-grounding 2>&1 | tee logs/stage2_grounding.log
         terminationMessagePath: "/tmp/my-log"
         terminationMessagePolicy: File
         imagePullPolicy: "Always"

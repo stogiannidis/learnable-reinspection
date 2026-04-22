@@ -1,4 +1,4 @@
-"""Unified configuration for Re-Inspection VLM training (Qwen3-VL and InternVL3)."""
+"""Unified configuration for Re-Inspection VLM training (InternVL3, Qwen2.5-VL, Gemma4)."""
 
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -9,7 +9,7 @@ class ReInspectionConfig:
     # ------------------------------------------------------------------ #
     # Runtime (set via Hydra overrides or config file)                    #
     # ------------------------------------------------------------------ #
-    backend: str = "internvl3"          # qwen3vl | internvl3
+    backend: str = "internvl3"          # internvl3 | qwen25vl | gemma4
     stage: int = 1                      # 1 | 2
     data_root: str = "/data/datasets"
     output_dir: str = "models"
@@ -48,7 +48,7 @@ class ReInspectionConfig:
     # ------------------------------------------------------------------ #
     # Model                                                                #
     # ------------------------------------------------------------------ #
-    model_name_or_path: str = "Qwen/Qwen3-VL-8B-Instruct"
+    model_name_or_path: str = "OpenGVLab/InternVL3-8B-hf"
     processor_name_or_path: Optional[str] = None
     image_seq_length: int = 256
     answer_ignore_index: int = -100
@@ -102,6 +102,8 @@ class ReInspectionConfig:
     crop_to_patches_stage1: bool = False
     crop_to_patches_stage2: bool = True
     system_prompt: str = "You are a helpful assistant."
+    val_split_ratio: float = 0.05
+    val_batch_size: Optional[int] = None
 
     # ------------------------------------------------------------------ #
     # Misc                                                                 #

@@ -3,9 +3,8 @@
 Wraps Qwen2_5_VLForConditionalGeneration, inserting task-conditioned
 re-inspection tokens (R) between the user message and assistant response.
 
-Architecturally near-identical to the Qwen3-VL backend: same d_model=3584,
-same MRoPE [16,24,24], same <|im_start|>/<|im_end|> chat template.
-The main difference is the HF model class name.
+Uses d_model=3584, MRoPE [16,24,24], and the <|im_start|>/<|im_end|> chat
+template. Same wrapping pattern as the InternVL3/Gemma4 backends.
 """
 import torch
 import torch.nn as nn
@@ -22,8 +21,8 @@ from src.model.reinspection_module import ReInspectionModule
 class Qwen25VLWithReInspection(nn.Module):
     """Qwen2.5-VL + Re-Inspection Module.
 
-    Wrapper pattern identical to Qwen3VLWithReInspection: embed, encode vision,
-    scatter, inject R tokens before <|im_start|>assistant, forward through LLM.
+    Wrapper: embed, encode vision, scatter, inject R tokens before
+    <|im_start|>assistant, forward through LLM.
     """
 
     def __init__(self, config: ReInspectionConfig, base_model: Qwen2_5_VLForConditionalGeneration):
@@ -72,7 +71,7 @@ class Qwen25VLWithReInspection(nn.Module):
     ) -> Tuple[torch.LongTensor, torch.LongTensor]:
         """Compute 3D MRoPE position IDs for Qwen2.5-VL.
 
-        Same MRoPE scheme as Qwen3-VL: [16, 24, 24] section split.
+        MRoPE scheme: [16, 24, 24] section split.
         """
         model = self.base_model.model
         cfg = model.config
@@ -449,9 +448,9 @@ class Qwen25VLWithReInspection(nn.Module):
     def generate(self, **kwargs):
         """Generation with R token injection via forward hook.
 
-        Same strategy as Qwen3VL: insert N_q placeholder tokens, let the base
-        model handle vision encoding and MRoPE, then replace placeholders with
-        actual R tokens via a pre-hook on language_model.
+        Strategy: insert N_q placeholder tokens, let the base model handle
+        vision encoding and MRoPE, then replace placeholders with actual R
+        tokens via a pre-hook on language_model.
         """
         input_ids = kwargs.pop("input_ids", None)
         pixel_values = kwargs.pop("pixel_values", None)

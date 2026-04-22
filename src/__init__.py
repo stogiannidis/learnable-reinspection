@@ -1,4 +1,4 @@
-"""Unified Re-Inspection training stack for Qwen3-VL and InternVL3."""
+"""Unified Re-Inspection training stack for InternVL3, Qwen2.5-VL, and Gemma4."""
 
 from src.config import ReInspectionConfig
 
