@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from peft import LoraConfig, TaskType, get_peft_model
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, DistributedSampler, Subset
+from tqdm import tqdm
 from transformers import AutoProcessor
 
 from src.backends.hf_hub_utils import resolve_pretrained_local_path
@@ -1042,8 +1043,7 @@ def run_training(config: ReInspectionConfig) -> None:
     pfx = f"{backend}_stage{stage}"
 
     log(
-        "Starting training loop. Console loss logs every 100 micro-steps; "
-        "the first forward/backward on a large VLM can take several minutes."
+        "Starting training. The first forward/backward on a large VLM can take several minutes."
     )
 
     for epoch in range(n_epochs):
@@ -1056,7 +1056,15 @@ def run_training(config: ReInspectionConfig) -> None:
         epoch_grounding = 0.0
         epoch_stage1_supervision = 0.0
 
-        for step, batch in enumerate(train_loader):
+        pbar = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch + 1}/{n_epochs}",
+            disable=not is_main_process(),
+            dynamic_ncols=True,
+            leave=True,
+        )
+
+        for step, batch in enumerate(pbar):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
             outputs = model(**_train_forward_kwargs(batch, backend, is_stage1))
@@ -1083,12 +1091,13 @@ def run_training(config: ReInspectionConfig) -> None:
             if dist.is_initialized():
                 dist.all_reduce(_finite, op=dist.ReduceOp.MIN)
             if _finite.item() < 0.5:
-                log(
-                    f"[WARNING] Non-finite loss={loss.item():.4f} "
-                    f"(ce={ce_loss.item():.4f}, attn={attn_loss.item():.4f}, "
-                    f"grounding={grounding_loss.item():.4f}) "
-                    f"at global_step={global_step}, skipping batch"
-                )
+                if is_main_process():
+                    tqdm.write(
+                        f"[WARNING] Non-finite loss={loss.item():.4f} "
+                        f"(ce={ce_loss.item():.4f}, attn={attn_loss.item():.4f}, "
+                        f"grounding={grounding_loss.item():.4f}) "
+                        f"at global_step={global_step}, skipping batch"
+                    )
                 global_step += 1
                 continue
 
@@ -1136,20 +1145,16 @@ def run_training(config: ReInspectionConfig) -> None:
             if global_step % config.wandb_log_interval == 0:
                 _log_wandb(metrics, global_step)
 
-            if global_step == 1:
-                log(
-                    f"First training step complete (loss={loss.item():.4f}). "
-                    f"Next console log at step 100."
-                )
+            postfix: dict = {"loss": f"{loss.item():.4f}", "ce": f"{ce_loss.item():.4f}", "lr": f"{lr:.2e}"}
+            if use_attn:
+                postfix["attn"] = f"{attn_loss.item():.4f}"
+            if use_grounding:
+                postfix["gnd"] = f"{grounding_loss.item():.4f}"
+            if grad_norm is not None:
+                postfix["gnorm"] = f"{grad_norm:.2f}"
+            pbar.set_postfix(postfix)
 
-            if global_step % 100 == 0:
-                msg = f"Epoch {epoch + 1} Step {global_step}: loss={loss.item():.4f} ce={ce_loss.item():.4f}"
-                if use_attn:
-                    msg += f" attn={attn_loss.item():.4f}"
-                if use_grounding:
-                    msg += f" ground={grounding_loss.item():.4f}"
-                msg += f" lr={lr:.2e}"
-                log("  " + msg)
+        pbar.close()
 
         num_steps = max(1, len(train_loader))
         avg_epoch_loss = epoch_loss / num_steps
@@ -1171,10 +1176,11 @@ def run_training(config: ReInspectionConfig) -> None:
             aux_msg += f" attn={epoch_attn / num_steps:.4f}"
         if use_grounding:
             aux_msg += f" ground={epoch_grounding / num_steps:.4f}"
-        log(
-            f"Epoch {epoch + 1}/{n_epochs}: loss={avg_epoch_loss:.4f} ce={epoch_ce / num_steps:.4f}"
-            + aux_msg
-        )
+        if is_main_process():
+            tqdm.write(
+                f"Epoch {epoch + 1}/{n_epochs}: loss={avg_epoch_loss:.4f} ce={epoch_ce / num_steps:.4f}"
+                + aux_msg
+            )
 
         val_loss = None
         if val_loader is not None:
@@ -1201,10 +1207,11 @@ def run_training(config: ReInspectionConfig) -> None:
                     sup += config.stage1_grounding_loss_weight * val_metrics["grounding_loss"]
                 val_summary[f"{pfx}/val/stage1_supervision_loss"] = sup
             _log_wandb(val_summary, global_step)
-            log(
-                f"Epoch {epoch + 1}/{n_epochs} val: loss={val_metrics['loss']:.4f} "
-                f"ce={val_metrics['ce_loss']:.4f}"
-            )
+            if is_main_process():
+                tqdm.write(
+                    f"Epoch {epoch + 1}/{n_epochs} val: loss={val_metrics['loss']:.4f} "
+                    f"ce={val_metrics['ce_loss']:.4f}"
+                )
 
         parts = [config.output_dir, backend]
         if config.experiment_name:
