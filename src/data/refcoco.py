@@ -16,6 +16,7 @@ from torch.utils.data import Dataset
 from .utils import bbox_to_patch_mask as qwen_bbox_to_patch_mask, build_chat_messages as qwen_build_chat
 from .chat_template import build_chat_messages as intern_build_chat
 from .gemma4_chat import build_chat_messages as gemma4_build_chat
+from .registry import stage1_defaults
 
 _QWEN_BACKENDS = ("qwen25vl",)
 _VALID_BACKENDS = ("qwen25vl", "internvl3", "gemma4")
@@ -125,7 +126,7 @@ class RefCOCODataset(Dataset):
         self.image_seq_length = getattr(processor, "image_seq_length", 256)
 
         if dataset_names is None:
-            dataset_names = ["refcoco", "refcoco+", "refcocog"]
+            dataset_names = stage1_defaults()
 
         self.samples = []
         for name in dataset_names:

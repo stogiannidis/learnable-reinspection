@@ -19,6 +19,7 @@ from torch.utils.data import ConcatDataset, Dataset
 from .utils import build_chat_messages as qwen_build_chat
 from .chat_template import build_chat_messages as intern_build_chat
 from .gemma4_chat import build_chat_messages as gemma4_build_chat
+from .registry import dataset_path_configs, stage2_defaults
 
 _QWEN_BACKENDS = ("qwen25vl",)
 _VALID_BACKENDS = ("qwen25vl", "internvl3", "gemma4")
@@ -271,42 +272,17 @@ def build_spatial_dataset(
         :class:`_EmptyDataset` when nothing on disk matches the configuration.
     """
     if datasets is None:
-        datasets = ["vsr", "whatsup", "gqa_spatial", "spatialbench"]
+        datasets = stage2_defaults()
 
-    dataset_configs = {
-        "vsr": {
-            "data_file": os.path.join(data_root, "vsr", f"{split}.jsonl"),
-            "image_root": os.path.join(data_root, "vsr", "images"),
-        },
-        "whatsup": {
-            "data_file": os.path.join(data_root, "whatsup", f"{split}.json"),
-            "image_root": os.path.join(data_root, "whatsup", "images"),
-        },
-        "gqa_spatial": {
-            "data_file": os.path.join(data_root, "gqa_spatial", f"{split}.json"),
-            "image_root": os.path.join(data_root, "gqa_spatial", "images"),
-        },
-        "spatialbench": {
-            "data_file": os.path.join(data_root, "spatialbench", f"{split}.json"),
-            "image_root": os.path.join(data_root, "spatialbench", "images"),
-        },
-        "rel3d": {
-            "data_file": os.path.join(data_root, "rel3d", f"{split}.json"),
-            "image_root": os.path.join(data_root, "rel3d", "images"),
-        },
-        "cambrian_spatial": {
-            "data_file": os.path.join(data_root, "cambrian_spatial", f"{split}.json"),
-            "image_root": os.path.join(data_root, "cambrian_spatial", "images"),
-        },
-        "clevr_spatial": {
-            "data_file": os.path.join(data_root, "clevr_spatial", f"{split}.json"),
-            "image_root": os.path.join(data_root, "clevr_spatial", "images"),
-        },
-    }
+    path_configs = dataset_path_configs(data_root, split)
+
+    # VSR uses .jsonl; override extension for that dataset only
+    if "vsr" in path_configs:
+        path_configs["vsr"]["data_file"] = os.path.join(data_root, "vsr", f"{split}.jsonl")
 
     all_datasets = []
     for name in datasets:
-        cfg = dataset_configs.get(name)
+        cfg = path_configs.get(name)
         if cfg is None or not os.path.exists(cfg["data_file"]):
             continue
         all_datasets.append(

@@ -5,15 +5,24 @@ Stage 2 (spatial VQA): {image, question, answer, split} JSON/JSONL
 
 Datasets:
   - grit:           GRIT grounding (Stage 1, streamed from zzliang/GRIT)
+  - vg_grounding:   Visual Genome region descriptions → Stage 1 grounding (Stage 1)
+                    Requires /data/datasets/vg/region_descriptions.json, image_data.json,
+                    and images in /data/datasets/vg/VG_100K/ + VG_100K_2/.
   - rel3d:          Rel3D 3D spatial relations (Stage 2)
   - cambrian:       Cambrian-style spatial VQA mix (Stage 2)
   - clevr_spatial:  Synthetic CLEVR-like spatial reasoning (Stage 2)
+  - vg_spatial:     Visual Genome relationships → spatial VQA (Stage 2)
+                    Requires /data/datasets/vg/relationships.json and image_data.json
+                    (downloaded from https://homes.cs.washington.edu/~ranjay/visualgenome/api.html)
+                    and images in /data/datasets/vg/VG_100K/ + VG_100K_2/.
 
 Usage:
     python -m src.data.prepare_training_data --output_dir /data/datasets --datasets all
     python -m src.data.prepare_training_data --output_dir /data/datasets --datasets grit --grit_max_samples 200000
     python -m src.data.prepare_training_data --output_dir /data/datasets --datasets clevr_spatial --clevr_num_scenes 50000
-    python -m src.data.prepare_training_data --datasets cambrian --cambrian_source fallback
+    python -m src.data.prepare_training_data --datasets cambrian_spatial --cambrian_source fallback
+    python -m src.data.prepare_training_data --datasets vg_spatial --vg_input_dir /data/datasets/vg
+    python -m src.data.prepare_training_data --datasets vg_grounding --vg_input_dir /data/datasets/vg
 
 Cambrian: nyu-visionx/Cambrian-10M via HuggingFace streaming often raises KeyError('jpg')
     inside the WebDataset loader (inconsistent shards). Default --cambrian_source fallback
@@ -36,7 +45,7 @@ from urllib.request import urlopen, urlretrieve
 from PIL import Image, ImageDraw
 from tqdm import tqdm
 
-ALL_DATASETS = ["grit", "rel3d", "cambrian", "clevr_spatial"]
+ALL_DATASETS = ["grit", "rel3d", "cambrian_spatial", "clevr_spatial", "vg_spatial", "vg_grounding", "grefcoco"]
 
 
 # =========================================================================== #
@@ -71,6 +80,291 @@ def _download_image(url: str, dest: str, timeout: int = 10) -> bool:
         return True
     except Exception:
         return False
+
+
+# =========================================================================== #
+# Visual Genome region descriptions — Stage 1 grounding                       #
+# =========================================================================== #
+
+def prepare_vg_grounding(
+    output_dir: str,
+    vg_input_dir: str = "/data/datasets/vg",
+    max_samples: int = 500_000,
+    min_bbox_area: float = 0.002,
+    seed: int = 42,
+) -> None:
+    """Convert VG region descriptions to Stage-1 grounding format.
+
+    Reads region_descriptions.json and image_data.json from ``vg_input_dir``.
+    Each region has a free-text phrase and an absolute bounding box — maps
+    directly to the RefCOCODataset schema: {image, expression, bbox, image_w, image_h}.
+    Images are symlinked (not copied) from VG_100K / VG_100K_2 to save disk space.
+    Output goes to ``output_dir/vg_grounding/``.
+
+    Args:
+        output_dir: Root data directory (the pipeline's ``data_root``).
+        vg_input_dir: Directory with region_descriptions.json, image_data.json,
+            VG_100K/, and VG_100K_2/.
+        max_samples: Maximum grounding pairs to emit.
+        min_bbox_area: Minimum normalized bbox area; filters out tiny/degenerate regions.
+        seed: Random seed for shuffling.
+    """
+    print("\n=== Preparing Visual Genome grounding (Stage 1) ===")
+
+    reg_path = os.path.join(vg_input_dir, "region_descriptions.json")
+    meta_path = os.path.join(vg_input_dir, "image_data.json")
+
+    if not os.path.exists(reg_path):
+        print(f"  region_descriptions.json not found at {reg_path}. Skipping.")
+        return
+    if not os.path.exists(meta_path):
+        print(f"  image_data.json not found at {meta_path}. Skipping.")
+        return
+
+    vg_dir = _ensure_dir(os.path.join(output_dir, "vg_grounding"))
+    img_out_dir = _ensure_dir(os.path.join(vg_dir, "images"))
+
+    print("  Building image_id → metadata index ...")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        image_meta = json.load(f)
+
+    id_to_meta: Dict[int, Dict] = {}
+    for entry in image_meta:
+        id_to_meta[entry["image_id"]] = entry
+
+    vg_image_dirs = [
+        os.path.join(vg_input_dir, "VG_100K"),
+        os.path.join(vg_input_dir, "VG_100K_2"),
+    ]
+
+    def _find_image(fname: str) -> Optional[str]:
+        for d in vg_image_dirs:
+            p = os.path.join(d, fname)
+            if os.path.exists(p):
+                return p
+        return None
+
+    print("  Scanning region descriptions ...")
+    with open(reg_path, "r", encoding="utf-8") as f:
+        reg_data = json.load(f)
+
+    rng = random.Random(seed)
+    samples = []
+
+    for img_entry in tqdm(reg_data, desc="VG grounding"):
+        if len(samples) >= max_samples:
+            break
+
+        iid = img_entry["id"]
+        meta = id_to_meta.get(iid)
+        if meta is None:
+            continue
+
+        img_w = meta["width"]
+        img_h = meta["height"]
+        if img_w <= 0 or img_h <= 0:
+            continue
+
+        url = meta.get("url", "")
+        fname = os.path.basename(url) if url else f"{iid}.jpg"
+        src_path = _find_image(fname)
+        if src_path is None:
+            continue
+
+        out_fname = f"vg_{iid}.jpg"
+        out_path = os.path.join(img_out_dir, out_fname)
+
+        # Symlink instead of copy — images are already on disk
+        if not os.path.exists(out_path):
+            try:
+                os.symlink(os.path.abspath(src_path), out_path)
+            except Exception:
+                continue
+
+        for region in img_entry.get("regions", []):
+            phrase = (region.get("phrase") or "").strip()
+            if not phrase:
+                continue
+
+            x = region.get("x", 0)
+            y = region.get("y", 0)
+            w = region.get("width", 0)
+            h = region.get("height", 0)
+
+            if w <= 0 or h <= 0:
+                continue
+
+            # Filter tiny regions by normalized area
+            norm_area = (w / img_w) * (h / img_h)
+            if norm_area < min_bbox_area:
+                continue
+
+            # Clamp to image bounds
+            x = max(0, min(x, img_w - 1))
+            y = max(0, min(y, img_h - 1))
+            w = max(1, min(w, img_w - x))
+            h = max(1, min(h, img_h - y))
+
+            samples.append({
+                "image": out_fname,
+                "expression": phrase,
+                "bbox": [float(x), float(y), float(w), float(h)],
+                "image_w": img_w,
+                "image_h": img_h,
+            })
+
+            if len(samples) >= max_samples:
+                break
+
+    rng.shuffle(samples)
+    split_idx = int(len(samples) * 0.95)
+    _save_json(samples[:split_idx], os.path.join(vg_dir, "train.json"))
+    _save_json(samples[split_idx:], os.path.join(vg_dir, "val.json"))
+    print(f"  Produced {len(samples)} grounding pairs from VG region descriptions")
+
+
+# =========================================================================== #
+# gRefCOCO — Stage 1 grounding                                                #
+# =========================================================================== #
+
+def prepare_grefcoco(
+    output_dir: str,
+    coco_image_dir: str = "/data/datasets/coco/train2017",
+    seed: int = 42,
+) -> None:
+    """Convert gRefCOCO to Stage-1 grounding format.
+
+    Reads from the HuggingFace cache populated by FudanCVL/gRefCOCO (the parquet
+    loader fails due to mixed segmentation types, so we read the raw JSONs directly).
+    Images are symlinked from the COCO train2017 directory (image_id zero-padded to
+    12 digits, e.g. 000000000072.jpg). Skips ``no_target`` entries (no bbox).
+
+    Output: ``output_dir/grefcoco/{train,val}.json`` in RefCOCODataset schema.
+
+    Args:
+        output_dir: Root data directory.
+        coco_image_dir: Path to COCO train2017 images.
+        seed: Random seed for shuffling.
+    """
+    print("\n=== Preparing gRefCOCO (Stage 1 grounding) ===")
+
+    import glob
+    snapshots = glob.glob(
+        os.path.expanduser(
+            "~/.cache/huggingface/hub/datasets--FudanCVL--gRefCOCO/snapshots/*/grefs(unc).json"
+        )
+    )
+    if not snapshots:
+        print("  FudanCVL/gRefCOCO not in HF cache. Downloading ...")
+        try:
+            from datasets import load_dataset
+            load_dataset("FudanCVL/gRefCOCO")
+        except Exception:
+            pass
+        snapshots = glob.glob(
+            os.path.expanduser(
+                "~/.cache/huggingface/hub/datasets--FudanCVL--gRefCOCO/snapshots/*/grefs(unc).json"
+            )
+        )
+
+    if not snapshots:
+        print("  Could not locate gRefCOCO cache. Skipping.")
+        return
+
+    cache_dir = os.path.dirname(snapshots[0])
+    grefs_path = snapshots[0]
+    instances_path = os.path.join(cache_dir, "instances.json")
+
+    print(f"  Reading from {cache_dir}")
+    with open(grefs_path, "r", encoding="utf-8") as f:
+        grefs = json.load(f)
+    with open(instances_path, "r", encoding="utf-8") as f:
+        instances = json.load(f)
+
+    # Build ann_id → bbox + image dimensions lookup
+    ann_id_to_info: Dict[int, Dict] = {}
+    image_id_to_dims: Dict[int, Tuple[int, int]] = {}
+
+    for img in instances["images"]:
+        image_id_to_dims[img["id"]] = (img["width"], img["height"])
+    for ann in instances["annotations"]:
+        ann_id_to_info[ann["id"]] = {
+            "bbox": ann["bbox"],  # [x, y, w, h] absolute COCO format
+            "image_id": ann["image_id"],
+        }
+
+    gref_dir = _ensure_dir(os.path.join(output_dir, "grefcoco"))
+    img_out_dir = _ensure_dir(os.path.join(gref_dir, "images"))
+
+    train_samples, val_samples = [], []
+    skipped_no_target = skipped_missing = 0
+
+    for entry in tqdm(grefs, desc="gRefCOCO"):
+        if entry.get("no_target"):
+            skipped_no_target += 1
+            continue
+
+        image_id = entry["image_id"]
+        split = entry.get("split", "train")
+
+        # Resolve bbox from first ann_id
+        ann_ids = entry.get("ann_id", [])
+        if not ann_ids:
+            skipped_missing += 1
+            continue
+        ann_info = ann_id_to_info.get(ann_ids[0])
+        if ann_info is None:
+            skipped_missing += 1
+            continue
+
+        dims = image_id_to_dims.get(image_id)
+        if dims is None:
+            skipped_missing += 1
+            continue
+        img_w, img_h = dims
+
+        # Symlink image
+        src_fname = f"{image_id:012d}.jpg"
+        src_path = os.path.join(coco_image_dir, src_fname)
+        if not os.path.exists(src_path):
+            skipped_missing += 1
+            continue
+
+        out_fname = f"grefcoco_{image_id:012d}.jpg"
+        out_path = os.path.join(img_out_dir, out_fname)
+        if not os.path.exists(out_path):
+            try:
+                os.symlink(os.path.abspath(src_path), out_path)
+            except Exception:
+                skipped_missing += 1
+                continue
+
+        bbox = ann_info["bbox"]  # [x, y, w, h]
+
+        # One sample per sentence
+        for sent_info in entry.get("sentences", []):
+            expression = sent_info.get("sent", sent_info.get("raw", "")).strip()
+            if not expression:
+                continue
+            sample = {
+                "image": out_fname,
+                "expression": expression,
+                "bbox": [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])],
+                "image_w": img_w,
+                "image_h": img_h,
+            }
+            if split in ("val", "testA", "testB"):
+                val_samples.append(sample)
+            else:
+                train_samples.append(sample)
+
+    rng = random.Random(seed)
+    rng.shuffle(train_samples)
+    rng.shuffle(val_samples)
+
+    _save_json(train_samples, os.path.join(gref_dir, "train.json"))
+    _save_json(val_samples, os.path.join(gref_dir, "val.json"))
+    print(f"  Skipped {skipped_no_target} no-target and {skipped_missing} missing entries")
 
 
 # =========================================================================== #
@@ -420,7 +714,7 @@ def _prepare_cambrian_hf_stream(
     print(f"  Kept {len(samples)} spatial samples from {images_saved} images (skipped {skipped} non-spatial)")
 
 
-def prepare_cambrian(
+def prepare_cambrian_spatial(
     output_dir: str,
     max_samples: int = 100_000,
     seed: int = 42,
@@ -532,70 +826,84 @@ def _prepare_cambrian_fallback(
     except Exception as e:
         print(f"    GQA load failed: {e}")
 
-    # --- Visual Genome relationships ---
-    print("  Loading Visual Genome relationships (spatial subset) ...")
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", FutureWarning)
-            vg_ds = load_dataset(
-                "visual_genome",
-                "relationships_v1.2.0",
-                split="train",
-                streaming=True,
-                trust_remote_code=True,
-            )
-        per_source = max_samples // 2
-        vg_count = 0
+    # --- Visual Genome relationships (from local annotations) ---
+    print("  Loading Visual Genome relationships (spatial subset, local) ...")
+    vg_input_dir = "/data/datasets/vg"
+    rel_path = os.path.join(vg_input_dir, "relationships.json")
+    meta_path = os.path.join(vg_input_dir, "image_data.json")
 
-        for row in tqdm(vg_ds, desc="VG spatial", total=per_source):
-            if vg_count >= per_source:
-                break
+    if os.path.exists(rel_path) and os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                image_meta_list = json.load(f)
+            id_to_fname: Dict[str, str] = {}
+            for entry in image_meta_list:
+                url = entry.get("url", "")
+                fname = os.path.basename(url) if url else f"{entry['image_id']}.jpg"
+                id_to_fname[entry["image_id"]] = fname
 
-            relationships = row.get("relationships", [])
-            img = row.get("image")
+            vg_image_dirs = [
+                os.path.join(vg_input_dir, "VG_100K"),
+                os.path.join(vg_input_dir, "VG_100K_2"),
+            ]
 
-            spatial_rels = []
-            for rel in relationships:
-                predicate = rel.get("predicate", "").lower().strip()
-                if any(kw in predicate for kw in _SPATIAL_KEYWORDS):
-                    spatial_rels.append(rel)
+            def _find_vg_img(fname: str) -> Optional[str]:
+                for d in vg_image_dirs:
+                    p = os.path.join(d, fname)
+                    if os.path.exists(p):
+                        return p
+                return None
 
-            if not spatial_rels:
-                continue
+            with open(rel_path, "r", encoding="utf-8") as f:
+                rel_data = json.load(f)
 
-            image_filename = f"vg_{vg_count:06d}.jpg"
-            image_path = os.path.join(img_dir, image_filename)
+            per_source = max_samples // 2
+            vg_count = 0
 
-            if not os.path.exists(image_path):
-                if isinstance(img, Image.Image):
-                    img.convert("RGB").save(image_path)
-                else:
+            for img_entry in tqdm(rel_data, desc="VG spatial"):
+                if vg_count >= per_source:
+                    break
+                iid = img_entry["image_id"]
+                fname = id_to_fname.get(iid)
+                if fname is None:
+                    continue
+                src = _find_vg_img(fname)
+                if src is None:
                     continue
 
-            # Create VQA pairs from relationships
-            for rel in spatial_rels[:2]:  # limit per image
-                subj = rel.get("subject", {}).get("name", rel.get("subject_name", ""))
-                obj_name = rel.get("object", {}).get("name", rel.get("object_name", ""))
-                predicate = rel.get("predicate", "")
+                image_filename = f"cambrian_vg_{iid}.jpg"
+                image_path = os.path.join(img_dir, image_filename)
+                if not os.path.exists(image_path):
+                    try:
+                        import shutil
+                        shutil.copy2(src, image_path)
+                    except Exception:
+                        continue
 
-                if not subj or not obj_name:
-                    continue
+                for rel in img_entry.get("relationships", [])[:2]:
+                    pred = rel.get("predicate", "").lower().strip()
+                    if not any(kw in pred for kw in _SPATIAL_KEYWORDS):
+                        continue
+                    subj_info = rel.get("subject", {})
+                    obj_info = rel.get("object", {})
+                    subj = (subj_info.get("name") or (subj_info.get("names") or [""])[0]).strip().lower()
+                    obj_name = (obj_info.get("name") or (obj_info.get("names") or [""])[0]).strip().lower()
+                    if not subj or not obj_name:
+                        continue
+                    samples.append({
+                        "image": image_filename,
+                        "question": f"What is the spatial relationship between the {subj} and the {obj_name}?",
+                        "answer": f"The {subj} is {pred} the {obj_name}.",
+                        "split": "train",
+                        "source": "visual_genome",
+                    })
+                    vg_count += 1
 
-                question = f"What is the spatial relationship between the {subj} and the {obj_name}?"
-                answer = f"The {subj} is {predicate} the {obj_name}."
-
-                samples.append({
-                    "image": image_filename,
-                    "question": question,
-                    "answer": answer,
-                    "split": "train",
-                    "source": "visual_genome",
-                })
-                vg_count += 1
-
-        print(f"    Extracted {vg_count} spatial relationships from VG")
-    except Exception as e:
-        print(f"    VG load failed: {e}")
+            print(f"    Extracted {vg_count} spatial relationships from VG (local)")
+        except Exception as e:
+            print(f"    VG local load failed: {e}")
+    else:
+        print(f"    VG annotations not found at {vg_input_dir}. Skipping VG.")
 
     rng = random.Random(seed)
     rng.shuffle(samples)
@@ -603,6 +911,185 @@ def _prepare_cambrian_fallback(
 
     _save_json(samples[:split_idx], os.path.join(camb_dir, "train.json"))
     _save_json(samples[split_idx:], os.path.join(camb_dir, "val.json"))
+
+
+# =========================================================================== #
+# Visual Genome spatial VQA — Stage 2                                          #
+# =========================================================================== #
+
+_VG_SPATIAL_PREDICATES = {
+    "left of", "to the left of", "right of", "to the right of",
+    "above", "below", "on top of", "under", "underneath", "beneath",
+    "in front of", "behind", "next to", "beside", "near", "far from",
+    "between", "inside", "outside", "on", "over",
+}
+
+_VG_QA_TEMPLATES = [
+    ("What is the spatial relationship between the {subj} and the {obj}?",
+     "The {subj} is {pred} the {obj}."),
+    ("Where is the {subj} relative to the {obj}?",
+     "The {subj} is {pred} the {obj}."),
+    ("Is the {subj} {pred} the {obj}?", "Yes"),
+]
+
+_VG_ANTONYMS = {
+    "left of": "right of", "to the left of": "to the right of",
+    "right of": "left of", "to the right of": "to the left of",
+    "above": "below", "below": "above",
+    "on top of": "under", "under": "on top of",
+    "in front of": "behind", "behind": "in front of",
+}
+
+
+def prepare_vg_spatial(
+    output_dir: str,
+    vg_input_dir: str = "/data/datasets/vg",
+    max_samples: int = 200_000,
+    seed: int = 42,
+) -> None:
+    """Convert locally downloaded Visual Genome annotations to Stage-2 spatial VQA.
+
+    Reads relationships.json and image_data.json from ``vg_input_dir`` (both
+    downloaded from https://homes.cs.washington.edu/~ranjay/visualgenome/api.html).
+    Images are expected in ``vg_input_dir/VG_100K/`` and ``vg_input_dir/VG_100K_2/``.
+
+    Each relationship whose predicate matches a spatial keyword is turned into
+    a natural-language QA pair. A contrastive negative is added for antonym
+    predicates. Outputs are saved to ``output_dir/vg_spatial/`` with symlinked
+    (or copied) images.
+
+    Args:
+        output_dir: Root data directory (the pipeline's ``data_root``).
+        vg_input_dir: Directory containing relationships.json, image_data.json,
+            VG_100K/, and VG_100K_2/.
+        max_samples: Maximum QA pairs to emit.
+        seed: Random seed for shuffling / subsampling.
+    """
+    print("\n=== Preparing Visual Genome spatial VQA ===")
+
+    rel_path = os.path.join(vg_input_dir, "relationships.json")
+    meta_path = os.path.join(vg_input_dir, "image_data.json")
+
+    if not os.path.exists(rel_path):
+        print(f"  relationships.json not found at {rel_path}. Skipping.")
+        return
+    if not os.path.exists(meta_path):
+        print(f"  image_data.json not found at {meta_path}. Skipping.")
+        return
+
+    vg_dir = _ensure_dir(os.path.join(output_dir, "vg_spatial"))
+    img_out_dir = _ensure_dir(os.path.join(vg_dir, "images"))
+
+    # Build image_id -> filename map from the two image directories
+    print("  Building image_id → filename index ...")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        image_meta = json.load(f)
+
+    id_to_filename: Dict[int, str] = {}
+    for entry in image_meta:
+        iid = entry["image_id"]
+        url = entry.get("url", "")
+        fname = os.path.basename(url) if url else f"{iid}.jpg"
+        id_to_filename[iid] = fname
+
+    # Locate each image across the two VG_100K dirs
+    vg_image_dirs = [
+        os.path.join(vg_input_dir, "VG_100K"),
+        os.path.join(vg_input_dir, "VG_100K_2"),
+    ]
+
+    def _find_image(fname: str) -> Optional[str]:
+        for d in vg_image_dirs:
+            p = os.path.join(d, fname)
+            if os.path.exists(p):
+                return p
+        return None
+
+    print("  Scanning relationships for spatial predicates ...")
+    with open(rel_path, "r", encoding="utf-8") as f:
+        rel_data = json.load(f)
+
+    rng = random.Random(seed)
+    samples = []
+
+    for img_entry in tqdm(rel_data, desc="VG images"):
+        if len(samples) >= max_samples:
+            break
+
+        image_id = img_entry["image_id"]
+        fname = id_to_filename.get(image_id)
+        if fname is None:
+            continue
+
+        src_path = _find_image(fname)
+        if src_path is None:
+            continue
+
+        out_fname = f"vg_{image_id}.jpg"
+        out_path = os.path.join(img_out_dir, out_fname)
+
+        # Only copy when not already present
+        if not os.path.exists(out_path):
+            try:
+                import shutil
+                shutil.copy2(src_path, out_path)
+            except Exception:
+                continue
+
+        for rel in img_entry.get("relationships", []):
+            pred_raw = rel.get("predicate", "").lower().strip()
+
+            # Normalise minor variants
+            pred = pred_raw
+            if pred == "left":
+                pred = "left of"
+            elif pred == "right":
+                pred = "right of"
+
+            if not any(sp in pred for sp in _VG_SPATIAL_PREDICATES):
+                continue
+
+            subj_info = rel.get("subject", {})
+            obj_info = rel.get("object", {})
+
+            subj = (subj_info.get("name") or
+                    (subj_info.get("names") or [""])[0]).strip().lower()
+            obj = (obj_info.get("name") or
+                   (obj_info.get("names") or [""])[0]).strip().lower()
+
+            if not subj or not obj or subj == obj:
+                continue
+
+            # Pick a random QA template for variety
+            tmpl_q, tmpl_a = rng.choice(_VG_QA_TEMPLATES[:2])
+            question = tmpl_q.format(subj=subj, obj=obj, pred=pred)
+            answer = tmpl_a.format(subj=subj, obj=obj, pred=pred)
+
+            samples.append({
+                "image": out_fname,
+                "question": question,
+                "answer": answer,
+                "split": "train",
+                "source": "visual_genome",
+            })
+
+            # Contrastive negative for antonym predicates
+            if pred in _VG_ANTONYMS and len(samples) < max_samples * 2:
+                neg_pred = _VG_ANTONYMS[pred]
+                neg_q = f"Is the {subj} {neg_pred} the {obj}?"
+                samples.append({
+                    "image": out_fname,
+                    "question": neg_q,
+                    "answer": "No",
+                    "split": "train",
+                    "source": "visual_genome",
+                })
+
+    rng.shuffle(samples)
+    split_idx = int(len(samples) * 0.95)
+    _save_json(samples[:split_idx], os.path.join(vg_dir, "train.json"))
+    _save_json(samples[split_idx:], os.path.join(vg_dir, "val.json"))
+    print(f"  Produced {len(samples)} spatial QA pairs from Visual Genome")
 
 
 # =========================================================================== #
@@ -888,9 +1375,12 @@ def prepare_clevr_spatial(
 
 PREPARE_FNS = {
     "grit": prepare_grit,
+    "vg_grounding": prepare_vg_grounding,
+    "grefcoco": prepare_grefcoco,
     "rel3d": prepare_rel3d,
-    "cambrian": prepare_cambrian,
+    "cambrian_spatial": prepare_cambrian_spatial,
     "clevr_spatial": prepare_clevr_spatial,
+    "vg_spatial": prepare_vg_spatial,
 }
 
 
@@ -930,6 +1420,16 @@ def main() -> None:
     parser.add_argument("--clevr_max_qa", type=int, default=4,
                         help="Max QA pairs per CLEVR scene")
 
+    # gRefCOCO options
+    parser.add_argument("--coco_image_dir", type=str, default="/data/datasets/coco/train2017",
+                        help="COCO train2017 image directory for gRefCOCO")
+
+    # VG options
+    parser.add_argument("--vg_input_dir", type=str, default="/data/datasets/vg",
+                        help="Directory with VG relationships.json, image_data.json, VG_100K/, VG_100K_2/")
+    parser.add_argument("--vg_max_samples", type=int, default=200_000,
+                        help="Max spatial QA pairs to extract from Visual Genome")
+
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
     args = parser.parse_args()
@@ -943,8 +1443,8 @@ def main() -> None:
 
         if ds_name == "grit":
             prepare_grit(args.output_dir, max_samples=args.grit_max_samples, seed=args.seed)
-        elif ds_name == "cambrian":
-            prepare_cambrian(
+        elif ds_name == "cambrian_spatial":
+            prepare_cambrian_spatial(
                 args.output_dir,
                 max_samples=args.cambrian_max_samples,
                 seed=args.seed,
@@ -956,6 +1456,26 @@ def main() -> None:
                 num_scenes=args.clevr_num_scenes,
                 max_qa_per_scene=args.clevr_max_qa,
                 canvas_size=args.clevr_canvas_size,
+                seed=args.seed,
+            )
+        elif ds_name == "vg_grounding":
+            prepare_vg_grounding(
+                args.output_dir,
+                vg_input_dir=args.vg_input_dir,
+                max_samples=args.vg_max_samples,
+                seed=args.seed,
+            )
+        elif ds_name == "grefcoco":
+            prepare_grefcoco(
+                args.output_dir,
+                coco_image_dir=args.coco_image_dir,
+                seed=args.seed,
+            )
+        elif ds_name == "vg_spatial":
+            prepare_vg_spatial(
+                args.output_dir,
+                vg_input_dir=args.vg_input_dir,
+                max_samples=args.vg_max_samples,
                 seed=args.seed,
             )
         else:

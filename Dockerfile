@@ -39,7 +39,7 @@ WORKDIR /data/users/stogian/learnable-reinspection
 
 COPY requirements.vlm.txt .
 
-RUN uv pip install --system --no-cache --break-system-packages -r requirements.vlm.txt
+RUN uv pip install --system --no-cache --break-system-packages -r requirements.txt
 
 COPY src/ src/
 

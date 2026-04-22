@@ -33,6 +33,7 @@ from src.model.bbox_head import BboxHead, compute_grounding_loss
 from src.config import ReInspectionConfig
 from src.data.refcoco import RefCOCODataset
 from src.data.spatial_dataset import build_spatial_dataset
+from src.data.registry import REGISTRY, stage1_defaults
 
 _CONCAT_KEYS = {"pixel_values", "image_grid_thw", "video_grid_thw"}
 _VARLEN_FLOAT_PAD_KEYS = {"attn_target_mask", "bbox_norm"}
@@ -210,15 +211,10 @@ def _log_dataset_artifact(
                 if hasattr(sub, "samples") and sub.samples:
                     meta[f"subdataset_{type(sub).__name__}_size"] = len(sub.samples)
 
-        for name in ["refcoco", "refcoco+", "refcocog"]:
-            for split in ["train", "test"]:
-                p = os.path.join(data_root, name, f"{split}.json")
-                if os.path.exists(p):
-                    ann_files.add(p)
-        for name in ["vsr", "whatsup", "gqa_spatial", "spatialbench", "3dsrbench", "mindcube", "blink", "srbench"]:
-            for ext in ["json", "jsonl"]:
-                for split in ["train", "test"]:
-                    p = os.path.join(data_root, name, f"{split}.{ext}")
+        for ds in REGISTRY:
+            for split in ["train", "val", "test"]:
+                for ext in ["json", "jsonl"]:
+                    p = os.path.join(data_root, ds.subdir, f"{split}.{ext}")
                     if os.path.exists(p):
                         ann_files.add(p)
 
@@ -546,11 +542,13 @@ def _build_dataset(
     processor,
 ):
     if stage == 1:
+        stage1_names = config.stage1_dataset_names or stage1_defaults()
         return RefCOCODataset(
             data_root=data_root,
             processor=processor,
             backend=backend,
             split="train",
+            dataset_names=stage1_names,
             max_pixels=config.max_pixels,
             min_pixels=config.min_pixels,
             crop_to_patches=config.crop_to_patches_stage1,
@@ -562,6 +560,7 @@ def _build_dataset(
         processor=processor,
         backend=backend,
         split="train",
+        datasets=config.stage2_dataset_names,
         max_pixels=config.max_pixels,
         min_pixels=config.min_pixels,
         crop_to_patches=config.crop_to_patches_stage2,

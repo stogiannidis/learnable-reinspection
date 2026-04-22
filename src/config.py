@@ -122,6 +122,8 @@ class ReInspectionConfig:
     system_prompt: str = "You are a helpful assistant."
     val_split_ratio: float = 0.05
     val_batch_size: Optional[int] = None
+    stage1_dataset_names: Optional[List[str]] = None  # None → registry.stage1_defaults()
+    stage2_dataset_names: Optional[List[str]] = None  # None → registry.stage2_defaults()
 
     # ------------------------------------------------------------------ #
     # Misc                                                                 #

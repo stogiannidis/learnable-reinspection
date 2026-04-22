@@ -24,14 +24,39 @@ spec:
           - |
             set -euo pipefail
             mkdir -p logs
+            # Run datasets sequentially to keep peak RSS under control.
+            # cambrian (fallback): GQA testdev + VG local annotations → cambrian_spatial/
             python -m src.data.prepare_training_data \
               --output_dir /data/datasets \
-              --datasets cambrian clevr_spatial \
-              --grit_max_samples 200000 \
+              --datasets cambrian_spatial \
+              --cambrian_source fallback \
               --cambrian_max_samples 100000 \
-              --clevr_num_scenes 50000 \
+              --vg_input_dir /data/datasets/vg \
               --seed 42 \
-              2>&1 | tee logs/prepare_training_data.log
+              2>&1 | tee -a logs/prepare_training_data.log
+            # vg_grounding: VG region descriptions → Stage 1 grounding pairs
+            python -m src.data.prepare_training_data \
+              --output_dir /data/datasets \
+              --datasets vg_grounding \
+              --vg_input_dir /data/datasets/vg \
+              --vg_max_samples 500000 \
+              --seed 42 \
+              2>&1 | tee -a logs/prepare_training_data.log
+            # vg_spatial: VG relationships → Stage 2 spatial VQA pairs
+            python -m src.data.prepare_training_data \
+              --output_dir /data/datasets \
+              --datasets vg_spatial \
+              --vg_input_dir /data/datasets/vg \
+              --vg_max_samples 200000 \
+              --seed 42 \
+              2>&1 | tee -a logs/prepare_training_data.log
+            # grefcoco: gRefCOCO → Stage 1 grounding (reads from HF cache)
+            python -m src.data.prepare_training_data \
+              --output_dir /data/datasets \
+              --datasets grefcoco \
+              --coco_image_dir /data/datasets/coco/train2017 \
+              --seed 42 \
+              2>&1 | tee -a logs/prepare_training_data.log
         terminationMessagePath: "/tmp/my-log"
         terminationMessagePolicy: File
         imagePullPolicy: "Always"
@@ -45,13 +70,15 @@ spec:
             value: "8"
           - name: HF_HOME
             value: "/data/Huggingface"
+          - name: TRANSFORMERS_CACHE
+            value: "/data/Huggingface"
         resources:
           requests:
-            cpu: 8
-            memory: "64Gi"
+            cpu: 16
+            memory: "128Gi"
           limits:
-            cpu: 8
-            memory: "64Gi"
+            cpu: 16
+            memory: "128Gi"
         volumeMounts:
           - mountPath: /data
             name: nfs
