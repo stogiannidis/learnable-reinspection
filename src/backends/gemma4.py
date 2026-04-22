@@ -306,7 +306,7 @@ class Gemma4WithReInspection(nn.Module):
 
         new_mm_token_type_ids = None
         if mm_token_type_ids is not None:
-            # R slots are text-type (0); matches Qwen path in qwen3vl.generate.
+            # R slots are text-type (0); matches Qwen path in qwen25vl.generate.
             new_mm_token_type_ids = _insert_1d(mm_token_type_ids, 0, insert_positions)
 
         return {

@@ -14,8 +14,8 @@ from .utils import build_chat_messages as qwen_build_chat
 from .chat_template import build_chat_messages as intern_build_chat
 from .gemma4_chat import build_chat_messages as gemma4_build_chat
 
-_QWEN_BACKENDS = ("qwen3vl", "qwen25vl")
-_VALID_BACKENDS = ("qwen3vl", "qwen25vl", "internvl3", "gemma4")
+_QWEN_BACKENDS = ("qwen25vl",)
+_VALID_BACKENDS = ("qwen25vl", "internvl3", "gemma4")
 
 logger = logging.getLogger(__name__)
 _MAX_RETRIES = 10

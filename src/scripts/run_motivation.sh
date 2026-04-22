@@ -19,8 +19,8 @@
 # Examples (local):
 #   bash src/scripts/run_motivation.sh
 #   MOTIVATION_PROFILE=gemma4 bash src/scripts/run_motivation.sh
-#   bash src/scripts/run_motivation.sh backend=qwen3vl
-#   bash src/scripts/run_motivation.sh backend=qwen3vl checkpoint_dir=models/qwen3vl/stage2/epoch_4
+#   bash src/scripts/run_motivation.sh backend=qwen25vl
+#   bash src/scripts/run_motivation.sh backend=qwen25vl checkpoint_dir=models/qwen25vl/stage2/epoch_4
 #   bash src/scripts/run_motivation.sh max_samples=50
 #
 # Kubernetes: only run this script from the job workingDir, e.g.

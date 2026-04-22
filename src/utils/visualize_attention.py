@@ -10,7 +10,7 @@ Produces two complementary views:
      This shows what the bottleneck module focuses on in its own latent
      space — it is *not* the same signal as the decoder's attention.
 
-The decoder view is implemented for Qwen3-VL and InternVL3 (requires
+The decoder view is implemented for Qwen2.5-VL and InternVL3 (requires
 ``attn_implementation="eager"``). Other backends pre-build ``inputs_embeds``
 in different ways; scope them separately.
 """
@@ -30,7 +30,7 @@ from src.config import ReInspectionConfig
 
 def _load_backend(backend: str):
     """Return (load_model_fn, build_chat_messages_fn) for the requested backend."""
-    if backend in ("qwen3vl", "qwen25vl"):
+    if backend == "qwen25vl":
         backend_mod = importlib.import_module(f"src.backends.{backend}")
         chat_mod = importlib.import_module("src.data.utils")
     elif backend == "internvl3":
@@ -48,7 +48,7 @@ def _load_processor(backend: str, config: ReInspectionConfig):
     from transformers import AutoProcessor
 
     path = config.processor_path
-    if backend in ("qwen3vl", "qwen25vl"):
+    if backend == "qwen25vl":
         return AutoProcessor.from_pretrained(
             path, max_pixels=config.max_pixels, min_pixels=config.min_pixels
         )
@@ -57,7 +57,7 @@ def _load_processor(backend: str, config: ReInspectionConfig):
 
 def _process_inputs(backend: str, processor, text: str, image_path: str, config: ReInspectionConfig):
     kwargs = dict(text=[text], images=[image_path], return_tensors="pt")
-    if backend in ("qwen3vl", "qwen25vl"):
+    if backend == "qwen25vl":
         kwargs["max_pixels"] = config.max_pixels
         kwargs["min_pixels"] = config.min_pixels
     elif backend == "internvl3":
@@ -68,7 +68,7 @@ def _process_inputs(backend: str, processor, text: str, image_path: str, config:
 
 def _vision_grid(backend: str, model, inputs, fallback_n: int) -> Tuple[int, int]:
     """Return (h_merged, w_merged) for the vision token grid."""
-    if backend in ("qwen3vl", "qwen25vl") and "image_grid_thw" in inputs:
+    if backend == "qwen25vl" and "image_grid_thw" in inputs:
         _, h, w = inputs["image_grid_thw"][0].tolist()
         spatial_merge = 2
         return h // spatial_merge, w // spatial_merge
@@ -96,7 +96,7 @@ def _vision_grid(backend: str, model, inputs, fallback_n: int) -> Tuple[int, int
 
 
 def _decode_generation(backend: str, model, processor, inputs, generated_ids, n_queries: int) -> str:
-    if backend in ("qwen3vl", "qwen25vl"):
+    if backend == "qwen25vl":
         input_len = inputs["input_ids"].shape[1] + n_queries
     elif (
         hasattr(model, "last_generation_prompt_lengths")
@@ -350,7 +350,7 @@ def visualize_single(
     inputs = _process_inputs(backend, processor, text, image_path, config)
     inputs = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
-    capture_decoder = backend in ("qwen3vl", "internvl3")
+    capture_decoder = backend == "internvl3"
 
     gen_kwargs = dict(max_new_tokens=max_new_tokens, do_sample=False)
     if capture_decoder:
@@ -443,8 +443,8 @@ def main():
     parser.add_argument(
         "--backend",
         type=str,
-        default="qwen3vl",
-        choices=["qwen3vl", "qwen25vl", "internvl3", "gemma4"],
+        default="internvl3",
+        choices=["internvl3", "qwen25vl", "gemma4"],
     )
     args = parser.parse_args()
 
@@ -461,10 +461,10 @@ def main():
     load_model_fn, build_chat_messages = _load_backend(args.backend)
 
     # Eager attention is required for `output_attentions=True` in generate().
-    # Only Qwen3-VL's load_model currently plumbs this kwarg; other backends
+    # Only InternVL3's load_model currently plumbs this kwarg; other backends
     # fall back to their defaults (decoder viz is skipped for them).
     load_kwargs = dict(device_map="auto")
-    if args.backend in ("qwen3vl", "internvl3"):
+    if args.backend == "internvl3":
         load_kwargs["attn_implementation"] = "eager"
     model = load_model_fn(config, **load_kwargs)
 

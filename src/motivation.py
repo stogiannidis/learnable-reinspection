@@ -10,9 +10,9 @@ Demonstrates two architectural limitations of standard VLMs on spatial reasoning
    how different are the model's attention patterns over vision tokens?  A model
    whose vision encoding is question-agnostic will show low divergence.
 
-Entry point: ``python -m src.motivation stage=eval backend=qwen3vl [overrides]``
+Entry point: ``python -m src.motivation stage=eval backend=internvl3 [overrides]``
 
-Supports all backends (qwen3vl, qwen25vl, internvl3, gemma4) and two conditions:
+Supports all backends (internvl3, qwen25vl, gemma4) and two conditions:
   - ``frozen``: base VLM without re-inspection (shows the problem)
   - ``reinspection``: VLM + re-inspection module (shows the fix)
 """
@@ -216,7 +216,7 @@ def _generate_with_attention_inner(
 ) -> Dict:
     device = model_device(model)
 
-    if backend in ("qwen3vl", "qwen25vl"):
+    if backend == "qwen25vl":
         messages = qwen_build_chat(question, image_path=image_path)
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = processor(
@@ -259,7 +259,7 @@ def _generate_with_attention_inner(
         decoder_attentions = None
 
     # Determine input length for decoding
-    if backend in ("qwen3vl", "qwen25vl"):
+    if backend == "qwen25vl":
         input_len = inputs["input_ids"].shape[1] + (config.n_queries if is_reinspection else 0)
     elif hasattr(model, "last_generation_prompt_lengths") and model.last_generation_prompt_lengths is not None:
         input_len = int(model.last_generation_prompt_lengths[0].item())
@@ -733,21 +733,21 @@ def run_attention_visualization(
     """Collect attention heatmap data for the given condition. Returns saved .npz paths.
 
     For ``condition='reinspection'``: uses the module's A_vis maps unless
-    ``use_decoder_attn`` (Qwen3-VL / InternVL3 with eager attention).
-    For ``condition='frozen'`` with Qwen3-VL or InternVL3: LLM decoder self-attention
+    ``use_decoder_attn`` (InternVL3 with eager attention).
+    For ``condition='frozen'`` with InternVL3: LLM decoder self-attention
     to image tokens. Otherwise frozen uses a hidden-state cosine proxy over vision tokens.
 
     Qwen backends use ``image_grid_thw``; InternVL3 uses the merged patch grid from
     ``vision_config`` (single-tile inputs via ``crop_to_patches=False``).
     """
-    if backend not in ("qwen3vl", "qwen25vl", "internvl3"):
+    if backend not in ("qwen25vl", "internvl3"):
         print(f"  Attention visualisation not supported for backend={backend} — skipping.")
         return []
 
     is_ri = condition == "reinspection"
     # Decoder-attention capture: proper VLM attention (generated → image tokens).
     # Requires attn_implementation="eager" at load time (see main()).
-    use_decoder_attn = backend in ("qwen3vl", "internvl3")
+    use_decoder_attn = backend == "internvl3"
     force_single_tile = backend == "internvl3"
 
     fig_dir = os.path.join(output_dir, "attention_figures")
@@ -1251,7 +1251,7 @@ def main(cfg: DictConfig) -> None:
         print(f"{'='*60}")
 
         # Eager attention is required for output_attentions=True in generate().
-        attn_impl = "eager" if backend in ("qwen3vl", "internvl3") else None
+        attn_impl = "eager" if backend == "internvl3" else None
         model, is_ri = load_condition_model(
             backend, condition, config, processor,
             checkpoint_dir=config.checkpoint_dir,
@@ -1326,7 +1326,7 @@ def main(cfg: DictConfig) -> None:
             json.dump(div_res.pop("samples", []), f, indent=2)
 
         # --- Prong 4: Attention Map Visualisation (both conditions) ---
-        if backend in ("qwen3vl", "qwen25vl", "internvl3"):
+        if backend in ("qwen25vl", "internvl3"):
             print(f"\n--- Prong 4: Attention Map Visualisation ({condition}) ---")
             npzs = run_attention_visualization(
                 model, processor, vis_selected, backend, config,

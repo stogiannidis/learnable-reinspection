@@ -13,8 +13,8 @@ from .utils import bbox_to_patch_mask as qwen_bbox_to_patch_mask, build_chat_mes
 from .chat_template import build_chat_messages as intern_build_chat
 from .gemma4_chat import build_chat_messages as gemma4_build_chat
 
-_QWEN_BACKENDS = ("qwen3vl", "qwen25vl")
-_VALID_BACKENDS = ("qwen3vl", "qwen25vl", "internvl3", "gemma4")
+_QWEN_BACKENDS = ("qwen25vl",)
+_VALID_BACKENDS = ("qwen25vl", "internvl3", "gemma4")
 
 
 def _squeeze_intern(batch: Dict) -> Dict:

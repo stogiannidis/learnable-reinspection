@@ -1,4 +1,4 @@
-"""Qwen3-VL-oriented data utilities."""
+"""Qwen-oriented data utilities (shared by Qwen2.5-VL)."""
 
 import numpy as np
 import torch
@@ -10,7 +10,7 @@ def bbox_to_patch_mask(
     image_grid_thw: torch.LongTensor,
     spatial_merge_size: int = 2,
 ) -> torch.Tensor:
-    """Map a normalized bbox to Qwen3-VL merged patch supervision."""
+    """Map a normalized bbox to Qwen merged patch supervision."""
     t, h_patches, w_patches = image_grid_thw.tolist()
     h_merged = h_patches // spatial_merge_size
     w_merged = w_patches // spatial_merge_size
@@ -49,7 +49,7 @@ def build_chat_messages(
     image_path: Optional[str] = None,
     image_url: Optional[str] = None,
 ) -> List[Dict]:
-    """Build Qwen3-VL chat messages."""
+    """Build Qwen chat messages."""
     content = []
 
     if image_path is not None:

@@ -42,18 +42,18 @@ plt.rcParams.update({
 })
 
 MODEL_LABELS = {
-    "qwen3vl": "Qwen3-VL (8B)",
     "internvl3": "InternVL3 (8B)",
+    "qwen25vl": "Qwen2.5-VL (7B)",
     "gemma4": "Gemma 4 (12B)",
 }
 
 MODEL_COLORS = {
-    "qwen3vl": "#4C72B0",
     "internvl3": "#55A868",
+    "qwen25vl": "#4C72B0",
     "gemma4": "#C44E52",
 }
 
-MODEL_ORDER = ["qwen3vl", "internvl3", "gemma4"]
+MODEL_ORDER = ["internvl3", "qwen25vl", "gemma4"]
 
 IMAGE_ROOT = "/data/datasets/vsr/images"
 
