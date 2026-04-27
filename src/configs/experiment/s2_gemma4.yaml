@@ -1,0 +1,11 @@
+# @package _global_
+# Stage 2 — spatial VQA. Gemma 4.
+# Edit `stage1_checkpoint` to match the Stage-1 epoch you want to use.
+defaults:
+  - override /backend: gemma4
+  - override /stage: stage2
+  - override /stage2_datasets: default
+
+stage1_checkpoint: models/gemma4/grounding/stage1/epoch_5/reinspection_module.pt
+wandb_run_name: gemma4-stage2-grounding
+experiment_name: grounding

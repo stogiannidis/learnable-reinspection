@@ -1,0 +1,44 @@
+# Standard 4x H100 training job. Non-secret env (experiments, OMP, HF_HOME, …)
+# lives in src/scripts/run_train.sh; this manifest only injects secrets.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-train-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  backoffLimit: 0
+  template:
+    spec:
+      containers:
+      - name: train
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            mkdir -p logs models
+            bash src/scripts/run_train.sh
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+        imagePullPolicy: Always
+        resources:
+          requests: { cpu: 32, memory: "128Gi", nvidia.com/gpu: 4 }
+          limits:   { cpu: 32, memory: "128Gi", nvidia.com/gpu: 4 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "64Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3

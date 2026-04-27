@@ -50,6 +50,14 @@ from src.evaluate import (
     normalize_answer,
     _generate_extra_kw,
 )
+from src.utils.attention_schema import (
+    ATTN_SIGNAL_CMAP,
+    ATTN_SIGNAL_LABELS,
+    ATTN_SIGNAL_STORAGE,
+    attention_capture_plan as _attention_capture_plan,
+    default_display_signal as _default_display_signal,
+    single_condition_display_signals as _single_condition_display_signals,
+)
 from src.utils.hydra_util import strip_deepspeed_local_rank_argv
 
 strip_deepspeed_local_rank_argv()
@@ -93,6 +101,54 @@ def _internvl3_merged_hw(model) -> Optional[Tuple[int, int]]:
     return side, side
 
 
+def _normalize_spatial_signal(values, n_spatial: int) -> Optional[np.ndarray]:
+    """Crop a 1D spatial signal to the patch grid and normalize it."""
+    if values is None:
+        return None
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    if arr.shape[0] < n_spatial:
+        return None
+    arr = arr[:n_spatial]
+    total = float(arr.sum())
+    if not np.isfinite(total) or total <= 0.0:
+        return None
+    return arr / (total + 1e-8)
+
+
+def _mean_a_vis(attn_vis, n_spatial: int) -> Optional[np.ndarray]:
+    """Average A_vis over queries and normalize on the spatial grid."""
+    if attn_vis is None:
+        return None
+    arr = np.asarray(attn_vis, dtype=np.float32)
+    if arr.ndim != 3 or arr.shape[0] == 0:
+        return None
+    return _normalize_spatial_signal(arr[0].mean(axis=0), n_spatial)
+
+
+def _npz_available_signals(data) -> List[str]:
+    """Read signal availability from either the expanded or legacy NPZ schema."""
+    if "available_signals" in data.files:
+        return [str(x) for x in np.asarray(data["available_signals"]).tolist()]
+    if "attn_source" in data.files:
+        return [str(data["attn_source"])]
+    condition = str(data["condition"]) if "condition" in data.files else "frozen"
+    return ["a_vis" if condition == "reinspection" else "hidden_cosine"]
+
+
+def _npz_signal_pair(data, signal: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Load one signal pair from expanded NPZs while remaining legacy-compatible."""
+    prefix = ATTN_SIGNAL_STORAGE[signal]
+    key_a = f"{prefix}_a"
+    key_b = f"{prefix}_b"
+    if key_a in data.files and key_b in data.files:
+        return np.asarray(data[key_a]), np.asarray(data[key_b])
+
+    legacy_source = str(data["attn_source"]) if "attn_source" in data.files else None
+    if legacy_source == signal or (legacy_source is None and signal in _npz_available_signals(data)):
+        return np.asarray(data["attn_a"]), np.asarray(data["attn_b"])
+    return None, None
+
+
 # ------------------------------------------------------------------ #
 #  Core generation + attention capture                                #
 # ------------------------------------------------------------------ #
@@ -105,58 +161,22 @@ def _decoder_image_attention(
     w_merged: int,
     tokenizer=None,
 ) -> Optional[np.ndarray]:
-    """Mean decoder self-attention from generated tokens → image-token columns.
-
-    `attentions` is `GenerateDecoderOnlyOutput.attentions`:
-      tuple (per-step) of tuple (per-layer) of [B, heads, q_len, k_len].
-    Step 0 (prefill): last row produces first generated token.
-    Step t > 0: only row is the attention producing token t.
-
-    Averages over heads and layers, selects columns at image-token positions,
-    reshapes to (h_merged, w_merged), then averages over all non-special
-    generated tokens. Returns a normalized (N_vis,) numpy vector, or None if
-    extraction fails (e.g. None attentions from SDPA).
-    """
+    """Mean decoder self-attention from generated tokens -> image-token columns."""
     if attentions is None or len(attentions) == 0 or attentions[0][0] is None:
         print("  [decoder-attn] attentions missing — is attn_implementation='eager'?")
         return None
 
-    seq0 = sequences[0]
-    img_positions = (seq0 == image_token_id).nonzero(as_tuple=True)[0]
-    n_img = img_positions.numel()
-    if n_img != h_merged * w_merged:
-        print(f"  [decoder-attn] image-token count {n_img} != grid {h_merged}×{w_merged}="
-              f"{h_merged*w_merged}")
+    from src.utils.visualize_attention import extract_decoder_image_attention
+
+    try:
+        mean_attn, _, _, _ = extract_decoder_image_attention(
+            sequences, attentions, image_token_id, tokenizer,
+            h_merged, w_merged,
+        )
+        return mean_attn
+    except ValueError as exc:
+        print(f"  [decoder-attn] {exc}")
         return None
-
-    prefill_len = attentions[0][0].shape[-1]
-    if int(img_positions.max().item()) >= prefill_len:
-        print(f"  [decoder-attn] image pos {int(img_positions.max())} ≥ prefill {prefill_len}")
-        return None
-
-    num_gen = len(attentions)
-    gen_ids = seq0[prefill_len: prefill_len + num_gen].tolist()
-    special_ids = set(getattr(tokenizer, "all_special_ids", []) or []) if tokenizer is not None else set()
-
-    accum: List[np.ndarray] = []
-    for t, layer_attns in enumerate(attentions):
-        tok = gen_ids[t] if t < len(gen_ids) else None
-        if tok is not None:
-            if tok in special_ids:
-                continue
-            if tokenizer is not None and not tokenizer.decode([tok], skip_special_tokens=False).strip():
-                continue
-        layer_rows = []
-        for la in layer_attns:
-            row = la[0, :, -1, :] if t == 0 else la[0, :, 0, :]
-            layer_rows.append(row[:, img_positions].float().mean(dim=0))
-        accum.append(torch.stack(layer_rows, dim=0).mean(dim=0).cpu().numpy())
-
-    if not accum:
-        return None
-    mean_attn = np.stack(accum, axis=0).mean(axis=0)
-    mean_attn = mean_attn / (mean_attn.sum() + 1e-8)
-    return mean_attn
 
 
 @torch.no_grad()
@@ -732,10 +752,9 @@ def run_attention_visualization(
 ) -> List[str]:
     """Collect attention heatmap data for the given condition. Returns saved .npz paths.
 
-    For ``condition='reinspection'``: uses the module's A_vis maps unless
-    ``use_decoder_attn`` (InternVL3 with eager attention).
-    For ``condition='frozen'`` with InternVL3: LLM decoder self-attention
-    to image tokens. Otherwise frozen uses a hidden-state cosine proxy over vision tokens.
+    InternVL3 frozen stores decoder attention. InternVL3 reinspection stores
+    both decoder attention and ``A_vis``. Other frozen backends fall back to a
+    hidden-state cosine proxy; wrapper paths store ``A_vis``.
 
     Qwen backends use ``image_grid_thw``; InternVL3 uses the merged patch grid from
     ``vision_config`` (single-tile inputs via ``crop_to_patches=False``).
@@ -745,9 +764,7 @@ def run_attention_visualization(
         return []
 
     is_ri = condition == "reinspection"
-    # Decoder-attention capture: proper VLM attention (generated → image tokens).
-    # Requires attn_implementation="eager" at load time (see main()).
-    use_decoder_attn = backend == "internvl3"
+    requested_signals = _attention_capture_plan(backend, condition)
     force_single_tile = backend == "internvl3"
 
     fig_dir = os.path.join(output_dir, "attention_figures")
@@ -763,15 +780,15 @@ def run_attention_visualization(
             out_a = _generate_with_attention(
                 model, processor, image_path, pair.question_a,
                 backend, config, is_ri, return_grid_info=True,
-                capture_base_vision_attn=(not is_ri) and (not use_decoder_attn),
-                capture_decoder_attn=use_decoder_attn,
+                capture_base_vision_attn=("hidden_cosine" in requested_signals),
+                capture_decoder_attn=("decoder" in requested_signals),
                 force_single_tile=force_single_tile,
             )
             out_b = _generate_with_attention(
                 model, processor, image_path, pair.question_b,
                 backend, config, is_ri, return_grid_info=True,
-                capture_base_vision_attn=(not is_ri) and (not use_decoder_attn),
-                capture_decoder_attn=use_decoder_attn,
+                capture_base_vision_attn=("hidden_cosine" in requested_signals),
+                capture_decoder_attn=("decoder" in requested_signals),
                 force_single_tile=force_single_tile,
             )
         except Exception as e:
@@ -794,59 +811,64 @@ def run_attention_visualization(
             continue
         n_spatial = h_merged * w_merged
 
-        if use_decoder_attn:
-            agg_a = out_a.get("decoder_image_attn")
-            agg_b = out_b.get("decoder_image_attn")
-            if agg_a is None or agg_b is None:
-                print(f"  skip attn vis [{condition}] example {i}: missing decoder attention")
-                continue
-        elif is_ri:
-            raw_a = out_a.get("reinspection_attn_vis")
-            raw_b = out_b.get("reinspection_attn_vis")
-            if raw_a is None or raw_b is None:
-                print(f"  skip attn vis [{condition}] example {i}: missing A_vis")
-                continue
-            # (B, N_q, N_vis) → mean over queries → (N_vis,)
-            agg_a = raw_a[0].mean(axis=0)
-            agg_b = raw_b[0].mean(axis=0)
-        else:
-            agg_a = out_a.get("base_vision_attn")
-            agg_b = out_b.get("base_vision_attn")
-            if agg_a is None or agg_b is None:
-                print(f"  skip attn vis [{condition}] example {i}: missing vision proxy")
-                continue
+        signal_pairs: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+        missing_signals: List[str] = []
 
-        # Guard: need at least n_spatial values to reshape
-        if len(agg_a) < n_spatial or len(agg_b) < n_spatial:
-            print(f"  skip attn vis [{condition}] example {i}: "
-                  f"attn length {len(agg_a)} < {n_spatial}")
+        for signal in requested_signals:
+            if signal == "decoder":
+                sig_a = _normalize_spatial_signal(out_a.get("decoder_image_attn"), n_spatial)
+                sig_b = _normalize_spatial_signal(out_b.get("decoder_image_attn"), n_spatial)
+            elif signal == "a_vis":
+                sig_a = _mean_a_vis(out_a.get("reinspection_attn_vis"), n_spatial)
+                sig_b = _mean_a_vis(out_b.get("reinspection_attn_vis"), n_spatial)
+            else:
+                sig_a = _normalize_spatial_signal(out_a.get("base_vision_attn"), n_spatial)
+                sig_b = _normalize_spatial_signal(out_b.get("base_vision_attn"), n_spatial)
+
+            if sig_a is None or sig_b is None:
+                missing_signals.append(signal)
+                continue
+            signal_pairs[signal] = (sig_a, sig_b)
+
+        if not signal_pairs:
+            requested = ", ".join(requested_signals)
+            print(f"  skip attn vis [{condition}] example {i}: missing all requested signals ({requested})")
             continue
 
-        agg_a = agg_a[:n_spatial]
-        agg_b = agg_b[:n_spatial]
-        agg_a = agg_a / (agg_a.sum() + 1e-8)
-        agg_b = agg_b / (agg_b.sum() + 1e-8)
+        if missing_signals:
+            print(
+                f"  [{condition}] example {i}: missing signals "
+                f"{', '.join(missing_signals)}; saving {', '.join(signal_pairs)}"
+            )
 
-        if use_decoder_attn:
-            attn_source = "decoder"
-        elif is_ri:
-            attn_source = "a_vis"
-        else:
-            attn_source = "hidden_cosine"
+        available_signals = list(signal_pairs.keys())
+        default_signal = _default_display_signal(condition, available_signals)
+        default_a, default_b = signal_pairs[default_signal]
 
         npz_path = os.path.join(fig_dir, f"{condition}_attn_pair_{i}.npz")
-        np.savez(
-            npz_path,
-            attn_a=agg_a, attn_b=agg_b,
-            h_merged=h_merged, w_merged=w_merged,
-            image_path=image_path,
-            question_a=pair.question_a, question_b=pair.question_b,
-            answer_a=out_a["generated_text"], answer_b=out_b["generated_text"],
-            gt_a=pair.answer_a, gt_b=pair.answer_b,
-            relation=pair.relation,
-            condition=condition,
-            attn_source=attn_source,
-        )
+        save_payload = {
+            "attn_a": default_a,
+            "attn_b": default_b,
+            "h_merged": h_merged,
+            "w_merged": w_merged,
+            "image_path": image_path,
+            "question_a": pair.question_a,
+            "question_b": pair.question_b,
+            "answer_a": out_a["generated_text"],
+            "answer_b": out_b["generated_text"],
+            "gt_a": pair.answer_a,
+            "gt_b": pair.answer_b,
+            "relation": pair.relation,
+            "condition": condition,
+            "attn_source": default_signal,
+            "available_signals": np.asarray(available_signals, dtype="<U32"),
+            "default_display_signal": default_signal,
+        }
+        for signal, (sig_a, sig_b) in signal_pairs.items():
+            prefix = ATTN_SIGNAL_STORAGE[signal]
+            save_payload[f"{prefix}_a"] = sig_a
+            save_payload[f"{prefix}_b"] = sig_b
+        np.savez(npz_path, **save_payload)
         saved_paths.append(npz_path)
         print(f"  [{condition}] Saved attention data: {npz_path}")
 
@@ -854,17 +876,28 @@ def run_attention_visualization(
 
 
 def _plot_single_condition_figure(npz_paths: List[str], fig_dir: str, condition: str) -> None:
-    """Render a 3-column attention figure (image | Q_A | Q_B) for one condition."""
+    """Render a condition figure using the signals stored in the NPZ schema."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from src.utils.visualize_attention import plot_attention_heatmap
 
-    cmap = "hot" if condition == "reinspection" else "cividis"
+    first = np.load(npz_paths[0], allow_pickle=True)
+    display_signals = _single_condition_display_signals(
+        condition, _npz_available_signals(first),
+    )
     n = len(npz_paths)
-    fig, axes = plt.subplots(n, 3, figsize=(14, 4 * n))
+    n_cols = 1 + (2 * len(display_signals))
+    fig, axes = plt.subplots(n, n_cols, figsize=(6 + 4 * len(display_signals), 4 * n))
     if n == 1:
         axes = axes[np.newaxis, :]
+
+    col_titles = ["Image"]
+    for signal in display_signals:
+        label = ATTN_SIGNAL_LABELS.get(signal, signal)
+        col_titles.extend([f"{label} · Q_A", f"{label} · Q_B"])
+    for col, title in enumerate(col_titles):
+        axes[0, col].set_title(title, fontsize=10, fontweight="bold")
 
     for row, npz_path in enumerate(npz_paths):
         data = np.load(npz_path, allow_pickle=True)
@@ -882,29 +915,29 @@ def _plot_single_condition_figure(npz_paths: List[str], fig_dir: str, condition:
         axes[row, 0].axis("off")
 
         a_ok = "Y" if ans_a.strip().lower() == gt_a.strip().lower() else "N"
-        plot_attention_heatmap(
-            image, data["attn_a"], h_m, w_m,
-            title=f"Q: ...{q_a[-50:]}\nA: {ans_a} (GT={gt_a}) [{a_ok}]",
-            ax=axes[row, 1], cmap=cmap, alpha=0.5,
-        )
         b_ok = "Y" if ans_b.strip().lower() == gt_b.strip().lower() else "N"
-        plot_attention_heatmap(
-            image, data["attn_b"], h_m, w_m,
-            title=f"Q: ...{q_b[-50:]}\nA: {ans_b} (GT={gt_b}) [{b_ok}]",
-            ax=axes[row, 2], cmap=cmap, alpha=0.5,
-        )
+        col = 1
+        for signal in display_signals:
+            sig_a, sig_b = _npz_signal_pair(data, signal)
+            if sig_a is None or sig_b is None:
+                axes[row, col].axis("off")
+                axes[row, col + 1].axis("off")
+                col += 2
+                continue
+            cmap = ATTN_SIGNAL_CMAP.get(signal, "cividis")
+            plot_attention_heatmap(
+                image, sig_a, h_m, w_m,
+                title=f"Q: ...{q_a[-50:]}\nA: {ans_a} (GT={gt_a}) [{a_ok}]",
+                ax=axes[row, col], cmap=cmap, alpha=0.5,
+            )
+            plot_attention_heatmap(
+                image, sig_b, h_m, w_m,
+                title=f"Q: ...{q_b[-50:]}\nA: {ans_b} (GT={gt_b}) [{b_ok}]",
+                ax=axes[row, col + 1], cmap=cmap, alpha=0.5,
+            )
+            col += 2
 
-    # Pick a label based on the recorded attention source of the first npz.
-    first = np.load(npz_paths[0], allow_pickle=True)
-    source = str(first["attn_source"]) if "attn_source" in first.files else (
-        "a_vis" if condition == "reinspection" else "hidden_cosine"
-    )
-    _src_label = {
-        "decoder": "LLM decoder → image",
-        "a_vis": "Re-Inspection A_vis",
-        "hidden_cosine": "Frozen (hidden-state cosine proxy)",
-    }.get(source, source)
-    label = f"{condition} · {_src_label}"
+    label = " + ".join(ATTN_SIGNAL_LABELS.get(sig, sig) for sig in display_signals)
     fig.suptitle(f"{label}: Question A vs. Question B", fontsize=14, fontweight="bold", y=1.01)
     plt.tight_layout()
     out_path = os.path.join(fig_dir, f"{condition}_attention_comparison.pdf")
@@ -917,11 +950,7 @@ def _plot_single_condition_figure(npz_paths: List[str], fig_dir: str, condition:
 def _plot_combined_attention_comparison(
     vis_npzs: Dict[str, List[str]], fig_dir: str,
 ) -> None:
-    """Render a 5-column combined figure: image | frozen Q_A | frozen Q_B | RI Q_A | RI Q_B.
-
-    Pairs are matched by example index (filename suffix), so only pairs present
-    in both conditions are shown.
-    """
+    """Render one combined figure per matched signal shared by frozen and reinspection."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -938,61 +967,74 @@ def _plot_combined_attention_comparison(
         print("  No matching pairs between frozen and reinspection — skipping combined figure.")
         return
 
-    n = len(common)
-    fig, axes = plt.subplots(n, 5, figsize=(22, 4 * n))
-    if n == 1:
-        axes = axes[np.newaxis, :]
-
-    col_titles = ["Image", "Frozen Q_A", "Frozen Q_B", "Re-Insp Q_A", "Re-Insp Q_B"]
-    for col, title in enumerate(col_titles):
-        axes[0, col].set_title(title, fontsize=10, fontweight="bold")
+    frozen_first = np.load(frozen_by_idx[common[0]], allow_pickle=True)
+    ri_first = np.load(ri_by_idx[common[0]], allow_pickle=True)
+    shared_signals = [
+        signal
+        for signal in _npz_available_signals(frozen_first)
+        if signal in _npz_available_signals(ri_first)
+    ]
+    if not shared_signals:
+        print("  Frozen and reinspection figures do not share an attention signal — skipping combined figure.")
+        return
 
     def _label(q, ans, gt):
         ok = "Y" if str(ans).strip().lower() == str(gt).strip().lower() else "N"
         return f"Q: {str(q)[-50:]}\nA: {ans} (GT={gt}) [{ok}]"
 
-    for row, idx in enumerate(common):
-        fd = np.load(frozen_by_idx[idx], allow_pickle=True)
-        rd = np.load(ri_by_idx[idx], allow_pickle=True)
-        image = Image.open(str(fd["image_path"])).convert("RGB")
-        h_m, w_m = int(fd["h_merged"]), int(fd["w_merged"])
+    n = len(common)
+    for signal in shared_signals:
+        fig, axes = plt.subplots(n, 5, figsize=(22, 4 * n))
+        if n == 1:
+            axes = axes[np.newaxis, :]
 
-        axes[row, 0].imshow(image)
-        axes[row, 0].set_title(
-            f"{os.path.basename(str(fd['image_path']))}\n{str(fd['relation'])}", fontsize=8,
-        )
-        axes[row, 0].axis("off")
+        col_titles = ["Image", "Frozen Q_A", "Frozen Q_B", "Re-Insp Q_A", "Re-Insp Q_B"]
+        for col, title in enumerate(col_titles):
+            axes[0, col].set_title(title, fontsize=10, fontweight="bold")
 
-        plot_attention_heatmap(image, fd["attn_a"], h_m, w_m,
-                               title=_label(fd["question_a"], fd["answer_a"], fd["gt_a"]),
-                               ax=axes[row, 1], cmap="cividis", alpha=0.5)
-        plot_attention_heatmap(image, fd["attn_b"], h_m, w_m,
-                               title=_label(fd["question_b"], fd["answer_b"], fd["gt_b"]),
-                               ax=axes[row, 2], cmap="cividis", alpha=0.5)
-        plot_attention_heatmap(image, rd["attn_a"], h_m, w_m,
-                               title=_label(rd["question_a"], rd["answer_a"], rd["gt_a"]),
-                               ax=axes[row, 3], cmap="hot", alpha=0.5)
-        plot_attention_heatmap(image, rd["attn_b"], h_m, w_m,
-                               title=_label(rd["question_b"], rd["answer_b"], rd["gt_b"]),
-                               ax=axes[row, 4], cmap="hot", alpha=0.5)
+        cmap = ATTN_SIGNAL_CMAP.get(signal, "cividis")
+        for row, idx in enumerate(common):
+            fd = np.load(frozen_by_idx[idx], allow_pickle=True)
+            rd = np.load(ri_by_idx[idx], allow_pickle=True)
+            image = Image.open(str(fd["image_path"])).convert("RGB")
+            h_m, w_m = int(fd["h_merged"]), int(fd["w_merged"])
+            frozen_a, frozen_b = _npz_signal_pair(fd, signal)
+            ri_a, ri_b = _npz_signal_pair(rd, signal)
+            if frozen_a is None or frozen_b is None or ri_a is None or ri_b is None:
+                continue
 
-    # If both sides used decoder-attention, both heatmaps are the same signal
-    # (generated → image tokens); reflect that in the title.
-    fd0 = np.load(list(frozen_by_idx.values())[0], allow_pickle=True)
-    rd0 = np.load(list(ri_by_idx.values())[0], allow_pickle=True)
-    src_fr = str(fd0["attn_source"]) if "attn_source" in fd0.files else "hidden_cosine"
-    src_ri = str(rd0["attn_source"]) if "attn_source" in rd0.files else "a_vis"
-    if src_fr == "decoder" and src_ri == "decoder":
-        suptitle = "Frozen VLM vs. Re-Inspection: LLM decoder attention over image tokens"
-    else:
-        suptitle = "Frozen VLM (blue) vs. Re-Inspection (red): Question-Conditioned Visual Attention"
-    fig.suptitle(suptitle, fontsize=14, fontweight="bold", y=1.01)
-    plt.tight_layout()
-    out_path = os.path.join(fig_dir, "combined_attention_comparison.pdf")
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    fig.savefig(out_path.replace(".pdf", ".png"), dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved combined attention comparison: {out_path}")
+            axes[row, 0].imshow(image)
+            axes[row, 0].set_title(
+                f"{os.path.basename(str(fd['image_path']))}\n{str(fd['relation'])}", fontsize=8,
+            )
+            axes[row, 0].axis("off")
+
+            plot_attention_heatmap(image, frozen_a, h_m, w_m,
+                                   title=_label(fd["question_a"], fd["answer_a"], fd["gt_a"]),
+                                   ax=axes[row, 1], cmap=cmap, alpha=0.5)
+            plot_attention_heatmap(image, frozen_b, h_m, w_m,
+                                   title=_label(fd["question_b"], fd["answer_b"], fd["gt_b"]),
+                                   ax=axes[row, 2], cmap=cmap, alpha=0.5)
+            plot_attention_heatmap(image, ri_a, h_m, w_m,
+                                   title=_label(rd["question_a"], rd["answer_a"], rd["gt_a"]),
+                                   ax=axes[row, 3], cmap=cmap, alpha=0.5)
+            plot_attention_heatmap(image, ri_b, h_m, w_m,
+                                   title=_label(rd["question_b"], rd["answer_b"], rd["gt_b"]),
+                                   ax=axes[row, 4], cmap=cmap, alpha=0.5)
+
+        signal_label = ATTN_SIGNAL_LABELS.get(signal, signal)
+        if signal == "decoder":
+            suptitle = "Frozen VLM vs. Re-Inspection: LLM decoder attention over image tokens"
+        else:
+            suptitle = f"Frozen VLM vs. Re-Inspection: {signal_label}"
+        fig.suptitle(suptitle, fontsize=14, fontweight="bold", y=1.01)
+        plt.tight_layout()
+        suffix = "" if len(shared_signals) == 1 else f"_{signal}"
+        out_path = os.path.join(fig_dir, f"combined_attention_comparison{suffix}.pdf")
+        fig.savefig(out_path, dpi=200, bbox_inches="tight")
+        fig.savefig(out_path.replace(".pdf", ".png"), dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved combined attention comparison: {out_path}")
 
 
 # ------------------------------------------------------------------ #

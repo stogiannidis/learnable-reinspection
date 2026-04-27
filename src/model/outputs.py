@@ -25,6 +25,9 @@ class ReInspectionOutput(ModelOutput):
       over text and vision tokens (when the backend exposes weights).
     - ``R_bottleneck``: final query states in reduced dimension before the
       up-projection, fed to the optional :class:`~src.model.bbox_head.BboxHead`.
+    - ``Q_text_bottleneck`` / ``text_bottleneck`` / ``text_bottleneck_mask``:
+      pre-vision query states, down-projected text tokens, and a padding mask
+      for optional query–text InfoNCE.
     """
 
     loss: Optional[torch.FloatTensor] = None
@@ -37,3 +40,6 @@ class ReInspectionOutput(ModelOutput):
     attn_task: Optional[torch.FloatTensor] = None
     attn_vis: Optional[torch.FloatTensor] = None
     R_bottleneck: Optional[torch.FloatTensor] = None
+    Q_text_bottleneck: Optional[torch.FloatTensor] = None
+    text_bottleneck: Optional[torch.FloatTensor] = None
+    text_bottleneck_mask: Optional[torch.BoolTensor] = None

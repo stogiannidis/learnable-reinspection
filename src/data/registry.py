@@ -31,9 +31,7 @@ REGISTRY: List[DatasetSpec] = [
     # Stage 2 — spatial VQA                                               #
     # ------------------------------------------------------------------ #
     DatasetSpec("vsr",              2, "vsr",              default=True),
-    DatasetSpec("whatsup",          2, "whatsup",          default=True),
     DatasetSpec("gqa_spatial",      2, "gqa_spatial",      default=True),
-    DatasetSpec("spatialbench",     2, "spatialbench",     default=True),
     DatasetSpec("clevr_spatial",    2, "clevr_spatial",    default=True),
     DatasetSpec("vg_spatial",       2, "vg_spatial",       default=True),
     # default=False until annotations land on disk

@@ -10,9 +10,9 @@ Produces two complementary views:
      This shows what the bottleneck module focuses on in its own latent
      space — it is *not* the same signal as the decoder's attention.
 
-The decoder view is implemented for Qwen2.5-VL and InternVL3 (requires
-``attn_implementation="eager"``). Other backends pre-build ``inputs_embeds``
-in different ways; scope them separately.
+The decoder view is currently wired for InternVL3 with
+``attn_implementation="eager"``. Wrapper paths across backends still expose
+the separate Re-Inspection ``A_vis`` signal.
 """
 
 import argparse
@@ -116,11 +116,11 @@ def _decode_generation(backend: str, model, processor, inputs, generated_ids, n_
 # Decoder self-attention → image patches
 # ---------------------------------------------------------------------------
 
-def _extract_decoder_image_attention(
-    model,
-    processor,
+def extract_decoder_image_attention(
     sequences: torch.Tensor,
     attentions: Tuple[Tuple[torch.Tensor, ...], ...],
+    image_token_id: int,
+    tokenizer,
     h_patches: int,
     w_patches: int,
     n_show: int = 8,
@@ -139,9 +139,8 @@ def _extract_decoder_image_attention(
     if attentions is None or len(attentions) == 0:
         return None, [], [], []
 
-    img_tok = model._image_token_id
     seq0 = sequences[0]
-    img_positions = (seq0 == img_tok).nonzero(as_tuple=True)[0]
+    img_positions = (seq0 == image_token_id).nonzero(as_tuple=True)[0]
     n_img = img_positions.numel()
     expected = h_patches * w_patches
     if n_img != expected:
@@ -172,7 +171,6 @@ def _extract_decoder_image_attention(
 
     # Token labels and a "valid" mask that drops pure-whitespace / special tokens.
     gen_token_ids = seq0[prefill_len: prefill_len + num_gen]
-    tokenizer = getattr(processor, "tokenizer", processor)
     special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
     token_strs: List[str] = []
     valid_indices: List[int] = []
@@ -396,8 +394,15 @@ def visualize_single(
     per_token_maps: List[np.ndarray] = []
     per_token_labels: List[str] = []
     if capture_decoder and decoder_attentions is not None:
-        decoder_mean, per_token_maps, per_token_labels, _ = _extract_decoder_image_attention(
-            model, processor, generated_ids, decoder_attentions,
+        base = getattr(model, "base_model", model)
+        img_tok = getattr(model, "_image_token_id", None) or getattr(
+            base, "_image_token_id", None
+        ) or getattr(getattr(base, "config", None), "image_token_id", None)
+        if img_tok is None:
+            raise RuntimeError("Could not resolve image token id for decoder attention visualization.")
+        tokenizer = getattr(processor, "tokenizer", processor)
+        decoder_mean, per_token_maps, per_token_labels, _ = extract_decoder_image_attention(
+            generated_ids, decoder_attentions, img_tok, tokenizer,
             h_merged, w_merged, n_show=n_show,
         )
 

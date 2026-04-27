@@ -1,0 +1,9 @@
+# @package _global_
+# Stage 1 — grounding. Qwen2.5-VL. Balanced no-GRIT mix (recommended first run).
+defaults:
+  - override /backend: qwen25vl
+  - override /stage: stage1
+  - override /stage1_datasets: no_grit
+
+wandb_run_name: s1_qwen
+experiment_name: s1_qwen

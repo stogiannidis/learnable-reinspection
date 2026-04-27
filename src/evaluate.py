@@ -75,13 +75,14 @@ warnings.filterwarnings("ignore", message=".*not a valid argument for this proce
 
 BENCHMARK_CONFIGS = {
     "vsr": {"data_file": "vsr/test.jsonl", "image_root": "vsr/images"},
-    "whatsup": {"data_file": "whatsup/test.json", "image_root": "whatsup/images"},
     "gqa_spatial": {"data_file": "gqa_spatial/test.json", "image_root": "gqa_spatial/images"},
-    "spatialbench": {"data_file": "spatialbench/test.json", "image_root": "spatialbench/images"},
+    "whatsup": {"data_file": "whatsup/test.json", "image_root": "whatsup/images"},
     "3dsrbench": {"data_file": "3dsrbench/test.json", "image_root": "3dsrbench/images"},
     "mindcube": {"data_file": "mindcube/test.json", "image_root": "mindcube/images"},
     "blink": {"data_file": "blink/test.json", "image_root": "blink/images"},
     "srbench": {"data_file": "srbench/test.json", "image_root": "srbench/images"},
+    "qspatial": {"data_file": "qspatial/test.json", "image_root": "qspatial/images"},
+    "embspatial": {"data_file": "embspatial/test.json", "image_root": "embspatial/images"},
 }
 
 # tqdm refresh and explicit acc line (both avoid per-instance log spam when tee'd to a file).

@@ -45,8 +45,9 @@ class ReInspectionConfig:
     output_file: str = "eval_results.json"
     benchmarks: List[str] = field(
         default_factory=lambda: [
-            "vsr", "gqa_spatial",
+            "vsr", "gqa_spatial", "whatsup",
             "3dsrbench", "mindcube", "blink", "srbench",
+            "qspatial", "embspatial",
         ]
     )
     eval_condition: str = "reinspection"
@@ -78,7 +79,7 @@ class ReInspectionConfig:
     lora_alpha: int = 32
     lora_dropout: float = 0.05
     lora_target_modules: List[str] = field(
-        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"]
     )
 
     # ------------------------------------------------------------------ #
@@ -92,21 +93,28 @@ class ReInspectionConfig:
     stage1_grad_accum: int = 8
     stage1_warmup_ratio: float = 0.03
     stage1_warmup_steps: Optional[int] = None
+    # ---- Stage 1 auxiliary losses (each independently toggleable) ----
+    # Attention KL between bottleneck attn_vis and target patch distribution.
+    stage1_use_attn_loss: bool = True
     stage1_attn_loss_weight: float = 1.0
-    stage1_train_projector: bool = False
-    stage1_attn_loss_type: str = "focal"
-    stage1_aux_loss: str = "both"  # "attn" | "grounding" | "both"
-    stage1_grounding_loss_weight: float = 5.0
-    stage1_grounding_l1_weight: float = 5.0
-    stage1_grounding_giou_weight: float = 2.0
+    # Box regression head: L1 + GIoU.
+    stage1_use_grounding_loss: bool = True
+    stage1_grounding_loss_weight: float = 2.0
+    stage1_grounding_l1_weight: float = 2.0
+    stage1_grounding_giou_weight: float = 1.0
     stage1_grounding_warmup_steps: int = 100
+    # Symmetric query–text InfoNCE in bottleneck space.
+    stage1_use_query_text_infonce: bool = False
+    stage1_query_text_infonce_weight: float = 0.1
+    stage1_query_text_infonce_temperature: float = 0.07
+    stage1_train_projector: bool = False
 
     # ------------------------------------------------------------------ #
     # Stage 2                                                              #
     # ------------------------------------------------------------------ #
     stage2_lr_module: float = 5e-5
     stage2_lr_lora: float = 2e-5
-    stage2_epochs: int = 10
+    stage2_epochs: int = 6
     stage2_batch_size: int = 4
     stage2_grad_accum: int = 8
     stage2_warmup_ratio: float = 0.03

@@ -25,7 +25,6 @@ stage1_grad_accum: 16
 stage1_warmup_ratio: 0.03
 stage1_attn_loss_weight: 0.4
 stage1_train_projector: false
-stage1_attn_loss_type: "kl"
 
 # Image processing
 max_pixels: 1003520  # 1280 * 28 * 28

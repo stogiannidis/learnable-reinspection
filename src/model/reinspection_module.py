@@ -183,10 +183,11 @@ class ReInspectionModule(nn.Module):
             need_weights: Whether to materialize attention distributions.
 
         Returns:
-            Tuple ``(R, A_task, A_vis, R_r)`` where ``R`` is the residual in
-            ``d_model`` to add into the LM stream, ``A_*`` are mean-pooled
-            attention maps per head (or ``None``), and ``R_r`` is the bottleneck
-            representation ``(B, n_queries, d_bottleneck)`` before up-projection.
+            Tuple ``(R, A_task, A_vis, R_r, Q_task, T_down)`` where ``R`` is the
+            residual in ``d_model``, ``A_*`` are mean-pooled attention maps (or
+            ``None``), ``R_r`` is the full bottleneck state before up-projection,
+            ``Q_task`` is the query tensor after text interaction (before vision
+            cross-attn), and ``T_down`` is text in bottleneck width ``(B, S_t, d_r)``.
         """
         if V_mask is None:
             V_mask = vision_mask
@@ -224,7 +225,8 @@ class ReInspectionModule(nn.Module):
 
         A_task_out = A_task.mean(dim=1) if A_task is not None else None
         A_vis_out = A_vis.mean(dim=1) if A_vis is not None else None
-        return R, A_task_out, A_vis_out, R_r
+        # Q_task: queries after text cross-attn + FFN, before vision (for query–text contrastive).
+        return R, A_task_out, A_vis_out, R_r, Q_task, T_down
 
     def count_parameters(self):
         """Return the number of trainable scalar parameters in this module."""

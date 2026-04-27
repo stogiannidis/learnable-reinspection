@@ -393,7 +393,7 @@ class Gemma4WithReInspection(nn.Module):
             attention_mask=attention_mask,
         )
 
-        R, A_task, A_vis, R_r = self.reinspection(
+        R, A_task, A_vis, R_r, Q_task, T_down = self.reinspection(
             V, T, V_mask=V_mask, T_mask=T_mask, need_weights=True,
         )
 
@@ -412,6 +412,9 @@ class Gemma4WithReInspection(nn.Module):
             "A_task": A_task,
             "A_vis": A_vis,
             "R_bottleneck": R_r,
+            "Q_task": Q_task,
+            "T_down": T_down,
+            "T_mask": T_mask,
         }
 
     # ------------------------------------------------------------------
@@ -432,6 +435,7 @@ class Gemma4WithReInspection(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: int = 0,
         return_attn_maps: bool = False,
+        return_query_text_tensors: bool = False,
         **kwargs,
     ) -> ReInspectionOutput:
         prepared = self._prepare_reinspection_inputs(
@@ -478,6 +482,9 @@ class Gemma4WithReInspection(nn.Module):
             attn_task=prepared["A_task"] if return_attn_maps else None,
             attn_vis=prepared["A_vis"] if return_attn_maps else None,
             R_bottleneck=prepared["R_bottleneck"] if return_attn_maps else None,
+            Q_text_bottleneck=prepared["Q_task"] if return_query_text_tensors else None,
+            text_bottleneck=prepared["T_down"] if return_query_text_tensors else None,
+            text_bottleneck_mask=prepared["T_mask"] if return_query_text_tensors else None,
         )
 
     def get_attention_maps(self):

@@ -4,7 +4,7 @@ stage: 2
 checkpoint_dir: models/internvl3/grounding/stage2/epoch_1
 lora_checkpoint_dir: null
 output_file: outputs/internvl3/eval_grounding_results.json
-benchmarks: [vsr, gqa_spatial, 3dsrbench, mindcube, blink, srbench]
+benchmarks: [vsr, gqa_spatial, whatsup, 3dsrbench, mindcube, blink, srbench, qspatial, embspatial]
 eval_condition: reinspection
 eval_compare: true
 max_samples: -1

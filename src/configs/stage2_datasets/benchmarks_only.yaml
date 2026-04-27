@@ -1,0 +1,5 @@
+# @package _global_
+# Real-data spatial benchmarks, no synthetic CLEVR / VG-derived data.
+stage2_dataset_names:
+  - vsr
+  - gqa_spatial

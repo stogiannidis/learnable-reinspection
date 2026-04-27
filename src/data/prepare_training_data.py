@@ -256,11 +256,19 @@ def prepare_grefcoco(
     )
     if not snapshots:
         print("  FudanCVL/gRefCOCO not in HF cache. Downloading ...")
+        # Use snapshot_download instead of load_dataset: the parquet split has
+        # a mixed-type `annotations[].segmentation` column (polygon arrays vs
+        # RLE dicts) that makes pyarrow's JSON->Arrow conversion fail. We only
+        # need the raw grefs(unc).json / instances.json files anyway.
         try:
-            from datasets import load_dataset
-            load_dataset("FudanCVL/gRefCOCO")
-        except Exception:
-            pass
+            from huggingface_hub import snapshot_download
+            snapshot_download(
+                repo_id="FudanCVL/gRefCOCO",
+                repo_type="dataset",
+                allow_patterns=["*.json"],
+            )
+        except Exception as e:
+            print(f"  snapshot_download failed: {e}")
         snapshots = glob.glob(
             os.path.expanduser(
                 "~/.cache/huggingface/hub/datasets--FudanCVL--gRefCOCO/snapshots/*/grefs(unc).json"

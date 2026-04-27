@@ -1,0 +1,8 @@
+# @package _global_
+stage2_dataset_names:
+  - vsr
+  - gqa_spatial
+  - clevr_spatial
+  - vg_spatial
+  - rel3d
+  - cambrian_spatial

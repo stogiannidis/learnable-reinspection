@@ -1,7 +1,7 @@
 """Distributed DeepSpeed training for re-inspection VLMs.
 
 Builds per-backend frozen-base + trainable-module setups, attaches optional
-stage-1 supervision (attention focal/KL, bounding-box head), runs the
+stage-1 supervision (attention KL, bounding-box head), runs the
 optimizer loop with cosine warmup scheduling, checkpointing, and optional
 Weights & Biases logging.
 """
@@ -29,8 +29,9 @@ from tqdm import tqdm
 from transformers import AutoProcessor
 
 from src.backends.hf_hub_utils import resolve_pretrained_local_path
-from src.model.attn_loss import compute_attn_loss_focal, compute_attn_loss_kl
+from src.model.attn_loss import compute_attn_loss_kl
 from src.model.bbox_head import BboxHead, compute_grounding_loss
+from src.model.query_text_infonce import compute_query_text_infonce_loss
 from src.config import ReInspectionConfig
 from src.data.refcoco import RefCOCODataset
 from src.data.spatial_dataset import build_spatial_dataset
@@ -377,7 +378,7 @@ def _setup_model_intern_stage1(config: ReInspectionConfig, processor):
     for parameter in model.reinspection.parameters():
         parameter.requires_grad = True
     optim_groups = [{"params": list(model.reinspection.parameters()), "lr": config.stage1_lr_module}]
-    if config.stage1_aux_loss in ("grounding", "both"):
+    if config.stage1_use_grounding_loss:
         _attach_bbox_head(model, config)
         optim_groups.append({"params": list(model.bbox_head.parameters()), "lr": config.stage1_lr_module})
     if config.stage1_train_projector:
@@ -589,6 +590,7 @@ def _run_validation(
     is_stage1: bool,
     use_attn: bool,
     use_grounding: bool,
+    use_qt_infonce: bool,
     config: ReInspectionConfig,
     device,
 ) -> dict:
@@ -604,6 +606,7 @@ def _run_validation(
     ce_sum = torch.zeros((), device=device)
     attn_sum = torch.zeros((), device=device)
     ground_sum = torch.zeros((), device=device)
+    qt_sum = torch.zeros((), device=device)
     total_sum = torch.zeros((), device=device)
     n_batches = torch.zeros((), device=device)
 
@@ -611,7 +614,11 @@ def _run_validation(
         with torch.inference_mode():
             for batch in val_loader:
                 batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                outputs = ds_engine(**_train_forward_kwargs(batch, backend, is_stage1))
+                outputs = ds_engine(
+                    **_train_forward_kwargs(
+                        batch, backend, is_stage1, return_query_text_tensors=use_qt_infonce
+                    )
+                )
 
                 ce_loss = outputs.loss
                 if ce_loss is None:
@@ -619,16 +626,24 @@ def _run_validation(
 
                 attn_loss = torch.zeros((), device=device)
                 grounding_loss = torch.zeros((), device=device)
+                qt_loss = torch.zeros((), device=device)
                 if use_attn:
                     attn_loss = _stage1_attn_loss(config, outputs, batch, device)
                 if use_grounding:
                     grounding_loss = _stage1_grounding_loss(
                         config, ds_engine, outputs, batch, device, global_step=10**9
                     )
+                if use_qt_infonce:
+                    qt_loss = _stage1_query_text_infonce_loss(config, outputs, device)
 
                 loss = ce_loss \
                     + (config.stage1_attn_loss_weight * attn_loss if use_attn else 0.0) \
-                    + (config.stage1_grounding_loss_weight * grounding_loss if use_grounding else 0.0)
+                    + (config.stage1_grounding_loss_weight * grounding_loss if use_grounding else 0.0) \
+                    + (
+                        config.stage1_query_text_infonce_weight * qt_loss
+                        if use_qt_infonce
+                        else 0.0
+                    )
 
                 _finite = torch.tensor(float(torch.isfinite(loss)), device=device)
                 if dist.is_initialized():
@@ -639,22 +654,24 @@ def _run_validation(
                 ce_sum = ce_sum + ce_loss.detach()
                 attn_sum = attn_sum + attn_loss.detach()
                 ground_sum = ground_sum + grounding_loss.detach()
+                qt_sum = qt_sum + qt_loss.detach()
                 total_sum = total_sum + loss.detach()
                 n_batches = n_batches + 1
     finally:
         if was_training:
             ds_engine.train()
 
-    packed = torch.stack([ce_sum, attn_sum, ground_sum, total_sum, n_batches])
+    packed = torch.stack([ce_sum, attn_sum, ground_sum, qt_sum, total_sum, n_batches])
     if dist.is_initialized():
         dist.all_reduce(packed, op=dist.ReduceOp.SUM)
-    ce_s, attn_s, ground_s, total_s, n = packed.tolist()
+    ce_s, attn_s, ground_s, qt_s, total_s, n = packed.tolist()
     denom = max(n, 1.0)
     return {
         "loss": total_s / denom,
         "ce_loss": ce_s / denom,
         "attn_loss": attn_s / denom,
         "grounding_loss": ground_s / denom,
+        "query_text_infonce_loss": qt_s / denom,
         "num_batches": int(n),
     }
 
@@ -744,13 +761,16 @@ def _init_deepspeed(
     return engine, optimizer
 
 
-def _train_forward_kwargs(batch: dict, backend: str, is_stage1: bool) -> dict:
+def _train_forward_kwargs(
+    batch: dict, backend: str, is_stage1: bool, return_query_text_tensors: bool = False
+) -> dict:
     fwd = {
         "input_ids": batch["input_ids"],
         "attention_mask": batch["attention_mask"],
         "pixel_values": batch.get("pixel_values"),
         "labels": batch["labels"],
         "return_attn_maps": is_stage1,
+        "return_query_text_tensors": return_query_text_tensors,
     }
     if backend == "qwen25vl":
         fwd["image_grid_thw"] = batch.get("image_grid_thw")
@@ -775,13 +795,22 @@ def _stage1_attn_loss(config: ReInspectionConfig, outputs, batch, device):
             )
             _attn_target_vis_mismatch_logged = True
         target = F.pad(target[:, :n_v], (0, max(0, n_v - target.shape[-1])))
-    if config.stage1_attn_loss_type == "kl":
-        return compute_attn_loss_kl(outputs.attn_vis, target)
-    return compute_attn_loss_focal(
-        outputs.attn_vis,
-        target,
-        image_grid_thw=batch.get("image_grid_thw"),
-        n_queries=config.n_queries,
+    return compute_attn_loss_kl(outputs.attn_vis, target)
+
+
+def _stage1_query_text_infonce_loss(config: ReInspectionConfig, outputs, device):
+    """Symmetric in-batch InfoNCE between pooled text-path queries and text tokens."""
+    if (
+        outputs.Q_text_bottleneck is None
+        or outputs.text_bottleneck is None
+        or outputs.text_bottleneck_mask is None
+    ):
+        return torch.zeros((), device=device)
+    return compute_query_text_infonce_loss(
+        outputs.Q_text_bottleneck,
+        outputs.text_bottleneck,
+        outputs.text_bottleneck_mask,
+        temperature=config.stage1_query_text_infonce_temperature,
     )
 
 
@@ -1033,8 +1062,9 @@ def run_training(config: ReInspectionConfig) -> None:
         "dataset/num_workers": num_workers,
     }, step=0)
 
-    use_attn = is_stage1 and config.stage1_aux_loss in ("attn", "both")
-    use_grounding = is_stage1 and config.stage1_aux_loss in ("grounding", "both")
+    use_attn = is_stage1 and config.stage1_use_attn_loss
+    use_grounding = is_stage1 and config.stage1_use_grounding_loss
+    use_qt_infonce = is_stage1 and config.stage1_use_query_text_infonce
 
     model.train()
     global_step = 0
@@ -1054,6 +1084,7 @@ def run_training(config: ReInspectionConfig) -> None:
         epoch_ce = 0.0
         epoch_attn = 0.0
         epoch_grounding = 0.0
+        epoch_qt_infonce = 0.0
         epoch_stage1_supervision = 0.0
 
         pbar = tqdm(
@@ -1067,7 +1098,11 @@ def run_training(config: ReInspectionConfig) -> None:
         for step, batch in enumerate(pbar):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
-            outputs = model(**_train_forward_kwargs(batch, backend, is_stage1))
+            outputs = model(
+                **_train_forward_kwargs(
+                    batch, backend, is_stage1, return_query_text_tensors=use_qt_infonce
+                )
+            )
 
             ce_loss = outputs.loss
             if ce_loss is None:
@@ -1077,14 +1112,22 @@ def run_training(config: ReInspectionConfig) -> None:
 
             attn_loss = torch.zeros((), device=device)
             grounding_loss = torch.zeros((), device=device)
+            qt_infonce_loss = torch.zeros((), device=device)
             if use_attn:
                 attn_loss = _stage1_attn_loss(config, outputs, batch, device)
             if use_grounding:
                 grounding_loss = _stage1_grounding_loss(config, model, outputs, batch, device, global_step)
+            if use_qt_infonce:
+                qt_infonce_loss = _stage1_query_text_infonce_loss(config, outputs, device)
 
             loss = ce_loss \
                 + (config.stage1_attn_loss_weight * attn_loss if use_attn else 0.0) \
-                + (config.stage1_grounding_loss_weight * grounding_loss if use_grounding else 0.0)
+                + (config.stage1_grounding_loss_weight * grounding_loss if use_grounding else 0.0) \
+                + (
+                    config.stage1_query_text_infonce_weight * qt_infonce_loss
+                    if use_qt_infonce
+                    else 0.0
+                )
             micro_loss = loss / grad_accum
 
             _finite = torch.tensor(float(torch.isfinite(loss)), device=device)
@@ -1095,7 +1138,8 @@ def run_training(config: ReInspectionConfig) -> None:
                     tqdm.write(
                         f"[WARNING] Non-finite loss={loss.item():.4f} "
                         f"(ce={ce_loss.item():.4f}, attn={attn_loss.item():.4f}, "
-                        f"grounding={grounding_loss.item():.4f}) "
+                        f"grounding={grounding_loss.item():.4f}, "
+                        f"qt_infonce={qt_infonce_loss.item():.4f}) "
                         f"at global_step={global_step}, skipping batch"
                     )
                 global_step += 1
@@ -1113,6 +1157,7 @@ def run_training(config: ReInspectionConfig) -> None:
             epoch_ce += ce_loss.item()
             epoch_attn += attn_loss.item()
             epoch_grounding += grounding_loss.item()
+            epoch_qt_infonce += qt_infonce_loss.item()
             global_step += 1
 
             lr = scheduler.get_last_lr()[0] if update_step > 0 else optimizer.param_groups[0]["lr"]
@@ -1125,12 +1170,16 @@ def run_training(config: ReInspectionConfig) -> None:
                 metrics[f"{pfx}/train/attn_loss"] = attn_loss.item()
             if use_grounding:
                 metrics[f"{pfx}/train/grounding_loss"] = grounding_loss.item()
-            if is_stage1 and (use_attn or use_grounding):
+            if use_qt_infonce:
+                metrics[f"{pfx}/train/query_text_infonce_loss"] = qt_infonce_loss.item()
+            if is_stage1 and (use_attn or use_grounding or use_qt_infonce):
                 stage1_sup = 0.0
                 if use_attn:
                     stage1_sup += config.stage1_attn_loss_weight * attn_loss.item()
                 if use_grounding:
                     stage1_sup += config.stage1_grounding_loss_weight * grounding_loss.item()
+                if use_qt_infonce:
+                    stage1_sup += config.stage1_query_text_infonce_weight * qt_infonce_loss.item()
                 metrics[f"{pfx}/train/stage1_supervision_loss"] = stage1_sup
                 epoch_stage1_supervision += stage1_sup
 
@@ -1150,6 +1199,8 @@ def run_training(config: ReInspectionConfig) -> None:
                 postfix["attn"] = f"{attn_loss.item():.4f}"
             if use_grounding:
                 postfix["gnd"] = f"{grounding_loss.item():.4f}"
+            if use_qt_infonce:
+                postfix["qt_nce"] = f"{qt_infonce_loss.item():.4f}"
             if grad_norm is not None:
                 postfix["gnorm"] = f"{grad_norm:.2f}"
             pbar.set_postfix(postfix)
@@ -1167,7 +1218,9 @@ def run_training(config: ReInspectionConfig) -> None:
             summary[f"{pfx}/epoch/attn_loss"] = epoch_attn / num_steps
         if use_grounding:
             summary[f"{pfx}/epoch/grounding_loss"] = epoch_grounding / num_steps
-        if is_stage1 and (use_attn or use_grounding):
+        if use_qt_infonce:
+            summary[f"{pfx}/epoch/query_text_infonce_loss"] = epoch_qt_infonce / num_steps
+        if is_stage1 and (use_attn or use_grounding or use_qt_infonce):
             summary[f"{pfx}/epoch/stage1_supervision_loss"] = epoch_stage1_supervision / num_steps
         _log_wandb(summary, global_step)
 
@@ -1176,6 +1229,8 @@ def run_training(config: ReInspectionConfig) -> None:
             aux_msg += f" attn={epoch_attn / num_steps:.4f}"
         if use_grounding:
             aux_msg += f" ground={epoch_grounding / num_steps:.4f}"
+        if use_qt_infonce:
+            aux_msg += f" qt_nce={epoch_qt_infonce / num_steps:.4f}"
         if is_main_process():
             tqdm.write(
                 f"Epoch {epoch + 1}/{n_epochs}: loss={avg_epoch_loss:.4f} ce={epoch_ce / num_steps:.4f}"
@@ -1186,7 +1241,7 @@ def run_training(config: ReInspectionConfig) -> None:
         if val_loader is not None:
             val_metrics = _run_validation(
                 ds_engine, val_loader, backend, is_stage1,
-                use_attn, use_grounding, config, device,
+                use_attn, use_grounding, use_qt_infonce, config, device,
             )
             val_loss = val_metrics["loss"]
             val_summary = {
@@ -1199,12 +1254,16 @@ def run_training(config: ReInspectionConfig) -> None:
                 val_summary[f"{pfx}/val/attn_loss"] = val_metrics["attn_loss"]
             if use_grounding:
                 val_summary[f"{pfx}/val/grounding_loss"] = val_metrics["grounding_loss"]
-            if is_stage1 and (use_attn or use_grounding):
+            if use_qt_infonce:
+                val_summary[f"{pfx}/val/query_text_infonce_loss"] = val_metrics["query_text_infonce_loss"]
+            if is_stage1 and (use_attn or use_grounding or use_qt_infonce):
                 sup = 0.0
                 if use_attn:
                     sup += config.stage1_attn_loss_weight * val_metrics["attn_loss"]
                 if use_grounding:
                     sup += config.stage1_grounding_loss_weight * val_metrics["grounding_loss"]
+                if use_qt_infonce:
+                    sup += config.stage1_query_text_infonce_weight * val_metrics["query_text_infonce_loss"]
                 val_summary[f"{pfx}/val/stage1_supervision_loss"] = sup
             _log_wandb(val_summary, global_step)
             if is_main_process():

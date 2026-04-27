@@ -1,0 +1,11 @@
+# @package _global_
+# Stage 2 — spatial VQA. Qwen2.5-VL. Full mix (adds rel3d, cambrian_spatial).
+# Edit `stage1_checkpoint` to match the Stage-1 epoch you want to use.
+defaults:
+  - override /backend: qwen25vl
+  - override /stage: stage2
+  - override /stage2_datasets: all
+
+stage1_checkpoint: models/qwen25vl/stage1/epoch_4/reinspection_module.pt
+wandb_run_name: s2_qwen_full
+experiment_name: s2_qwen_full

@@ -20,7 +20,7 @@ from urllib.request import urlretrieve
 from PIL import Image
 from tqdm import tqdm
 
-ALL_BENCHMARKS = ["3dsrbench", "mindcube", "blink", "srbench"]
+ALL_BENCHMARKS = ["3dsrbench", "mindcube", "blink", "srbench", "qspatial", "embspatial"]
 
 
 def _ensure_dir(path: str) -> str:
@@ -459,6 +459,172 @@ def prepare_srbench(output_dir: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Q-Spatial-Bench                                                              #
+# --------------------------------------------------------------------------- #
+def prepare_qspatial(output_dir: str) -> None:
+    """Download andrewliao11/Q-Spatial-Bench-v1 and convert.
+
+    Free-form quantitative spatial reasoning (distance/height/width with a
+    reference object). Produces {image, question, answer} with the ground-truth
+    numeric value + unit joined as the answer string.
+    """
+    from datasets import load_dataset
+
+    print("\n=== Preparing Q-Spatial-Bench ===")
+    bench_dir = _ensure_dir(os.path.join(output_dir, "qspatial"))
+    img_dir = _ensure_dir(os.path.join(bench_dir, "images"))
+
+    repo_candidates = [
+        "andrewliao11/Q-Spatial-Bench-v1",
+        "andrewliao11/Q-Spatial-Bench",
+    ]
+    ds = None
+    for repo in repo_candidates:
+        try:
+            ds_dict = load_dataset(repo)
+            split_name = "test" if "test" in ds_dict else list(ds_dict.keys())[0]
+            ds = ds_dict[split_name]
+            print(f"  Loaded {repo} split={split_name} ({len(ds)} rows)")
+            break
+        except Exception as e:
+            print(f"  Could not load {repo}: {e}")
+    if ds is None:
+        print("  Skipping Q-Spatial-Bench.")
+        return
+
+    samples = []
+    skipped = 0
+    for i, row in enumerate(tqdm(ds, desc="Q-Spatial-Bench")):
+        img = row.get("image") or row.get("image_1") or row.get("img")
+        question = row.get("question") or row.get("question_raw") or ""
+        answer_value = row.get("answer_value", row.get("answer"))
+        answer_unit = row.get("answer_unit", "")
+
+        if img is None or not question or answer_value is None:
+            skipped += 1
+            continue
+
+        image_filename = f"qspatial_{i:05d}.jpg"
+        image_path = os.path.join(img_dir, image_filename)
+        if not os.path.exists(image_path):
+            if isinstance(img, Image.Image):
+                img.convert("RGB").save(image_path)
+            elif isinstance(img, str) and os.path.exists(img):
+                Image.open(img).convert("RGB").save(image_path)
+            else:
+                skipped += 1
+                continue
+
+        answer_str = str(answer_value)
+        if answer_unit:
+            answer_str = f"{answer_str} {answer_unit}".strip()
+
+        samples.append({
+            "image": image_filename,
+            "question": question,
+            "answer": answer_str,
+            "split": "test",
+            "category": row.get("question_type", row.get("category", "quantitative")),
+            "benchmark": "qspatial",
+        })
+
+    print(f"  Skipped {skipped} rows (missing image/question/answer)")
+    _save_json(samples, os.path.join(bench_dir, "test.json"))
+
+
+# --------------------------------------------------------------------------- #
+# EmbSpatial-Bench                                                             #
+# --------------------------------------------------------------------------- #
+def prepare_embspatial(output_dir: str) -> None:
+    """Download mengfeidu/EmbSpatial-Bench and convert.
+
+    Embodied egocentric spatial MCQ (above/below/left/right/close/far)
+    over indoor scenes. Produces {image, question, answer=letter}.
+    """
+    from datasets import load_dataset
+
+    print("\n=== Preparing EmbSpatial-Bench ===")
+    bench_dir = _ensure_dir(os.path.join(output_dir, "embspatial"))
+    img_dir = _ensure_dir(os.path.join(bench_dir, "images"))
+
+    repo_candidates = [
+        "mengfeidu/EmbSpatial-Bench",
+        "MengfeiDu/EmbSpatial-Bench",
+    ]
+    ds = None
+    for repo in repo_candidates:
+        try:
+            ds_dict = load_dataset(repo)
+            split_name = "test" if "test" in ds_dict else list(ds_dict.keys())[0]
+            ds = ds_dict[split_name]
+            print(f"  Loaded {repo} split={split_name} ({len(ds)} rows)")
+            break
+        except Exception as e:
+            print(f"  Could not load {repo}: {e}")
+    if ds is None:
+        print("  Skipping EmbSpatial-Bench.")
+        return
+
+    samples = []
+    skipped = 0
+    for i, row in enumerate(tqdm(ds, desc="EmbSpatial-Bench")):
+        img = row.get("image") or row.get("img")
+        question_text = row.get("question", "")
+        answer = row.get("answer", "")
+
+        # Options may be under A/B/C/D columns, or under a single "options"/"choices" list.
+        choices: dict[str, str] = {}
+        if any(k in row for k in ("A", "B", "C", "D")):
+            for letter in ["A", "B", "C", "D"]:
+                val = row.get(letter)
+                if val is not None and str(val).strip():
+                    choices[letter] = str(val).strip()
+        else:
+            opts = row.get("options") or row.get("choices")
+            if isinstance(opts, (list, tuple)):
+                for letter, val in zip(["A", "B", "C", "D"], opts):
+                    if val is not None and str(val).strip():
+                        choices[letter] = str(val).strip()
+
+        if img is None or not question_text or not choices or answer == "":
+            skipped += 1
+            continue
+
+        # Normalize answer to a letter.
+        ans_str = str(answer).strip()
+        if ans_str not in choices:
+            # Might be the answer *text* — map it back to a letter.
+            match = next((L for L, v in choices.items() if v == ans_str), None)
+            if match is None:
+                skipped += 1
+                continue
+            ans_str = match
+
+        image_filename = f"embspatial_{i:05d}.jpg"
+        image_path = os.path.join(img_dir, image_filename)
+        if not os.path.exists(image_path):
+            if isinstance(img, Image.Image):
+                img.convert("RGB").save(image_path)
+            elif isinstance(img, str) and os.path.exists(img):
+                Image.open(img).convert("RGB").save(image_path)
+            else:
+                skipped += 1
+                continue
+
+        samples.append({
+            "image": image_filename,
+            "question": _format_mcq(question_text, choices),
+            "answer": ans_str,
+            "split": "test",
+            "category": row.get("category", row.get("relation", "embodied")),
+            "benchmark": "embspatial",
+        })
+
+    print(f"  Skipped {skipped} rows (missing image/question/options/answer)")
+    _save_json(samples, os.path.join(bench_dir, "test.json"))
+
+
+# --------------------------------------------------------------------------- #
 # CLI                                                                          #
 # --------------------------------------------------------------------------- #
 PREPARE_FNS = {
@@ -466,6 +632,8 @@ PREPARE_FNS = {
     "mindcube": prepare_mindcube,
     "blink": prepare_blink,
     "srbench": prepare_srbench,
+    "qspatial": prepare_qspatial,
+    "embspatial": prepare_embspatial,
 }
 
 

@@ -1,0 +1,9 @@
+# @package _global_
+# Stage 1 — grounding. InternVL3. Balanced no-GRIT mix.
+defaults:
+  - override /backend: internvl3
+  - override /stage: stage1
+  - override /stage1_datasets: no_grit
+
+wandb_run_name: s1_internvl
+experiment_name: s1_internvl

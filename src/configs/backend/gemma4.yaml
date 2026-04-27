@@ -19,9 +19,16 @@ stage1_epochs: 5
 stage1_batch_size: 8
 stage1_grad_accum: 16
 stage1_warmup_ratio: 0.03
+stage1_use_attn_loss: true
 stage1_attn_loss_weight: 0.5
-stage1_attn_loss_type: focal
-stage1_aux_loss: both  # attn | grounding | both
+stage1_attn_loss_type: kl
+stage1_use_grounding_loss: true
+stage1_grounding_loss_weight: 2.0
+stage1_grounding_l1_weight: 2.0
+stage1_grounding_giou_weight: 1.0
+stage1_use_query_text_infonce: false
+stage1_query_text_infonce_weight: 0.1
+stage1_query_text_infonce_temperature: 0.07
 
 # Stage 2
 stage2_lr_module: 5.0e-5
@@ -32,7 +39,7 @@ stage2_grad_accum: 16
 stage2_warmup_ratio: 0.03
 lora_r: 16
 lora_alpha: 32
-lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
 
 # Data
 max_pixels: 1003520

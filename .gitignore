@@ -1,3 +1,6 @@
+# Cursor IDE
+.cursor/
+
 # Secrets and local env
 .env
 .env.*
