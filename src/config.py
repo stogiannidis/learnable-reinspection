@@ -131,6 +131,8 @@ class ReInspectionConfig:
     val_split_ratio: float = 0.05
     val_batch_size: Optional[int] = None
     stage1_dataset_names: Optional[List[str]] = None  # None → registry.stage1_defaults()
+    # Extra stage-1 datasets appended to the base list (e.g. [grit, grefcoco]).
+    stage1_extra_datasets: Optional[List[str]] = None
     stage2_dataset_names: Optional[List[str]] = None  # None → registry.stage2_defaults()
 
     # ------------------------------------------------------------------ #

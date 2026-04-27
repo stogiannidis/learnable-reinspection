@@ -544,7 +544,11 @@ def _build_dataset(
     processor,
 ):
     if stage == 1:
-        stage1_names = config.stage1_dataset_names or stage1_defaults()
+        stage1_names = list(config.stage1_dataset_names or stage1_defaults())
+        if config.stage1_extra_datasets:
+            for name in config.stage1_extra_datasets:
+                if name not in stage1_names:
+                    stage1_names.append(name)
         return RefCOCODataset(
             data_root=data_root,
             processor=processor,
