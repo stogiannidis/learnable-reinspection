@@ -29,6 +29,11 @@ spec:
             export HF_HOME=/data/Huggingface
             export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
             export WANDB_MODE=offline
+            export PYTHONDONTWRITEBYTECODE=1
+
+            # Stale .pyc on the shared NFS can mask newly added symbols
+            # (e.g. ImportError: cannot import name 'load_processor').
+            find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
             # Frozen-only motivation across all three backends.
             for BACKEND in internvl3 qwen25vl gemma4; do

@@ -723,6 +723,7 @@ def _run_validation(
     finally:
         if was_training:
             ds_engine.train()
+        _drain_zero3_prefetches(ds_engine)
 
     packed = torch.stack([ce_sum, attn_sum, ground_sum, qt_sum, roi_sum, total_sum, n_batches])
     if dist.is_initialized():
@@ -740,8 +741,35 @@ def _run_validation(
     }
 
 
+def _drain_zero3_prefetches(ds_engine) -> None:
+    """Drain any in-flight ZeRO-3 async all-gathers before opening
+    GatheredParameters. Without a backward pass (e.g. after eval), prefetched
+    params can stay INFLIGHT and trip an assert in partition_parameters.py."""
+    torch.cuda.synchronize()
+    if dist.is_initialized():
+        dist.barrier()
+    for fn_name in ("empty_partition_cache",):
+        fn = getattr(ds_engine, fn_name, None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+            break
+        opt = getattr(ds_engine, "optimizer", None)
+        fn = getattr(opt, fn_name, None) if opt is not None else None
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+            break
+
+
 def _save_checkpoint(ds_engine, save_dir: str, save_lora: bool = False) -> None:
     import deepspeed
+
+    _drain_zero3_prefetches(ds_engine)
 
     if is_main_process():
         os.makedirs(save_dir, exist_ok=True)
