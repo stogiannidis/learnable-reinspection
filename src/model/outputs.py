@@ -43,3 +43,7 @@ class ReInspectionOutput(ModelOutput):
     Q_text_bottleneck: Optional[torch.FloatTensor] = None
     text_bottleneck: Optional[torch.FloatTensor] = None
     text_bottleneck_mask: Optional[torch.BoolTensor] = None
+    # Frozen vision hidden states fed to the re-inspection module, in d_model
+    # space, padded to ``(B, S_v, d_model)``. Used for ROI feature grounding.
+    vision_hidden_states: Optional[torch.FloatTensor] = None
+    vision_token_mask: Optional[torch.BoolTensor] = None

@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  generateName: reinspection-gemma4-stage2-
+  generateName: reinspection-internvl-stage1-smoke-
   namespace: eidf098ns
   labels:
     kueue.x-k8s.io/queue-name: eidf098ns-user-queue
@@ -12,10 +12,10 @@ spec:
   backoffLimit: 0
   template:
     metadata:
-      name: reinspection-gemma4-stage2
+      name: reinspection-internvl-stage1-smoke
     spec:
       containers:
-      - name: reinspection-gemma4-stage2
+      - name: reinspection-internvl-stage1-smoke
         image: stogian/l_reinspection:latest
         workingDir: /data/users/stogian/learnable-reinspection
         command:
@@ -24,15 +24,25 @@ spec:
           - |
             set -euo pipefail
             mkdir -p logs models
-            REINSPECTION_EXPERIMENT=s2_gemma4 REINSPECTION_EXPERIMENT_STAGE2= \
-              bash src/scripts/run_train.sh
+            export OMP_NUM_THREADS=4
+            export HYDRA_FULL_ERROR=1
+            export HF_HOME=/data/Huggingface
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+            export WANDB_MODE=offline
+            deepspeed --num_gpus=1 --module src.train \
+              +experiment=s1_internvl \
+              stage1_epochs=1 \
+              stage1_max_steps=200 \
+              wandb_run_name=s1_internvl_smoke \
+              experiment_name=s1_internvl_smoke \
+              2>&1 | tee logs/s1_internvl_smoke.log
         imagePullPolicy: Always
         env:
           - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
           - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
         resources:
-          requests: { cpu: 16, memory: "128Gi", nvidia.com/gpu: 4 }
-          limits:   { cpu: 16, memory: "128Gi", nvidia.com/gpu: 4 }
+          requests: { cpu: 16, memory: "64Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 16, memory: "64Gi", nvidia.com/gpu: 1 }
         volumeMounts:
           - { mountPath: /dev/shm, name: dshm }
           - { mountPath: /data,    name: nfs }
@@ -40,7 +50,7 @@ spec:
       securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
       volumes:
       - name: dshm
-        emptyDir: { medium: Memory, sizeLimit: "64Gi" }
+        emptyDir: { medium: Memory, sizeLimit: "32Gi" }
       - name: nfs
         nfs: { server: 10.24.6.66, path: / }
       nodeSelector:

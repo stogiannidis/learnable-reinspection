@@ -17,7 +17,7 @@ import platform
 import subprocess
 import sys
 from dataclasses import asdict
-from typing import Optional, Union
+from typing import Iterable, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -32,6 +32,7 @@ from src.backends.hf_hub_utils import resolve_pretrained_local_path
 from src.model.attn_loss import compute_attn_loss_kl
 from src.model.bbox_head import BboxHead, compute_grounding_loss
 from src.model.query_text_infonce import compute_query_text_infonce_loss
+from src.model.roi_feature_loss import ROIProjection, compute_roi_feature_loss
 from src.config import ReInspectionConfig
 from src.data.refcoco import RefCOCODataset
 from src.data.spatial_dataset import build_spatial_dataset
@@ -365,8 +366,12 @@ def _load_stage1_weights(model, checkpoint_path: str) -> None:
 
 def _attach_bbox_head(model, config: ReInspectionConfig) -> None:
     """Create and attach a BboxHead for Stage 1 grounding supervision."""
-    dtype = torch.bfloat16 if config.bf16 else torch.float32
-    model.bbox_head = BboxHead(config.d_bottleneck, dtype=dtype)
+    model.bbox_head = BboxHead(config.d_bottleneck, dtype=torch.float32)
+
+
+def _attach_roi_projection(model, config: ReInspectionConfig) -> None:
+    """Create and attach the ROI feature projection for Stage 1 grounding."""
+    model.roi_proj = ROIProjection(config.d_bottleneck, config.d_model, dtype=torch.float32)
 
 
 def _setup_model_intern_stage1(config: ReInspectionConfig, processor):
@@ -377,10 +382,31 @@ def _setup_model_intern_stage1(config: ReInspectionConfig, processor):
         parameter.requires_grad = False
     for parameter in model.reinspection.parameters():
         parameter.requires_grad = True
-    optim_groups = [{"params": list(model.reinspection.parameters()), "lr": config.stage1_lr_module}]
+    optim_groups = [
+        {
+            "params": list(model.reinspection.parameters()),
+            "lr": config.stage1_lr_module,
+            "name": "reinspection",
+        }
+    ]
     if config.stage1_use_grounding_loss:
         _attach_bbox_head(model, config)
-        optim_groups.append({"params": list(model.bbox_head.parameters()), "lr": config.stage1_lr_module})
+        optim_groups.append(
+            {
+                "params": list(model.bbox_head.parameters()),
+                "lr": config.stage1_lr_module,
+                "name": "bbox_head",
+            }
+        )
+    if config.stage1_use_roi_feature_loss:
+        _attach_roi_projection(model, config)
+        optim_groups.append(
+            {
+                "params": list(model.roi_proj.parameters()),
+                "lr": config.stage1_lr_module,
+                "name": "roi_proj",
+            }
+        )
     if config.stage1_train_projector:
         for parameter in model.base_model.model.multi_modal_projector.parameters():
             parameter.requires_grad = True
@@ -388,6 +414,7 @@ def _setup_model_intern_stage1(config: ReInspectionConfig, processor):
             {
                 "params": list(model.base_model.model.multi_modal_projector.parameters()),
                 "lr": config.stage1_lr_projector,
+                "name": "projector",
             }
         )
     optimizer = torch.optim.AdamW(optim_groups, weight_decay=0.01)
@@ -422,8 +449,8 @@ def _setup_model_intern_stage2(config: ReInspectionConfig, processor, stage1_che
     ]
     optimizer = torch.optim.AdamW(
         [
-            {"params": reinspection_params, "lr": config.stage2_lr_module},
-            {"params": lora_params, "lr": config.stage2_lr_lora},
+            {"params": reinspection_params, "lr": config.stage2_lr_module, "name": "reinspection"},
+            {"params": lora_params, "lr": config.stage2_lr_lora, "name": "lora"},
         ],
         weight_decay=0.01,
     )
@@ -440,11 +467,32 @@ def _setup_model_qwen25_stage1(config: ReInspectionConfig):
         param.requires_grad = False
     for param in model.reinspection.parameters():
         param.requires_grad = True
-    optimizer = torch.optim.AdamW(
-        model.reinspection.parameters(),
-        lr=config.stage1_lr_module,
-        weight_decay=0.01,
-    )
+    optim_groups = [
+        {
+            "params": list(model.reinspection.parameters()),
+            "lr": config.stage1_lr_module,
+            "name": "reinspection",
+        }
+    ]
+    if config.stage1_use_grounding_loss:
+        _attach_bbox_head(model, config)
+        optim_groups.append(
+            {
+                "params": list(model.bbox_head.parameters()),
+                "lr": config.stage1_lr_module,
+                "name": "bbox_head",
+            }
+        )
+    if config.stage1_use_roi_feature_loss:
+        _attach_roi_projection(model, config)
+        optim_groups.append(
+            {
+                "params": list(model.roi_proj.parameters()),
+                "lr": config.stage1_lr_module,
+                "name": "roi_proj",
+            }
+        )
+    optimizer = torch.optim.AdamW(optim_groups, weight_decay=0.01)
     return model, optimizer
 
 
@@ -474,8 +522,8 @@ def _setup_model_qwen25_stage2(config: ReInspectionConfig):
     lora_params = [p for _, p in model.base_model.named_parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
         [
-            {"params": reinspection_params, "lr": config.stage2_lr_module},
-            {"params": lora_params, "lr": config.stage2_lr_lora},
+            {"params": reinspection_params, "lr": config.stage2_lr_module, "name": "reinspection"},
+            {"params": lora_params, "lr": config.stage2_lr_lora, "name": "lora"},
         ],
         weight_decay=0.01,
     )
@@ -493,7 +541,7 @@ def _setup_model_gemma4_stage1(config: ReInspectionConfig, processor):
     for parameter in model.reinspection.parameters():
         parameter.requires_grad = True
     optimizer = torch.optim.AdamW(
-        model.reinspection.parameters(),
+        [{"params": list(model.reinspection.parameters()), "lr": config.stage1_lr_module, "name": "reinspection"}],
         lr=config.stage1_lr_module,
         weight_decay=0.01,
     )
@@ -528,8 +576,8 @@ def _setup_model_gemma4_stage2(config: ReInspectionConfig, processor, stage1_che
     ]
     optimizer = torch.optim.AdamW(
         [
-            {"params": reinspection_params, "lr": config.stage2_lr_module},
-            {"params": lora_params, "lr": config.stage2_lr_lora},
+            {"params": reinspection_params, "lr": config.stage2_lr_module, "name": "reinspection"},
+            {"params": lora_params, "lr": config.stage2_lr_lora, "name": "lora"},
         ],
         weight_decay=0.01,
     )
@@ -544,7 +592,11 @@ def _build_dataset(
     processor,
 ):
     if stage == 1:
-        stage1_names = config.stage1_dataset_names or stage1_defaults()
+        stage1_names = list(config.stage1_dataset_names or stage1_defaults())
+        if config.stage1_extra_datasets:
+            for name in config.stage1_extra_datasets:
+                if name not in stage1_names:
+                    stage1_names.append(name)
         return RefCOCODataset(
             data_root=data_root,
             processor=processor,
@@ -556,6 +608,7 @@ def _build_dataset(
             crop_to_patches=config.crop_to_patches_stage1,
             system_prompt=config.system_prompt,
             answer_ignore_index=config.answer_ignore_index,
+            coco_images_dir=config.coco_images_dir,
         )
     return build_spatial_dataset(
         data_root=data_root,
@@ -591,6 +644,8 @@ def _run_validation(
     use_attn: bool,
     use_grounding: bool,
     use_qt_infonce: bool,
+    use_roi_feat: bool,
+    use_lm_ce: bool,
     config: ReInspectionConfig,
     device,
 ) -> dict:
@@ -607,6 +662,7 @@ def _run_validation(
     attn_sum = torch.zeros((), device=device)
     ground_sum = torch.zeros((), device=device)
     qt_sum = torch.zeros((), device=device)
+    roi_sum = torch.zeros((), device=device)
     total_sum = torch.zeros((), device=device)
     n_batches = torch.zeros((), device=device)
 
@@ -616,7 +672,9 @@ def _run_validation(
                 batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
                 outputs = ds_engine(
                     **_train_forward_kwargs(
-                        batch, backend, is_stage1, return_query_text_tensors=use_qt_infonce
+                        batch, backend, is_stage1,
+                        return_query_text_tensors=use_qt_infonce,
+                        use_lm_ce=use_lm_ce,
                     )
                 )
 
@@ -627,6 +685,7 @@ def _run_validation(
                 attn_loss = torch.zeros((), device=device)
                 grounding_loss = torch.zeros((), device=device)
                 qt_loss = torch.zeros((), device=device)
+                roi_loss = torch.zeros((), device=device)
                 if use_attn:
                     attn_loss = _stage1_attn_loss(config, outputs, batch, device)
                 if use_grounding:
@@ -635,10 +694,13 @@ def _run_validation(
                     )
                 if use_qt_infonce:
                     qt_loss = _stage1_query_text_infonce_loss(config, outputs, device)
+                if use_roi_feat:
+                    roi_loss = _stage1_roi_feature_loss(config, ds_engine, outputs, batch, device)
 
-                loss = ce_loss \
+                loss = (ce_loss if use_lm_ce else torch.zeros((), device=device)) \
                     + (config.stage1_attn_loss_weight * attn_loss if use_attn else 0.0) \
                     + (config.stage1_grounding_loss_weight * grounding_loss if use_grounding else 0.0) \
+                    + (config.stage1_roi_feature_loss_weight * roi_loss if use_roi_feat else 0.0) \
                     + (
                         config.stage1_query_text_infonce_weight * qt_loss
                         if use_qt_infonce
@@ -655,16 +717,17 @@ def _run_validation(
                 attn_sum = attn_sum + attn_loss.detach()
                 ground_sum = ground_sum + grounding_loss.detach()
                 qt_sum = qt_sum + qt_loss.detach()
+                roi_sum = roi_sum + roi_loss.detach()
                 total_sum = total_sum + loss.detach()
                 n_batches = n_batches + 1
     finally:
         if was_training:
             ds_engine.train()
 
-    packed = torch.stack([ce_sum, attn_sum, ground_sum, qt_sum, total_sum, n_batches])
+    packed = torch.stack([ce_sum, attn_sum, ground_sum, qt_sum, roi_sum, total_sum, n_batches])
     if dist.is_initialized():
         dist.all_reduce(packed, op=dist.ReduceOp.SUM)
-    ce_s, attn_s, ground_s, qt_s, total_s, n = packed.tolist()
+    ce_s, attn_s, ground_s, qt_s, roi_s, total_s, n = packed.tolist()
     denom = max(n, 1.0)
     return {
         "loss": total_s / denom,
@@ -672,6 +735,7 @@ def _run_validation(
         "attn_loss": attn_s / denom,
         "grounding_loss": ground_s / denom,
         "query_text_infonce_loss": qt_s / denom,
+        "roi_feature_loss": roi_s / denom,
         "num_batches": int(n),
     }
 
@@ -698,6 +762,14 @@ def _save_checkpoint(ds_engine, save_dir: str, save_lora: bool = False) -> None:
                 torch.save(
                     unwrapped.bbox_head.state_dict(),
                     os.path.join(save_dir, "bbox_head.pt"),
+                )
+    if hasattr(unwrapped, "roi_proj"):
+        roi_params = list(unwrapped.roi_proj.parameters())
+        with deepspeed.zero.GatheredParameters(roi_params, modifier_rank=0):
+            if is_main_process():
+                torch.save(
+                    unwrapped.roi_proj.state_dict(),
+                    os.path.join(save_dir, "roi_proj.pt"),
                 )
 
     if save_lora:
@@ -762,13 +834,19 @@ def _init_deepspeed(
 
 
 def _train_forward_kwargs(
-    batch: dict, backend: str, is_stage1: bool, return_query_text_tensors: bool = False
+    batch: dict,
+    backend: str,
+    is_stage1: bool,
+    return_query_text_tensors: bool = False,
+    use_lm_ce: bool = True,
 ) -> dict:
     fwd = {
         "input_ids": batch["input_ids"],
         "attention_mask": batch["attention_mask"],
         "pixel_values": batch.get("pixel_values"),
-        "labels": batch["labels"],
+        # Stage 1 is pure grounding when ``use_lm_ce`` is False — pass labels=None
+        # so the backend skips computing the LM cross-entropy.
+        "labels": batch["labels"] if use_lm_ce else None,
         "return_attn_maps": is_stage1,
         "return_query_text_tensors": return_query_text_tensors,
     }
@@ -795,7 +873,21 @@ def _stage1_attn_loss(config: ReInspectionConfig, outputs, batch, device):
             )
             _attn_target_vis_mismatch_logged = True
         target = F.pad(target[:, :n_v], (0, max(0, n_v - target.shape[-1])))
-    return compute_attn_loss_kl(outputs.attn_vis, target)
+
+    k_sel = config.n_selector_queries
+    selector_attn = outputs.attn_vis[:, :k_sel]
+
+    bbox_areas = None
+    if config.stage1_attn_small_box_weight and "bbox_norm" in batch:
+        b = batch["bbox_norm"].to(device).float()
+        bbox_areas = ((b[:, 2] - b[:, 0]).clamp(min=0) * (b[:, 3] - b[:, 1]).clamp(min=0))
+
+    return compute_attn_loss_kl(
+        selector_attn,
+        target,
+        bbox_areas=bbox_areas,
+        small_box_weight=config.stage1_attn_small_box_weight and bbox_areas is not None,
+    )
 
 
 def _stage1_query_text_infonce_loss(config: ReInspectionConfig, outputs, device):
@@ -821,7 +913,8 @@ def _stage1_grounding_loss(config, model, outputs, batch, device, global_step):
     if outputs.R_bottleneck is None or "bbox_norm" not in batch:
         return torch.zeros((), device=device)
     bbox_gt = batch["bbox_norm"].to(device)
-    bbox_pred = unwrapped.bbox_head(outputs.R_bottleneck)
+    selectors = outputs.R_bottleneck[:, :config.n_selector_queries]
+    bbox_pred = unwrapped.bbox_head(selectors)
     warmup = min(1.0, global_step / max(1, config.stage1_grounding_warmup_steps))
     loss = compute_grounding_loss(
         bbox_pred, bbox_gt,
@@ -829,6 +922,36 @@ def _stage1_grounding_loss(config, model, outputs, batch, device, global_step):
         giou_weight=config.stage1_grounding_giou_weight,
     )
     return loss * warmup
+
+
+def _stage1_roi_feature_loss(config, model, outputs, batch, device):
+    """Cosine ROI feature loss between pooled content tokens and bbox-pooled V."""
+    unwrapped = model.module if hasattr(model, "module") else model
+    if not hasattr(unwrapped, "roi_proj"):
+        return torch.zeros((), device=device)
+    if (
+        outputs.R_bottleneck is None
+        or outputs.vision_hidden_states is None
+        or "attn_target_mask" not in batch
+    ):
+        return torch.zeros((), device=device)
+
+    V_frozen = outputs.vision_hidden_states.detach()
+    target = batch["attn_target_mask"]
+    n_v = V_frozen.shape[1]
+    if target.shape[-1] != n_v:
+        target = F.pad(target[:, :n_v], (0, max(0, n_v - target.shape[-1])))
+
+    R_content = outputs.R_bottleneck[:, config.n_selector_queries:]
+    if R_content.shape[1] == 0:
+        return torch.zeros((), device=device)
+    loss, _cos = compute_roi_feature_loss(
+        V_frozen=V_frozen,
+        R_content=R_content,
+        attn_target_mask=target.to(device),
+        projection=unwrapped.roi_proj,
+    )
+    return loss
 
 
 def _compute_grad_norm(model) -> float:
@@ -855,13 +978,151 @@ def _global_grad_norm_for_log(engine) -> Optional[float]:
     return _compute_grad_norm(engine)
 
 
-def _compute_param_norm(model) -> float:
-    """Compute the total L2 parameter norm across trainable parameters."""
-    total = 0.0
-    for p in model.parameters():
-        if p.requires_grad:
-            total += p.data.float().norm(2).item() ** 2
-    return total ** 0.5
+def _metric_safe_name(name: str) -> str:
+    """Convert a free-form optimizer group name into a stable metric segment."""
+    safe = []
+    for char in name:
+        if char.isalnum() or char in ("_", "-"):
+            safe.append(char)
+        else:
+            safe.append("_")
+    return "".join(safe).strip("_") or "group"
+
+
+def _local_grad_for_log(param) -> Optional[torch.Tensor]:
+    """Return the local gradient shard used for logging.
+
+    For plain PyTorch training this is ``param.grad``. Under DeepSpeed ZeRO-3 we
+    query the optimizer's local fp32 gradient shard to avoid gathering full
+    tensors just for logging.
+    """
+    grad = param.grad
+    if grad is not None:
+        return grad.detach()
+    if hasattr(param, "ds_id") and hasattr(param, "_z3_optimizer"):
+        try:
+            return param._z3_optimizer.get_local_fp32_grad_for_param(param)
+        except Exception:
+            return None
+    if hasattr(param, "_hp_mapping"):
+        try:
+            return param.get_full_hp_grad()
+        except Exception:
+            return None
+    return None
+
+
+def _local_param_for_log(param) -> Optional[torch.Tensor]:
+    """Return the local parameter shard used for logging."""
+    if hasattr(param, "ds_id") and hasattr(param, "_z3_optimizer"):
+        try:
+            return param._z3_optimizer.get_local_fp32_param(param)
+        except Exception:
+            return None
+    if hasattr(param, "_hp_mapping"):
+        try:
+            return param.get_full_hp_param()
+        except Exception:
+            return None
+    return param.detach()
+
+
+def _collect_param_stats(params: Iterable[torch.nn.Parameter]) -> dict[str, float]:
+    """Collect distributed-safe gradient and parameter statistics for ``params``."""
+    params = list(params)
+    device = None
+    for param in params:
+        local_param = _local_param_for_log(param)
+        if local_param is not None:
+            device = local_param.device
+            break
+        local_grad = _local_grad_for_log(param)
+        if local_grad is not None:
+            device = local_grad.device
+            break
+        device = param.device
+    if device is None:
+        device = torch.device("cpu")
+
+    sums = torch.zeros(6, device=device, dtype=torch.float64)
+    max_abs_grad = torch.zeros((), device=device, dtype=torch.float32)
+
+    for param in params:
+        local_param = _local_param_for_log(param)
+        if local_param is not None:
+            local_param = local_param.detach().float()
+            sums[3] += local_param.square().sum(dtype=torch.float64)
+            sums[4] += float(local_param.numel())
+
+        local_grad = _local_grad_for_log(param)
+        if local_grad is None:
+            continue
+
+        local_grad = local_grad.detach().float()
+        abs_grad = local_grad.abs()
+        sums[0] += local_grad.square().sum(dtype=torch.float64)
+        sums[1] += abs_grad.sum(dtype=torch.float64)
+        sums[2] += float(local_grad.numel())
+        sums[5] += torch.count_nonzero(local_grad).to(dtype=torch.float64)
+        if abs_grad.numel() > 0:
+            max_abs_grad = torch.maximum(max_abs_grad, abs_grad.max())
+
+    if dist.is_initialized():
+        dist.all_reduce(sums, op=dist.ReduceOp.SUM)
+        dist.all_reduce(max_abs_grad, op=dist.ReduceOp.MAX)
+
+    grad_sq_sum, grad_abs_sum, grad_numel, param_sq_sum, param_numel, grad_nonzero = sums.tolist()
+    grad_norm = math.sqrt(grad_sq_sum)
+    param_norm = math.sqrt(param_sq_sum)
+    grad_abs_mean = grad_abs_sum / max(grad_numel, 1.0)
+    grad_nonzero_frac = grad_nonzero / max(grad_numel, 1.0)
+    grad_coverage = grad_numel / max(param_numel, 1.0)
+    grad_param_ratio = grad_norm / max(param_norm, 1e-12)
+
+    return {
+        "grad_norm": grad_norm,
+        "param_norm": param_norm,
+        "grad_abs_mean": grad_abs_mean,
+        "grad_abs_max": float(max_abs_grad.item()),
+        "grad_nonzero_frac": grad_nonzero_frac,
+        "grad_coverage": grad_coverage,
+        "grad_param_ratio": grad_param_ratio,
+    }
+
+
+def _collect_optimizer_group_grad_metrics(optimizer, metric_prefix: str) -> dict[str, float]:
+    """Collect global and per-group gradient stats for the active optimizer."""
+    metrics: dict[str, float] = {}
+
+    for index, group in enumerate(optimizer.param_groups):
+        group_name = _metric_safe_name(str(group.get("name", f"group_{index}")))
+        stats = _collect_param_stats(group["params"])
+        group_prefix = f"{metric_prefix}/groups/{group_name}"
+        metrics[f"{group_prefix}/lr"] = float(group["lr"])
+        metrics[f"{group_prefix}/grad_norm"] = stats["grad_norm"]
+        metrics[f"{group_prefix}/param_norm"] = stats["param_norm"]
+        metrics[f"{group_prefix}/grad_abs_mean"] = stats["grad_abs_mean"]
+        metrics[f"{group_prefix}/grad_abs_max"] = stats["grad_abs_max"]
+        metrics[f"{group_prefix}/grad_nonzero_frac"] = stats["grad_nonzero_frac"]
+        metrics[f"{group_prefix}/grad_coverage"] = stats["grad_coverage"]
+        metrics[f"{group_prefix}/grad_param_ratio"] = stats["grad_param_ratio"]
+
+    # Recompute aggregate stats directly from the flattened trainable set so the
+    # global metrics stay exact even if some groups are empty.
+    all_params = [
+        param
+        for group in optimizer.param_groups
+        for param in group["params"]
+    ]
+    total_stats = _collect_param_stats(all_params)
+    metrics[f"{metric_prefix}/grad_norm"] = total_stats["grad_norm"]
+    metrics[f"{metric_prefix}/param_norm"] = total_stats["param_norm"]
+    metrics[f"{metric_prefix}/grad_abs_mean"] = total_stats["grad_abs_mean"]
+    metrics[f"{metric_prefix}/grad_abs_max"] = total_stats["grad_abs_max"]
+    metrics[f"{metric_prefix}/grad_nonzero_frac"] = total_stats["grad_nonzero_frac"]
+    metrics[f"{metric_prefix}/grad_coverage"] = total_stats["grad_coverage"]
+    metrics[f"{metric_prefix}/grad_param_ratio"] = total_stats["grad_param_ratio"]
+    return metrics
 
 
 class _CosineWarmupLR:
@@ -1058,6 +1319,7 @@ def run_training(config: ReInspectionConfig) -> None:
         "schedule/num_epochs": n_epochs,
         "schedule/batch_size": batch_size,
         "schedule/grad_accum": grad_accum,
+        "schedule/wandb_gradient_log_interval": config.wandb_gradient_log_interval,
         "dataset/num_samples": len(train_dataset),
         "dataset/num_workers": num_workers,
     }, step=0)
@@ -1065,6 +1327,9 @@ def run_training(config: ReInspectionConfig) -> None:
     use_attn = is_stage1 and config.stage1_use_attn_loss
     use_grounding = is_stage1 and config.stage1_use_grounding_loss
     use_qt_infonce = is_stage1 and config.stage1_use_query_text_infonce
+    use_roi_feat = is_stage1 and config.stage1_use_roi_feature_loss
+    # Stage 1 is pure grounding by default — disable LM CE / NTP unless asked.
+    use_lm_ce = (not is_stage1) or config.stage1_use_lm_ce
 
     model.train()
     global_step = 0
@@ -1085,6 +1350,7 @@ def run_training(config: ReInspectionConfig) -> None:
         epoch_attn = 0.0
         epoch_grounding = 0.0
         epoch_qt_infonce = 0.0
+        epoch_roi_feat = 0.0
         epoch_stage1_supervision = 0.0
 
         pbar = tqdm(
@@ -1100,29 +1366,35 @@ def run_training(config: ReInspectionConfig) -> None:
 
             outputs = model(
                 **_train_forward_kwargs(
-                    batch, backend, is_stage1, return_query_text_tensors=use_qt_infonce
+                    batch, backend, is_stage1,
+                    return_query_text_tensors=use_qt_infonce,
+                    use_lm_ce=use_lm_ce,
                 )
             )
 
             ce_loss = outputs.loss
             if ce_loss is None:
-                if backend in ("internvl3", "gemma4"):
+                if use_lm_ce and backend in ("internvl3", "gemma4"):
                     raise RuntimeError("Model did not return a loss. Check dataset labels.")
-                ce_loss = torch.tensor(0.0, device=device)
+                ce_loss = torch.zeros((), device=device)
 
             attn_loss = torch.zeros((), device=device)
             grounding_loss = torch.zeros((), device=device)
             qt_infonce_loss = torch.zeros((), device=device)
+            roi_feat_loss = torch.zeros((), device=device)
             if use_attn:
                 attn_loss = _stage1_attn_loss(config, outputs, batch, device)
             if use_grounding:
                 grounding_loss = _stage1_grounding_loss(config, model, outputs, batch, device, global_step)
             if use_qt_infonce:
                 qt_infonce_loss = _stage1_query_text_infonce_loss(config, outputs, device)
+            if use_roi_feat:
+                roi_feat_loss = _stage1_roi_feature_loss(config, model, outputs, batch, device)
 
-            loss = ce_loss \
+            loss = (ce_loss if use_lm_ce else torch.zeros((), device=device)) \
                 + (config.stage1_attn_loss_weight * attn_loss if use_attn else 0.0) \
                 + (config.stage1_grounding_loss_weight * grounding_loss if use_grounding else 0.0) \
+                + (config.stage1_roi_feature_loss_weight * roi_feat_loss if use_roi_feat else 0.0) \
                 + (
                     config.stage1_query_text_infonce_weight * qt_infonce_loss
                     if use_qt_infonce
@@ -1139,6 +1411,7 @@ def run_training(config: ReInspectionConfig) -> None:
                         f"[WARNING] Non-finite loss={loss.item():.4f} "
                         f"(ce={ce_loss.item():.4f}, attn={attn_loss.item():.4f}, "
                         f"grounding={grounding_loss.item():.4f}, "
+                        f"roi={roi_feat_loss.item():.4f}, "
                         f"qt_infonce={qt_infonce_loss.item():.4f}) "
                         f"at global_step={global_step}, skipping batch"
                     )
@@ -1147,17 +1420,31 @@ def run_training(config: ReInspectionConfig) -> None:
 
             ds_engine.backward(micro_loss)
             grad_norm = None
+            grad_metrics = None
             if (step + 1) % grad_accum == 0:
+                next_update_step = update_step + 1
+                if (
+                    config.wandb_gradient_log_interval > 0
+                    and next_update_step % config.wandb_gradient_log_interval == 0
+                ):
+                    grad_metrics = _collect_optimizer_group_grad_metrics(
+                        optimizer,
+                        f"{pfx}/train",
+                    )
                 ds_engine.step()
                 scheduler.step()
-                update_step += 1
-                grad_norm = _global_grad_norm_for_log(ds_engine)
+                update_step = next_update_step
+                if grad_metrics is not None:
+                    grad_norm = grad_metrics.get(f"{pfx}/train/grad_norm")
+                else:
+                    grad_norm = _global_grad_norm_for_log(ds_engine)
 
             epoch_loss += loss.item()
             epoch_ce += ce_loss.item()
             epoch_attn += attn_loss.item()
             epoch_grounding += grounding_loss.item()
             epoch_qt_infonce += qt_infonce_loss.item()
+            epoch_roi_feat += roi_feat_loss.item()
             global_step += 1
 
             lr = scheduler.get_last_lr()[0] if update_step > 0 else optimizer.param_groups[0]["lr"]
@@ -1165,6 +1452,7 @@ def run_training(config: ReInspectionConfig) -> None:
                 f"{pfx}/train/loss": loss.item(),
                 f"{pfx}/train/ce_loss": ce_loss.item(),
                 f"{pfx}/train/lr": lr,
+                f"{pfx}/train/update_step": update_step,
             }
             if use_attn:
                 metrics[f"{pfx}/train/attn_loss"] = attn_loss.item()
@@ -1172,7 +1460,9 @@ def run_training(config: ReInspectionConfig) -> None:
                 metrics[f"{pfx}/train/grounding_loss"] = grounding_loss.item()
             if use_qt_infonce:
                 metrics[f"{pfx}/train/query_text_infonce_loss"] = qt_infonce_loss.item()
-            if is_stage1 and (use_attn or use_grounding or use_qt_infonce):
+            if use_roi_feat:
+                metrics[f"{pfx}/train/roi_feature_loss"] = roi_feat_loss.item()
+            if is_stage1 and (use_attn or use_grounding or use_qt_infonce or use_roi_feat):
                 stage1_sup = 0.0
                 if use_attn:
                     stage1_sup += config.stage1_attn_loss_weight * attn_loss.item()
@@ -1180,30 +1470,46 @@ def run_training(config: ReInspectionConfig) -> None:
                     stage1_sup += config.stage1_grounding_loss_weight * grounding_loss.item()
                 if use_qt_infonce:
                     stage1_sup += config.stage1_query_text_infonce_weight * qt_infonce_loss.item()
+                if use_roi_feat:
+                    stage1_sup += config.stage1_roi_feature_loss_weight * roi_feat_loss.item()
                 metrics[f"{pfx}/train/stage1_supervision_loss"] = stage1_sup
                 epoch_stage1_supervision += stage1_sup
 
-            if grad_norm is not None:
+            if grad_metrics is not None:
+                metrics.update(grad_metrics)
+            elif grad_norm is not None:
                 metrics[f"{pfx}/train/grad_norm"] = grad_norm
-                metrics[f"{pfx}/train/param_norm"] = _compute_param_norm(model)
 
             if torch.cuda.is_available():
                 metrics[f"{pfx}/system/gpu_mem_allocated_gb"] = torch.cuda.memory_allocated(device) / (1024 ** 3)
                 metrics[f"{pfx}/system/gpu_mem_reserved_gb"] = torch.cuda.memory_reserved(device) / (1024 ** 3)
 
-            if global_step % config.wandb_log_interval == 0:
+            if grad_metrics is not None or global_step % config.wandb_log_interval == 0:
                 _log_wandb(metrics, global_step)
 
-            postfix: dict = {"loss": f"{loss.item():.4f}", "ce": f"{ce_loss.item():.4f}", "lr": f"{lr:.2e}"}
+            postfix: dict = {"loss": f"{loss.item():.4f}", "lr": f"{lr:.2e}"}
+            if use_lm_ce:
+                postfix["ce"] = f"{ce_loss.item():.4f}"
             if use_attn:
                 postfix["attn"] = f"{attn_loss.item():.4f}"
             if use_grounding:
                 postfix["gnd"] = f"{grounding_loss.item():.4f}"
+            if use_roi_feat:
+                postfix["roi"] = f"{roi_feat_loss.item():.4f}"
             if use_qt_infonce:
                 postfix["qt_nce"] = f"{qt_infonce_loss.item():.4f}"
             if grad_norm is not None:
                 postfix["gnorm"] = f"{grad_norm:.2f}"
             pbar.set_postfix(postfix)
+
+            if (
+                is_stage1
+                and config.stage1_max_steps is not None
+                and global_step >= config.stage1_max_steps
+            ):
+                if is_main_process():
+                    log(f"Reached stage1_max_steps={config.stage1_max_steps}; stopping early.")
+                break
 
         pbar.close()
 
@@ -1220,7 +1526,9 @@ def run_training(config: ReInspectionConfig) -> None:
             summary[f"{pfx}/epoch/grounding_loss"] = epoch_grounding / num_steps
         if use_qt_infonce:
             summary[f"{pfx}/epoch/query_text_infonce_loss"] = epoch_qt_infonce / num_steps
-        if is_stage1 and (use_attn or use_grounding or use_qt_infonce):
+        if use_roi_feat:
+            summary[f"{pfx}/epoch/roi_feature_loss"] = epoch_roi_feat / num_steps
+        if is_stage1 and (use_attn or use_grounding or use_qt_infonce or use_roi_feat):
             summary[f"{pfx}/epoch/stage1_supervision_loss"] = epoch_stage1_supervision / num_steps
         _log_wandb(summary, global_step)
 
@@ -1229,6 +1537,8 @@ def run_training(config: ReInspectionConfig) -> None:
             aux_msg += f" attn={epoch_attn / num_steps:.4f}"
         if use_grounding:
             aux_msg += f" ground={epoch_grounding / num_steps:.4f}"
+        if use_roi_feat:
+            aux_msg += f" roi={epoch_roi_feat / num_steps:.4f}"
         if use_qt_infonce:
             aux_msg += f" qt_nce={epoch_qt_infonce / num_steps:.4f}"
         if is_main_process():
@@ -1241,7 +1551,8 @@ def run_training(config: ReInspectionConfig) -> None:
         if val_loader is not None:
             val_metrics = _run_validation(
                 ds_engine, val_loader, backend, is_stage1,
-                use_attn, use_grounding, use_qt_infonce, config, device,
+                use_attn, use_grounding, use_qt_infonce, use_roi_feat, use_lm_ce,
+                config, device,
             )
             val_loss = val_metrics["loss"]
             val_summary = {
@@ -1256,7 +1567,9 @@ def run_training(config: ReInspectionConfig) -> None:
                 val_summary[f"{pfx}/val/grounding_loss"] = val_metrics["grounding_loss"]
             if use_qt_infonce:
                 val_summary[f"{pfx}/val/query_text_infonce_loss"] = val_metrics["query_text_infonce_loss"]
-            if is_stage1 and (use_attn or use_grounding or use_qt_infonce):
+            if use_roi_feat:
+                val_summary[f"{pfx}/val/roi_feature_loss"] = val_metrics["roi_feature_loss"]
+            if is_stage1 and (use_attn or use_grounding or use_qt_infonce or use_roi_feat):
                 sup = 0.0
                 if use_attn:
                     sup += config.stage1_attn_loss_weight * val_metrics["attn_loss"]
@@ -1264,6 +1577,8 @@ def run_training(config: ReInspectionConfig) -> None:
                     sup += config.stage1_grounding_loss_weight * val_metrics["grounding_loss"]
                 if use_qt_infonce:
                     sup += config.stage1_query_text_infonce_weight * val_metrics["query_text_infonce_loss"]
+                if use_roi_feat:
+                    sup += config.stage1_roi_feature_loss_weight * val_metrics["roi_feature_loss"]
                 val_summary[f"{pfx}/val/stage1_supervision_loss"] = sup
             _log_wandb(val_summary, global_step)
             if is_main_process():
@@ -1288,6 +1603,13 @@ def run_training(config: ReInspectionConfig) -> None:
         if is_best:
             best_val_loss = tracked_loss
         _log_model_artifact(save_dir, stage, backend, epoch + 1, is_best=is_best)
+
+        if (
+            is_stage1
+            and config.stage1_max_steps is not None
+            and global_step >= config.stage1_max_steps
+        ):
+            break
 
     _finish_wandb()
     if dist.is_initialized():

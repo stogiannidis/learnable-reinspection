@@ -2,7 +2,7 @@
 backend: internvl3
 model_name_or_path: OpenGVLab/InternVL3-8B-hf
 deepspeed_config: src/configs/deepspeed_z3.json
-wandb_project: reinspection-internvl3
+wandb_project: learnable-reinspection
 
 # Re-Inspection Module
 d_model: 3584
@@ -22,10 +22,10 @@ stage1_warmup_ratio: 0.03
 stage1_use_attn_loss: true
 stage1_attn_loss_weight: 0.5
 stage1_attn_loss_type: kl
-stage1_use_grounding_loss: false
-stage1_grounding_loss_weight: 2.0
-stage1_grounding_l1_weight: 2.0
-stage1_grounding_giou_weight: 1.0
+stage1_use_grounding_loss: true
+stage1_grounding_loss_weight: 1.0
+stage1_grounding_l1_weight: 5.0
+stage1_grounding_giou_weight: 2.0
 stage1_use_query_text_infonce: false
 stage1_query_text_infonce_weight: 0.1
 stage1_query_text_infonce_temperature: 0.07

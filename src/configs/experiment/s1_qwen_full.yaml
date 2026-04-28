@@ -1,9 +1,0 @@
-# @package _global_
-# Stage 1 — grounding. Qwen2.5-VL. Full mix including GRIT (ablation).
-defaults:
-  - override /backend: qwen25vl
-  - override /stage: stage1
-  - override /stage1_datasets: all
-
-wandb_run_name: s1_qwen_full
-experiment_name: s1_qwen_full
