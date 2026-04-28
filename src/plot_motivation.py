@@ -426,7 +426,16 @@ def _npz_signal_pair(data, signal):
 
 
 def _render_attention_condition(npz_files, output_dir, condition):
-    """Render one condition-specific attention figure from saved NPZ files."""
+    """Render one condition-specific attention figure from saved NPZ files.
+
+    Layout per row: [reference image] [Q_A overlay] [Q_B overlay] (per signal).
+    Question text is rendered as a wrapped caption *below* each overlay so
+    titles cannot collide across columns. The reference image is shown once
+    per row at reduced width; overlays use a stronger alpha so attention mass
+    is clearly visible against the photograph.
+    """
+    import textwrap
+
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     available_signals = []
     for npz_file in npz_files:
@@ -436,12 +445,19 @@ def _render_attention_condition(npz_files, output_dir, condition):
                 available_signals.append(signal)
     display_signals = _display_signals_for_condition(condition, available_signals)
     n = len(npz_files)
-    n_cols = 1 + (2 * len(display_signals))
-    fig, axes = plt.subplots(n, n_cols, figsize=(6 + 4 * len(display_signals), 4 * n))
+    n_signals = len(display_signals)
+    n_cols = 1 + 2 * n_signals
+    fig_w = 3.2 + 3.6 * 2 * n_signals
+    fig_h = 4.4 * n
+    width_ratios = [0.85] + [1.0] * (2 * n_signals)
+    fig, axes = plt.subplots(
+        n, n_cols, figsize=(fig_w, fig_h),
+        gridspec_kw={"width_ratios": width_ratios, "wspace": 0.18, "hspace": 0.6},
+    )
     if n == 1:
         axes = axes[np.newaxis, :]
 
-    def _overlay(ax, attn_map, h_p, w_p, title, img, cmap):
+    def _overlay(ax, attn_map, h_p, w_p, img, cmap):
         attn_2d = attn_map.reshape(h_p, w_p)
         img_w, img_h = img.size
         attn_resized = np.array(
@@ -450,64 +466,92 @@ def _render_attention_condition(npz_files, output_dir, condition):
             )
         )
         ax.imshow(img)
-        ax.imshow(attn_resized, cmap=cmap, alpha=0.5, vmin=0, vmax=attn_resized.max())
-        ax.set_title(title, fontsize=8)
-        ax.axis("off")
+        # Mask very low attention values so the photograph shows through.
+        amax = float(attn_resized.max()) if attn_resized.size else 1.0
+        thresh = 0.15 * amax
+        masked = np.ma.masked_less(attn_resized, thresh)
+        ax.imshow(masked, cmap=cmap, alpha=0.6, vmin=thresh, vmax=amax)
+        ax.set_xticks([]); ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
 
-    col_titles = ["Image"]
-    for signal in display_signals:
+    def _wrap(text, width=38):
+        return "\n".join(textwrap.wrap(text, width=width)) or text
+
+    axes[0, 0].set_title("Image", fontsize=10, fontweight="bold", pad=8)
+    for s_idx, signal in enumerate(display_signals):
         label = ATTN_SIGNAL_LABELS.get(signal, signal)
-        col_titles.extend([f"{label} · Q_A", f"{label} · Q_B"])
-    for col, title in enumerate(col_titles):
-        axes[0, col].set_title(title, fontsize=10, fontweight="bold")
+        axes[0, 1 + 2 * s_idx].set_title(
+            f"{label}\nQuestion A", fontsize=10, fontweight="bold", pad=8,
+        )
+        axes[0, 2 + 2 * s_idx].set_title(
+            f"{label}\nQuestion B", fontsize=10, fontweight="bold", pad=8,
+        )
 
     for row, npz_file in enumerate(npz_files):
         data = np.load(npz_file, allow_pickle=True)
         img_path = str(data["image_path"])
         if not Path(img_path).exists():
+            for c in range(n_cols):
+                axes[row, c].axis("off")
             continue
 
         image = Image.open(img_path).convert("RGB")
         h_m = int(data["h_merged"])
         w_m = int(data["w_merged"])
-        q_a = str(data["question_a"])
-        q_b = str(data["question_b"])
-        ans_a = str(data["answer_a"])
-        ans_b = str(data["answer_b"])
-        gt_a = str(data["gt_a"])
-        gt_b = str(data["gt_b"])
+        q_a = str(data["question_a"]).strip()
+        q_b = str(data["question_b"]).strip()
+        ans_a = str(data["answer_a"]).strip()
+        ans_b = str(data["answer_b"]).strip()
+        gt_a = str(data["gt_a"]).strip()
+        gt_b = str(data["gt_b"]).strip()
         relation = str(data["relation"])
 
-        axes[row, 0].imshow(image)
-        axes[row, 0].set_title(relation, fontsize=10, fontweight="bold")
-        axes[row, 0].axis("off")
+        ax_ref = axes[row, 0]
+        ax_ref.imshow(image)
+        ax_ref.set_xticks([]); ax_ref.set_yticks([])
+        for spine in ax_ref.spines.values():
+            spine.set_visible(False)
+        ax_ref.set_ylabel(
+            f'"{relation}"', fontsize=10, fontweight="bold", rotation=0,
+            ha="right", va="center", labelpad=14,
+        )
 
-        a_sym = "\u2713" if ans_a.strip().lower() == gt_a.strip().lower() else "\u2717"
-        b_sym = "\u2713" if ans_b.strip().lower() == gt_b.strip().lower() else "\u2717"
-        col = 1
-        for signal in display_signals:
+        a_correct = ans_a.lower() == gt_a.lower()
+        b_correct = ans_b.lower() == gt_b.lower()
+        a_sym = "\u2713" if a_correct else "\u2717"
+        b_sym = "\u2713" if b_correct else "\u2717"
+        a_color = "#2ca02c" if a_correct else "#d62728"
+        b_color = "#2ca02c" if b_correct else "#d62728"
+
+        for s_idx, signal in enumerate(display_signals):
+            ax_a = axes[row, 1 + 2 * s_idx]
+            ax_b = axes[row, 2 + 2 * s_idx]
             attn_a, attn_b = _npz_signal_pair(data, signal)
             if attn_a is None or attn_b is None:
-                axes[row, col].axis("off")
-                axes[row, col + 1].axis("off")
-                col += 2
+                ax_a.axis("off"); ax_b.axis("off")
                 continue
             cmap = ATTN_SIGNAL_CMAP.get(signal, "cividis")
-            _overlay(
-                axes[row, col], attn_a, h_m, w_m,
-                f"Q_A: ...{q_a[-45:]}\nModel: {ans_a} {a_sym}  (GT: {gt_a})",
-                image, cmap,
+            _overlay(ax_a, attn_a, h_m, w_m, image, cmap)
+            _overlay(ax_b, attn_b, h_m, w_m, image, cmap)
+            ax_a.set_xlabel(
+                f"{_wrap(q_a)}\nModel: {ans_a} {a_sym}   GT: {gt_a}",
+                fontsize=8, color="#222", labelpad=6,
             )
-            _overlay(
-                axes[row, col + 1], attn_b, h_m, w_m,
-                f"Q_B: ...{q_b[-45:]}\nModel: {ans_b} {b_sym}  (GT: {gt_b})",
-                image, cmap,
+            ax_b.set_xlabel(
+                f"{_wrap(q_b)}\nModel: {ans_b} {b_sym}   GT: {gt_b}",
+                fontsize=8, color="#222", labelpad=6,
             )
-            col += 2
+            ax_a.plot([0.0, 1.0], [-0.02, -0.02], transform=ax_a.transAxes,
+                      color=a_color, lw=2.0, clip_on=False)
+            ax_b.plot([0.0, 1.0], [-0.02, -0.02], transform=ax_b.transAxes,
+                      color=b_color, lw=2.0, clip_on=False)
 
     label = " + ".join(ATTN_SIGNAL_LABELS.get(sig, sig) for sig in display_signals)
-    fig.suptitle(f"{condition}: {label}", fontsize=13, fontweight="bold", y=1.01)
-    plt.tight_layout()
+    fig.suptitle(
+        f"Attention comparison ({condition}) \u2014 {label}",
+        fontsize=13, fontweight="bold", y=0.995,
+    )
     out = Path(output_dir) / f"{condition}_attention_comparison.pdf"
     fig.savefig(out, dpi=200, bbox_inches="tight")
     fig.savefig(out.with_suffix(".png"), dpi=200, bbox_inches="tight")
