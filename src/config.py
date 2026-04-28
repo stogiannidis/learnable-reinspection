@@ -30,12 +30,14 @@ class ReInspectionConfig:
     backend: str = "internvl3"          # internvl3 | qwen25vl | gemma4
     stage: int = 1                      # 1 | 2
     data_root: str = "/data/datasets"
+    coco_images_dir: Optional[str] = "/data/datasets/coco/images/train2014"
     output_dir: str = "models"
     deepspeed_config: Optional[str] = None
     stage1_checkpoint: Optional[str] = None
     wandb_project: Optional[str] = None
     wandb_run_name: Optional[str] = None
     wandb_log_interval: int = 300
+    wandb_gradient_log_interval: int = 1
     experiment_name: Optional[str] = None
     num_workers: int = 4
 
@@ -60,6 +62,7 @@ class ReInspectionConfig:
     d_model: int = 4096
     d_bottleneck: int = 512
     n_queries: int = 64
+    n_selector_queries: int = 8
     n_heads: int = 8
     ffn_mult: int = 4
     dropout: float = 0.0
@@ -93,16 +96,25 @@ class ReInspectionConfig:
     stage1_grad_accum: int = 8
     stage1_warmup_ratio: float = 0.03
     stage1_warmup_steps: Optional[int] = None
+    stage1_max_steps: Optional[int] = None
     # ---- Stage 1 auxiliary losses (each independently toggleable) ----
-    # Attention KL between bottleneck attn_vis and target patch distribution.
+    # Stage 1 is a pure grounding stage; LM CE / NTP is disabled by default.
+    stage1_use_lm_ce: bool = False
+    # Attention KL between selector-token attn_vis and overlap-area target.
     stage1_use_attn_loss: bool = True
     stage1_attn_loss_weight: float = 1.0
-    # Box regression head: L1 + GIoU.
+    stage1_attn_loss_type: str = "kl"
+    stage1_attn_small_box_weight: bool = True
+    # Box regression head on selector tokens: L1 + GIoU (DETR weights).
     stage1_use_grounding_loss: bool = True
-    stage1_grounding_loss_weight: float = 2.0
-    stage1_grounding_l1_weight: float = 2.0
-    stage1_grounding_giou_weight: float = 1.0
+    stage1_grounding_loss_weight: float = 1.0
+    stage1_grounding_l1_weight: float = 5.0
+    stage1_grounding_giou_weight: float = 2.0
     stage1_grounding_warmup_steps: int = 100
+    # ROI feature grounding: cosine between pooled content tokens and ROI-pooled
+    # frozen vision features. Encourages content tokens to carry region info.
+    stage1_use_roi_feature_loss: bool = True
+    stage1_roi_feature_loss_weight: float = 0.2
     # Symmetric query–text InfoNCE in bottleneck space.
     stage1_use_query_text_infonce: bool = False
     stage1_query_text_infonce_weight: float = 0.1
@@ -152,6 +164,10 @@ class ReInspectionConfig:
         if self.d_bottleneck % self.n_heads != 0:
             raise ValueError(
                 f"d_bottleneck ({self.d_bottleneck}) must be divisible by n_heads ({self.n_heads})"
+            )
+        if not 0 < self.n_selector_queries < self.n_queries:
+            raise ValueError(
+                f"n_selector_queries ({self.n_selector_queries}) must be in (0, n_queries={self.n_queries})"
             )
         self.d_head = self.d_bottleneck // self.n_heads
 

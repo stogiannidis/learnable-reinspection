@@ -13,7 +13,11 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from .utils import bbox_to_patch_mask as qwen_bbox_to_patch_mask, build_chat_messages as qwen_build_chat
+from .utils import (
+    _overlap_area_grid,
+    bbox_to_patch_mask as qwen_bbox_to_patch_mask,
+    build_chat_messages as qwen_build_chat,
+)
 from .chat_template import build_chat_messages as intern_build_chat
 from .gemma4_chat import build_chat_messages as gemma4_build_chat
 from .registry import stage1_defaults
@@ -49,7 +53,10 @@ def intern_bbox_to_patch_mask(
 
     Returns:
         Float tensor of length ``num_image_patches * image_seq_length`` summing
-        to 1 over positive entries (uniform mass inside the box).
+        to 1. Each entry is the fractional bbox-overlap area for that patch
+        (tiled uniformly across crops when ``num_image_patches > 1``); tiny
+        boxes that miss every patch boundary collapse to a single delta on the
+        patch containing the bbox center.
 
     Raises:
         ValueError: If ``image_seq_length`` is not a perfect square.
@@ -58,25 +65,13 @@ def intern_bbox_to_patch_mask(
     if side * side != image_seq_length:
         raise ValueError(f"image_seq_length={image_seq_length} is not a square grid")
 
-    x1, y1, x2, y2 = bbox
-    col_start = max(0, min(int(math.floor(x1 * side)), side - 1))
-    col_end = max(col_start + 1, min(int(math.ceil(x2 * side)), side))
-    row_start = max(0, min(int(math.floor(y1 * side)), side - 1))
-    row_end = max(row_start + 1, min(int(math.ceil(y2 * side)), side))
-
-    base_mask = torch.zeros(side * side, dtype=torch.float32)
-    for row in range(row_start, row_end):
-        for col in range(col_start, col_end):
-            base_mask[row * side + col] = 1.0
-
+    base_mask = _overlap_area_grid(bbox, side, side).flatten()
     if num_image_patches > 1:
-        mask = base_mask.repeat(num_image_patches)
+        # Replicate across crops; renormalize so the full vector sums to 1.
+        mask = base_mask.unsqueeze(0).expand(num_image_patches, -1).contiguous().flatten()
+        mask = mask / float(num_image_patches)
     else:
         mask = base_mask
-
-    total = mask.sum()
-    if total > 0:
-        mask = mask / total
     return mask
 
 
@@ -95,6 +90,7 @@ class RefCOCODataset(Dataset):
         crop_to_patches: bool = False,
         system_prompt: str = "You are a helpful assistant.",
         answer_ignore_index: int = -100,
+        coco_images_dir: Optional[str] = None,
     ):
         """Scan annotation JSON files and build the in-memory sample list.
 
@@ -109,6 +105,10 @@ class RefCOCODataset(Dataset):
             crop_to_patches: Whether to request patch cropping from the image processor.
             system_prompt: System message for chat-templated backends.
             answer_ignore_index: Label mask for prompt tokens.
+            coco_images_dir: If set, resolve all relative image filenames from this
+                directory instead of ``{data_root}/{name}/images/``. Use this to
+                point at the canonical COCO train2014 folder, e.g.
+                ``/data/datasets/coco/images/train2014``.
 
         Raises:
             ValueError: If ``backend`` is not supported.
@@ -139,7 +139,16 @@ class RefCOCODataset(Dataset):
                 item = dict(item)
                 item["dataset"] = name
                 if not os.path.isabs(item["image"]):
-                    item["image"] = os.path.join(data_root, name, "images", item["image"])
+                    img_dir = coco_images_dir or os.path.join(data_root, name, "images")
+                    fname = item["image"]
+                    if coco_images_dir is not None:
+                        # train2014 files are named COCO_train2014_XXXXXXXXXX.jpg
+                        stem = os.path.splitext(fname)[0]
+                        coco_fname = f"COCO_train2014_{stem}.jpg"
+                        candidate = os.path.join(img_dir, coco_fname)
+                        if os.path.exists(candidate):
+                            fname = coco_fname
+                    item["image"] = os.path.join(img_dir, fname)
                 self.samples.append(item)
 
     def __len__(self) -> int:
@@ -264,9 +273,18 @@ class RefCOCODataset(Dataset):
         labels[:, :prompt_len] = self.answer_ignore_index
         full_inputs["labels"] = labels
         result = _squeeze_intern(full_inputs)
+        # Count actual image tokens emitted by the processor (dynamic tiling can
+        # produce more crops than ``get_number_of_image_patches`` reports when
+        # we don't thread ``crop_to_patches``/pixel bounds through the call).
+        image_token_id = getattr(self.processor, "image_token_id", None)
+        if image_token_id is not None:
+            n_image_tokens = int((result["input_ids"] == image_token_id).sum().item())
+            num_tiles = max(1, n_image_tokens // self.image_seq_length)
+        else:
+            num_tiles = self._intern_num_patches(image)
         result["attn_target_mask"] = intern_bbox_to_patch_mask(
             bbox=bbox_norm,
-            num_image_patches=self._intern_num_patches(image),
+            num_image_patches=num_tiles,
             image_seq_length=self.image_seq_length,
         )
         result["bbox_norm"] = torch.tensor(bbox_norm, dtype=torch.float32)

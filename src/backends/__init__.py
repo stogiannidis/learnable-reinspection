@@ -1,21 +1,27 @@
-"""Public exports for vision-language backends with re-inspection wrappers.
+"""Lazy public exports for vision-language backends with re-inspection wrappers."""
 
-Each submodule pairs a frozen (or PEFT-wrapped) base VLM with
-:class:`~src.model.reinspection_module.ReInspectionModule` and exposes
-``load_model`` / ``load_processor`` entry points used by training and evaluation.
-"""
+from __future__ import annotations
 
-from .qwen25vl import Qwen25VLWithReInspection, load_model as load_qwen25_model
-from .internvl3 import InternVL3WithReInspection, load_model as load_internvl_model, load_processor
-from .gemma4 import Gemma4WithReInspection, load_model as load_gemma4_model, load_processor as load_gemma4_processor
+import importlib
 
-__all__ = [
-    "Qwen25VLWithReInspection",
-    "InternVL3WithReInspection",
-    "Gemma4WithReInspection",
-    "load_qwen25_model",
-    "load_internvl_model",
-    "load_gemma4_model",
-    "load_processor",
-    "load_gemma4_processor",
-]
+_EXPORTS = {
+    "Qwen25VLWithReInspection": ("src.backends.qwen25vl", "Qwen25VLWithReInspection"),
+    "InternVL3WithReInspection": ("src.backends.internvl3", "InternVL3WithReInspection"),
+    "Gemma4WithReInspection": ("src.backends.gemma4", "Gemma4WithReInspection"),
+    "load_qwen25_model": ("src.backends.qwen25vl", "load_model"),
+    "load_internvl_model": ("src.backends.internvl3", "load_model"),
+    "load_gemma4_model": ("src.backends.gemma4", "load_model"),
+    "load_processor": ("src.backends.internvl3", "load_processor"),
+    "load_gemma4_processor": ("src.backends.gemma4", "load_processor"),
+}
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name: str):
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = _EXPORTS[name]
+    value = getattr(importlib.import_module(module_name), attr_name)
+    globals()[name] = value
+    return value

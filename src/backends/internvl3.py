@@ -386,6 +386,8 @@ class InternVL3WithReInspection(nn.Module):
             "Q_task": Q_task,
             "T_down": T_down,
             "T_mask": T_mask,
+            "V": V,
+            "V_mask": V_mask,
         }
 
     def forward(
@@ -446,6 +448,8 @@ class InternVL3WithReInspection(nn.Module):
             Q_text_bottleneck=prepared["Q_task"] if return_query_text_tensors else None,
             text_bottleneck=prepared["T_down"] if return_query_text_tensors else None,
             text_bottleneck_mask=prepared["T_mask"] if return_query_text_tensors else None,
+            vision_hidden_states=prepared["V"] if return_attn_maps else None,
+            vision_token_mask=prepared["V_mask"] if return_attn_maps else None,
         )
 
     def get_attention_maps(self):
