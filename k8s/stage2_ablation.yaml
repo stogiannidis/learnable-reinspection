@@ -1,5 +1,5 @@
 # Stage 2 ablation — InternVL3 from a specific Stage-1 checkpoint.
-# Set REINSPECTION_EXPERIMENT inline (in the command below) to one of:
+# Set REINSPECTION_EXPERIMENT_STAGE2 inline (in the command below) to one of:
 #   s2_internvl_grounding  (from grounding Stage-1)
 #   s2_internvl_focal      (from focal Stage-1)
 #   s2_internvl_kl         (from kl Stage-1)
@@ -31,8 +31,8 @@ spec:
           - |
             set -euo pipefail
             mkdir -p logs models
-            REINSPECTION_EXPERIMENT=s2_internvl_grounding REINSPECTION_EXPERIMENT_STAGE2= \
-              bash src/scripts/run_train.sh
+            REINSPECTION_EXPERIMENT_STAGE2=s2_internvl_grounding \
+              bash src/scripts/run_train_stage2.sh
         imagePullPolicy: Always
         env:
           - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }

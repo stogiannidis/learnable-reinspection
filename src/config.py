@@ -131,6 +131,18 @@ class ReInspectionConfig:
     stage2_grad_accum: int = 8
     stage2_warmup_ratio: float = 0.03
     stage2_warmup_steps: Optional[int] = None
+    # Keep the Stage-1 ROI encoder adaptable during instruction tuning unless
+    # an experiment explicitly freezes it.
+    stage2_train_reinspection: bool = True
+    # Optional weak grounding stream mixed into Stage 2. Disabled unless both
+    # the master weight and cadence are positive.
+    stage2_aux_grounding_weight: float = 0.0
+    stage2_aux_attn_loss_weight: float = 1.0
+    stage2_aux_roi_feature_loss_weight: float = 0.2
+    stage2_aux_every_n_steps: int = 0
+    stage2_aux_batch_size: Optional[int] = None
+    stage2_aux_stage1_dataset_names: Optional[List[str]] = None
+    stage2_aux_stage1_extra_datasets: Optional[List[str]] = None
 
     # ------------------------------------------------------------------ #
     # Data                                                                 #
