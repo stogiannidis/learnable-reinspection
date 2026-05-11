@@ -3,7 +3,7 @@
 import torch
 
 from src.config import ReInspectionConfig
-from src.reinspection_module import ReInspectionModule
+from src.model.reinspection_module import ReInspectionModule
 
 
 def _stack_insert_embeds(
@@ -45,6 +45,7 @@ def test_reinspection_w_up_grad_through_insert_pattern():
         d_model=128,
         d_bottleneck=32,
         n_queries=4,
+        n_selector_queries=2,
         n_heads=4,
         ffn_mult=2,
     )
@@ -59,7 +60,7 @@ def test_reinspection_w_up_grad_through_insert_pattern():
     T = torch.randn(B, nt, 128)
     vm = torch.ones(B, nv, dtype=torch.bool)
     tm = torch.ones(B, nt, dtype=torch.bool)
-    R, _, _, _ = m(V, T, V_mask=vm, T_mask=tm, need_weights=False)
+    R = m(V, T, V_mask=vm, T_mask=tm, need_weights=False)[0]
     ie = torch.randn(B, L, 128)
     new_embeds = _stack_insert_embeds(ie, R, pos)
     new_embeds.sum().backward()

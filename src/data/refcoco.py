@@ -24,6 +24,40 @@ from .registry import stage1_defaults
 
 _QWEN_BACKENDS = ("qwen25vl",)
 _VALID_BACKENDS = ("qwen25vl", "internvl3", "gemma4")
+_COCO_IMAGE_DATASETS = {"refcoco", "refcoco+", "refcocog"}
+
+
+def _resolve_grounding_image_path(
+    data_root: str,
+    dataset_name: str,
+    image_name: str,
+    coco_images_dir: Optional[str] = None,
+) -> str:
+    """Resolve prepared grounding image paths.
+
+    Classic RefCOCO annotations store bare COCO ids and can use the canonical
+    COCO image directory. Other prepared grounding datasets use dataset-local
+    filenames such as ``grefcoco_*.jpg``, ``vg_*.jpg``, and ``grit_*.jpg``.
+    """
+    if os.path.isabs(image_name):
+        return image_name
+
+    dataset_image_path = os.path.join(data_root, dataset_name, "images", image_name)
+    candidates = []
+    if coco_images_dir is not None and dataset_name in _COCO_IMAGE_DATASETS:
+        stem = os.path.splitext(image_name)[0]
+        candidates.extend(
+            [
+                os.path.join(coco_images_dir, f"COCO_train2014_{stem}.jpg"),
+                os.path.join(coco_images_dir, image_name),
+            ]
+        )
+    candidates.append(dataset_image_path)
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[0]
 
 
 def _squeeze_intern(batch: Dict) -> Dict:
@@ -105,10 +139,10 @@ class RefCOCODataset(Dataset):
             crop_to_patches: Whether to request patch cropping from the image processor.
             system_prompt: System message for chat-templated backends.
             answer_ignore_index: Label mask for prompt tokens.
-            coco_images_dir: If set, resolve all relative image filenames from this
-                directory instead of ``{data_root}/{name}/images/``. Use this to
-                point at the canonical COCO train2014 folder, e.g.
-                ``/data/datasets/coco/images/train2014``.
+            coco_images_dir: If set, resolve classic RefCOCO numeric filenames
+                from this canonical COCO directory, e.g.
+                ``/data/datasets/coco/images/train2014``. Dataset-local
+                prepared images still resolve from ``{data_root}/{name}/images``.
 
         Raises:
             ValueError: If ``backend`` is not supported.
@@ -138,17 +172,12 @@ class RefCOCODataset(Dataset):
             for item in data:
                 item = dict(item)
                 item["dataset"] = name
-                if not os.path.isabs(item["image"]):
-                    img_dir = coco_images_dir or os.path.join(data_root, name, "images")
-                    fname = item["image"]
-                    if coco_images_dir is not None:
-                        # train2014 files are named COCO_train2014_XXXXXXXXXX.jpg
-                        stem = os.path.splitext(fname)[0]
-                        coco_fname = f"COCO_train2014_{stem}.jpg"
-                        candidate = os.path.join(img_dir, coco_fname)
-                        if os.path.exists(candidate):
-                            fname = coco_fname
-                    item["image"] = os.path.join(img_dir, fname)
+                item["image"] = _resolve_grounding_image_path(
+                    data_root=data_root,
+                    dataset_name=name,
+                    image_name=item["image"],
+                    coco_images_dir=coco_images_dir,
+                )
                 self.samples.append(item)
 
     def __len__(self) -> int:

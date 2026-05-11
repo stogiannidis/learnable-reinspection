@@ -15,14 +15,15 @@ Training is split into two stages:
 - **Stage 1** trains the re-inspection module on referring-expression grounding
   data, with optional auxiliary supervision.
 - **Stage 2** continues training on spatial VQA with standard causal language
-  modeling only.
+  modeling, with an optional weak auxiliary grounding stream.
 
 At a high level:
 
 - **Stage 1 total loss**
   `L_stage1 = L_ce + lambda_attn * L_attn + lambda_ground * L_ground + lambda_qt * L_qt`
 - **Stage 2 total loss**
-  `L_stage2 = L_ce`
+  `L_stage2 = L_ce + lambda_s2_aux * L_s2_aux` when auxiliary grounding is enabled;
+  otherwise `L_stage2 = L_ce`
 
 The main implementation lives in:
 
@@ -419,10 +420,19 @@ Stage 2 uses standard spatial VQA instruction tuning.
 ### Total Stage-2 objective
 
 ```text
-L_stage2 = L_ce
+L_stage2 =
+    L_ce
+  + stage2_aux_grounding_weight
+      * (
+          stage2_aux_attn_loss_weight * L_attn_aux
+        + stage2_aux_roi_feature_loss_weight * L_roi_aux
+      )
+    if stage2_aux_every_n_steps > 0
 ```
 
-There are no Stage-2 auxiliary losses in the current trainer.
+By default `stage2_aux_grounding_weight = 0.0` and `stage2_aux_every_n_steps = 0`,
+so the effective Stage-2 objective remains `L_ce` unless an experiment enables
+the auxiliary grounding stream.
 
 What `L_ce` supervises:
 
@@ -441,19 +451,35 @@ Stage-2 label construction follows the same basic pattern as Stage 1:
 4. compute causal next-token cross-entropy on the answer tokens
 
 There is no attention target, box target, or query-text contrastive target in
-the Stage-2 dataset path.
+the normal Stage-2 dataset path. When auxiliary grounding is enabled, the
+trainer builds a separate `RefCOCODataset` stream and periodically runs an
+extra forward pass on those ROI-labeled samples with `labels=None` and
+`return_attn_maps=True`.
+
+The auxiliary terms are:
+
+- `L_attn_aux`: the same selector-query KL attention loss used in Stage 1,
+  computed from `attn_vis` and `attn_target_mask`
+- `L_roi_aux`: the same ROI feature cosine loss used in Stage 1, computed from
+  content queries and ROI-pooled frozen vision features
+
+The direct bbox regression head is not part of Stage 2 auxiliary grounding by
+default; the goal is to keep the re-inspection tokens grounded without forcing
+Stage-2 instruction tuning to keep optimizing coordinate prediction.
 
 ### What is trainable in Stage 2
 
 Stage 2 is not just "plain SFT on the whole model." The loss is still only
 cross-entropy, but the trainable parameters are restricted:
 
-- the re-inspection module remains trainable
+- the re-inspection module is trainable by default, controlled by
+  `stage2_train_reinspection`
 - the base model stays frozen
 - LoRA adapters are attached to the language model and trained alongside the
   re-inspection module
 
-So Stage 2 changes the **trainable parameter set**, not the loss formula.
+So Stage 2 always changes the **trainable parameter set**, and can optionally
+add a weak grounding term to the loss formula.
 
 ---
 

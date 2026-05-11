@@ -1,0 +1,19 @@
+# @package _global_
+# Stage 1 — grounding. InternVL3. Throughput-optimized variant of s1_internvl.
+#
+# Changes vs s1_internvl:
+#   - ZeRO-2 instead of ZeRO-3 (base model frozen, trainable adapter is tiny —
+#     no need to partition params; cuts gather/scatter overhead per step).
+#   - Larger micro-batch + smaller grad_accum (same effective batch, fewer
+#     comm rounds per optimizer step).
+defaults:
+  - override /backend: internvl3
+  - override /stage: stage1
+  - override /stage1_datasets: refcoco
+
+deepspeed_config: src/configs/deepspeed_z2.json
+
+stage1_batch_size: 16
+stage1_grad_accum: 8
+
+wandb_run_name: internvl3-stage1-fast
