@@ -19,5 +19,8 @@ wandb_run_name: null
 wandb_log_interval: 300
 wandb_gradient_log_interval: 1
 experiment_name: null
+pbar_enabled: false
+pbar_api_url: "https://pbar.io/api"
+pbar_update_interval: 0.5
 num_workers: 16
 stage1_max_steps: null

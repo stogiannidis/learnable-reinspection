@@ -25,8 +25,10 @@ import torch.nn.functional as F
 from peft import LoraConfig, TaskType, get_peft_model
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, DistributedSampler, Subset
-from tqdm import tqdm
+from tqdm import tqdm as tqdm_stdlib
 from transformers import AutoProcessor
+
+from src.utils.progress import get_tqdm
 
 from src.backends.hf_hub_utils import resolve_pretrained_local_path
 from src.model.attn_loss import compute_attn_loss_kl
@@ -1506,7 +1508,8 @@ def run_training(config: ReInspectionConfig) -> None:
         epoch_stage2_aux_attn = 0.0
         epoch_stage2_aux_roi = 0.0
 
-        pbar = tqdm(
+        tqdm_cls = get_tqdm(config, cloud=is_main_process())
+        pbar = tqdm_cls(
             train_loader,
             desc=f"Epoch {epoch + 1}/{n_epochs}",
             disable=not is_main_process(),
@@ -1563,7 +1566,7 @@ def run_training(config: ReInspectionConfig) -> None:
                 dist.all_reduce(_finite, op=dist.ReduceOp.MIN)
             if _finite.item() < 0.5:
                 if is_main_process():
-                    tqdm.write(
+                    tqdm_stdlib.write(
                         f"[WARNING] Non-finite loss={main_loss.item():.4f} "
                         f"(ce={ce_loss.item():.4f}, attn={attn_loss.item():.4f}, "
                         f"grounding={grounding_loss.item():.4f}, "
@@ -1614,7 +1617,7 @@ def run_training(config: ReInspectionConfig) -> None:
                     dist.all_reduce(aux_finite, op=dist.ReduceOp.MIN)
                 if aux_finite.item() < 0.5:
                     if is_main_process():
-                        tqdm.write(
+                        tqdm_stdlib.write(
                             f"[WARNING] Non-finite stage2_aux_grounding_loss="
                             f"{stage2_aux_grounding_loss.item():.4f} "
                             f"at global_step={global_step}, skipping aux gradients"
@@ -1764,7 +1767,7 @@ def run_training(config: ReInspectionConfig) -> None:
         if use_qt_infonce:
             aux_msg += f" qt_nce={epoch_qt_infonce / num_steps:.4f}"
         if is_main_process():
-            tqdm.write(
+            tqdm_stdlib.write(
                 f"Epoch {epoch + 1}/{n_epochs}: loss={avg_epoch_loss:.4f} ce={epoch_ce / num_steps:.4f}"
                 + aux_msg
             )
@@ -1804,7 +1807,7 @@ def run_training(config: ReInspectionConfig) -> None:
                 val_summary[f"{pfx}/val/stage1_supervision_loss"] = sup
             _log_wandb(val_summary, global_step)
             if is_main_process():
-                tqdm.write(
+                tqdm_stdlib.write(
                     f"Epoch {epoch + 1}/{n_epochs} val: loss={val_metrics['loss']:.4f} "
                     f"ce={val_metrics['ce_loss']:.4f}"
                 )

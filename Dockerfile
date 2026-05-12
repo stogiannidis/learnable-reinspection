@@ -37,7 +37,7 @@ RUN apt-get update && \
 
 WORKDIR /data/users/stogian/learnable-reinspection
 
-COPY requirements.vlm.txt .
+COPY requirements.txt .
 
 RUN uv pip install --system --no-cache --break-system-packages -r requirements.txt
 

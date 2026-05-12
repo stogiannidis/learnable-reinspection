@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from peft import PeftModel
 from PIL import Image
-from tqdm import tqdm
+from tqdm import tqdm as tqdm_stdlib
 from transformers import (
     AutoProcessor,
     InternVLForConditionalGeneration,
@@ -44,6 +44,7 @@ from src.data.gemma4_chat import build_chat_messages as gemma4_build_chat
 from src.data.spatial_dataset import SpatialVQADataset
 from src.data.utils import build_chat_messages as qwen_build_chat
 from src.utils.hydra_util import strip_deepspeed_local_rank_argv
+from src.utils.progress import maybe_track_tqdm
 from src.training.trainer import _env_info, _git_info
 
 strip_deepspeed_local_rank_argv()
@@ -604,13 +605,16 @@ def evaluate_benchmark(
     _QWEN_BACKENDS = ("qwen25vl",)
     _PROMPT_LEN_BACKENDS = ("internvl3", "gemma4")
 
-    for i in tqdm(
+    pbar = tqdm_stdlib(
         range(n),
         desc=benchmark_name,
         miniters=EVAL_PROGRESS_LOG_INTERVAL,
         mininterval=1.0,
         disable=_eval_tqdm_disable(),
-    ):
+    )
+    maybe_track_tqdm(config, pbar)
+
+    for i in pbar:
         sample = ds.samples[i]
         gt_answer = sample["answer"]
         question = sample["question"]
@@ -660,7 +664,7 @@ def evaluate_benchmark(
                 )
         except Exception as e:
             skipped += 1
-            tqdm.write(f"  skip {i}: {e}")
+            tqdm_stdlib.write(f"  skip {i}: {e}")
             continue
 
         inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}

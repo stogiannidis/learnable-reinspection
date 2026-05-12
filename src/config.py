@@ -39,6 +39,11 @@ class ReInspectionConfig:
     wandb_log_interval: int = 300
     wandb_gradient_log_interval: int = 1
     experiment_name: Optional[str] = None
+    # Optional pbar.io cloud progress (https://pbar.io/docs/integrations).
+    # When enabled, set PBAR_API_KEY in the environment if your account requires it.
+    pbar_enabled: bool = False
+    pbar_api_url: str = "https://pbar.io/api"
+    pbar_update_interval: float = 0.5
     num_workers: int = 4
 
     # Eval-specific

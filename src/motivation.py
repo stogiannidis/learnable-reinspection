@@ -32,13 +32,14 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from PIL import Image
-from tqdm import tqdm
+from tqdm import tqdm as tqdm_stdlib
 from transformers import AutoProcessor
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
 from src.config import ReInspectionConfig
+from src.utils.progress import get_tqdm
 from src.data.chat_template import build_chat_messages as intern_build_chat
 from src.data.gemma4_chat import build_chat_messages as gemma4_build_chat
 from src.data.minimal_pairs import MinimalPair, generate_pairs_from_vsr
@@ -409,7 +410,8 @@ def run_flip_consistency(
     }
     model.eval()
 
-    for i, pair in enumerate(tqdm(pairs, desc="Flip Consistency", miniters=50)):
+    tqdm_cls = get_tqdm(config, cloud=True)
+    for i, pair in enumerate(tqdm_cls(pairs, desc="Flip Consistency", miniters=50)):
         image_path = os.path.join(image_root, pair.image)
         if not os.path.isfile(image_path):
             continue
@@ -424,7 +426,7 @@ def run_flip_consistency(
                 backend, config, is_reinspection,
             )
         except Exception as e:
-            tqdm.write(f"  skip pair {i}: {e}")
+            tqdm_stdlib.write(f"  skip pair {i}: {e}")
             continue
 
         gen_a = out_a["generated_text"]
@@ -523,7 +525,8 @@ def run_mirror_test(
     }
     model.eval()
 
-    for i, pair in enumerate(tqdm(lr_pairs, desc="Mirror Test", miniters=50)):
+    tqdm_cls = get_tqdm(config, cloud=True)
+    for i, pair in enumerate(tqdm_cls(lr_pairs, desc="Mirror Test", miniters=50)):
         image_path = os.path.join(image_root, pair.image)
         if not os.path.isfile(image_path):
             continue
@@ -546,7 +549,7 @@ def run_mirror_test(
                 backend, config, is_reinspection,
             )
         except Exception as e:
-            tqdm.write(f"  skip mirror pair {i}: {e}")
+            tqdm_stdlib.write(f"  skip mirror pair {i}: {e}")
             continue
 
         gen_orig = out_orig["generated_text"]
@@ -629,7 +632,8 @@ def run_attention_divergence(
     samples = []
     model.eval()
 
-    for i, pair in enumerate(tqdm(pairs, desc="Attention Divergence", miniters=50)):
+    tqdm_cls = get_tqdm(config, cloud=True)
+    for i, pair in enumerate(tqdm_cls(pairs, desc="Attention Divergence", miniters=50)):
         image_path = os.path.join(image_root, pair.image)
         if not os.path.isfile(image_path):
             continue
@@ -644,7 +648,7 @@ def run_attention_divergence(
                 backend, config, is_reinspection,
             )
         except Exception as e:
-            tqdm.write(f"  skip pair {i}: {e}")
+            tqdm_stdlib.write(f"  skip pair {i}: {e}")
             continue
 
         sample = {
