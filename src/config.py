@@ -59,6 +59,7 @@ class ReInspectionConfig:
     )
     eval_condition: str = "reinspection"
     eval_compare: bool = False
+    frozen_cache_file: Optional[str] = None
     max_samples: int = -1
 
     # ------------------------------------------------------------------ #

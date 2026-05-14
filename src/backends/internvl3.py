@@ -11,6 +11,7 @@ from transformers import AutoProcessor, InternVLForConditionalGeneration
 
 from src.backends.hf_hub_utils import resolve_pretrained_local_path
 from src.config import ReInspectionConfig
+from src.model.lm_loss import masked_answer_cross_entropy
 from src.model.outputs import ReInspectionOutput
 from src.model.reinspection_module import ReInspectionModule
 
@@ -79,6 +80,8 @@ class InternVL3WithReInspection(nn.Module):
         self._last_attn_vis = None
         self._last_generation_prompt_lengths = None
         self._assistant_generation_suffix = self._resolve_generation_suffix(processor)
+        self._debug_tokenizer = getattr(processor, "tokenizer", None) if processor is not None else None
+        self._debug_emitted = {"train": False, "eval": False}
 
     @property
     def device(self):
@@ -297,6 +300,43 @@ class InternVL3WithReInspection(nn.Module):
             "input_ids": new_input_ids,
         }
 
+    def _debug_emit_insertion(
+        self,
+        mode: str,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor],
+        insert_positions: torch.LongTensor,
+    ) -> None:
+        """Print decoded context around R-token insertion point (once per mode).
+
+        Use to verify train vs eval insertion alignment. Set
+        ``self._debug_emitted[mode] = False`` to re-emit.
+        """
+        if self._debug_emitted.get(mode, True):
+            return
+        tok = self._debug_tokenizer
+        if tok is None:
+            return
+        pos = int(insert_positions[0].item())
+        if attention_mask is not None:
+            seq_len = int(attention_mask[0].sum().item())
+        else:
+            seq_len = int(input_ids.shape[1])
+        N_q = int(self.config.n_queries)
+        # window of 8 tokens on each side, skip image-token runs for readability
+        lo = max(0, pos - 8)
+        hi = min(seq_len, pos + 8)
+        ids = input_ids[0, lo:hi].tolist()
+        decoded = [tok.decode([i], skip_special_tokens=False) for i in ids]
+        marker_idx = pos - lo
+        decoded.insert(marker_idx, f"<<R×{N_q}>>")
+        print(
+            f"[R-INSERT DEBUG | {mode}] seq_len={seq_len} insert_pos={pos} "
+            f"window[{lo}:{hi}]:\n  {' | '.join(repr(t) for t in decoded)}",
+            flush=True,
+        )
+        self._debug_emitted[mode] = True
+
     def _nan_check(self, tensor: torch.Tensor, name: str, step: int) -> None:
         if tensor is not None and torch.isnan(tensor).any():
             raise RuntimeError(f"NaN detected in {name} at step {step}")
@@ -336,6 +376,7 @@ class InternVL3WithReInspection(nn.Module):
         pixel_values: Optional[torch.Tensor] = None,
         vision_feature_layer: Optional[int] = None,
         vision_feature_select_strategy: Optional[str] = None,
+        need_weights: bool = True,
     ) -> dict:
         step = getattr(self, "_fwd_step", 0)
 
@@ -355,6 +396,10 @@ class InternVL3WithReInspection(nn.Module):
             self._nan_check(image_features, "image_features", step)
 
         insert_positions = self._find_insert_positions(input_ids, attention_mask=attention_mask, labels=labels)
+        self._debug_emit_insertion(
+            "train" if labels is not None else "eval",
+            input_ids, attention_mask, insert_positions,
+        )
         V, T, V_mask, T_mask = self._extract_vision_and_text(
             inputs_embeds,
             input_ids,
@@ -365,12 +410,12 @@ class InternVL3WithReInspection(nn.Module):
         self._nan_check(T, "T_extracted", step)
 
         R, A_task, A_vis, R_r, Q_task, T_down = self.reinspection(
-            V, T, V_mask=V_mask, T_mask=T_mask, need_weights=True,
+            V, T, V_mask=V_mask, T_mask=T_mask, need_weights=need_weights,
         )
         self._nan_check(R, "R_tokens", step)
 
-        self._last_attn_task = A_task.detach()
-        self._last_attn_vis = A_vis.detach()
+        self._last_attn_task = A_task.detach() if A_task is not None else None
+        self._last_attn_vis = A_vis.detach() if A_vis is not None else None
 
         inserted = self._insert_tokens(
             inputs_embeds, R, insert_positions,
@@ -405,11 +450,13 @@ class InternVL3WithReInspection(nn.Module):
         logits_to_keep: int = 0,
         return_attn_maps: bool = False,
         return_query_text_tensors: bool = False,
+        return_logits: bool = True,
         **kwargs,
     ) -> ReInspectionOutput:
         prepared = self._prepare_reinspection_inputs(
             input_ids, inputs_embeds, attention_mask, position_ids, labels,
             pixel_values, vision_feature_layer, vision_feature_select_strategy,
+            need_weights=return_attn_maps,
         )
 
         prepared["inputs_embeds"] = prepared["inputs_embeds"].to(self.base_model.dtype)
@@ -425,15 +472,18 @@ class InternVL3WithReInspection(nn.Module):
 
         hidden_states = outputs.last_hidden_state
 
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.base_model.lm_head(hidden_states[:, slice_indices, :])
-
         loss = None
+        logits = None
         if prepared["labels"] is not None:
-            labels = prepared["labels"]
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = _chunked_cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+            loss = masked_answer_cross_entropy(
+                hidden_states,
+                prepared["labels"],
+                self.base_model.lm_head,
+                ignore_index=self.config.answer_ignore_index,
+            )
+        if return_logits:
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            logits = self.base_model.lm_head(hidden_states[:, slice_indices, :])
 
         return ReInspectionOutput(
             loss=loss,
@@ -475,13 +525,15 @@ class InternVL3WithReInspection(nn.Module):
             input_ids, None, attention_mask, None, None,
             pixel_values, vision_feature_layer, vision_feature_select_strategy,
         )
-        self._last_generation_prompt_lengths = self._sequence_lengths(
-            prepared["input_ids"], prepared["attention_mask"]
-        ).detach().cpu()
+        # When generate() is called with inputs_embeds and no input_ids, HF returns
+        # only the newly-generated token IDs (no prompt prefix in the output tensor).
+        # Setting prompt lengths to 0 ensures evaluate.py slices from index 0.
+        batch_size = prepared["inputs_embeds"].shape[0]
+        self._last_generation_prompt_lengths = torch.zeros(batch_size, dtype=torch.long)
 
         return self.base_model.generate(
-            input_ids=prepared["input_ids"],
-            inputs_embeds=prepared["inputs_embeds"],
+            input_ids=None,
+            inputs_embeds=prepared["inputs_embeds"].to(self.base_model.dtype),
             attention_mask=prepared["attention_mask"],
             **kwargs,
         )

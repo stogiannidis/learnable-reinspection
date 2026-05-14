@@ -48,3 +48,11 @@ latest_stage1_checkpoint() {
   [[ -n "$best" ]] || { echo "run_train: no checkpoint found under ${base}" >&2; return 1; }
   printf '%s' "$best"
 }
+
+configured_stage1_checkpoint() {
+  local name="$1"
+  local config="src/configs/experiment/${name}.yaml"
+  [[ -f "$config" ]] || { echo "run_train: missing ${config}" >&2; return 1; }
+
+  awk '$1 == "stage1_checkpoint:" {sub(/#.*/, ""); print $2; exit}' "$config" | tr -d "\"'"
+}

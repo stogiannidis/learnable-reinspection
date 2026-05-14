@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  generateName: reinspection-internvl-stage2-
+  generateName: reinspection-eval-
   namespace: eidf098ns
   labels:
     kueue.x-k8s.io/queue-name: eidf098ns-user-queue
@@ -12,10 +12,10 @@ spec:
   backoffLimit: 0
   template:
     metadata:
-      name: reinspection-internvl-stage2
+      name: reinspection-eval
     spec:
       containers:
-      - name: reinspection-internvl-stage2
+      - name: reinspection-eval
         image: stogian/l_reinspection:latest
         workingDir: /data/users/stogian/learnable-reinspection
         command:
@@ -23,17 +23,30 @@ spec:
           - -c
           - |
             set -euo pipefail
-            mkdir -p logs models
-            REINSPECTION_EXPERIMENT=s1_internvl \
-            REINSPECTION_EXPERIMENT_STAGE2=s2_internvl \
-              bash src/scripts/run_train.sh
+            mkdir -p logs outputs/internvl3/grounding outputs/internvl3
+            export OMP_NUM_THREADS=4
+            export HYDRA_FULL_ERROR=1
+            export HF_HOME=/data/Huggingface
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+            export WANDB_MODE=offline
+            export PYTHONDONTWRITEBYTECODE=1
+
+            find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+            bash src/scripts/run_eval.sh \
+              checkpoint_dir=models/internvl3/grounding/stage2/epoch_2 \
+              ~lora_checkpoint_dir \
+              output_file=outputs/internvl3/grounding/eval_stage2_epoch2_reinspection.json \
+              eval_condition=reinspection \
+              eval_compare=false \
+              2>&1 | tee logs/eval_grounding_stage2_epoch2_reinspection.log
         imagePullPolicy: Always
         env:
           - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
           - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
         resources:
-          requests: { cpu: 16, memory: "128Gi", nvidia.com/gpu: 4 }
-          limits:   { cpu: 16, memory: "128Gi", nvidia.com/gpu: 4 }
+          requests: { cpu: 16, memory: "64Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 16, memory: "64Gi", nvidia.com/gpu: 1 }
         volumeMounts:
           - { mountPath: /dev/shm, name: dshm }
           - { mountPath: /data,    name: nfs }
@@ -41,7 +54,7 @@ spec:
       securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
       volumes:
       - name: dshm
-        emptyDir: { medium: Memory, sizeLimit: "64Gi" }
+        emptyDir: { medium: Memory, sizeLimit: "32Gi" }
       - name: nfs
         nfs: { server: 10.24.6.66, path: / }
       nodeSelector:

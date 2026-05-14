@@ -8,12 +8,12 @@ template. Same wrapping pattern as the InternVL3/Gemma4 backends.
 """
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Optional, List, Tuple
-from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from transformers import Qwen2_5_VLForConditionalGeneration
 
 from src.backends.hf_hub_utils import resolve_pretrained_local_path
 from src.config import ReInspectionConfig
+from src.model.lm_loss import masked_answer_cross_entropy
 from src.model.outputs import ReInspectionOutput
 from src.model.reinspection_module import ReInspectionModule
 
@@ -403,6 +403,7 @@ class Qwen25VLWithReInspection(nn.Module):
         logits_to_keep: int = 0,
         return_attn_maps: bool = False,
         return_query_text_tensors: bool = False,
+        return_logits: bool = True,
         **kwargs,
     ) -> ReInspectionOutput:
         """Forward pass with Re-Inspection token injection."""
@@ -423,18 +424,21 @@ class Qwen25VLWithReInspection(nn.Module):
         )
 
         hidden_states = outputs.last_hidden_state
-        if logits_to_keep > 0:
-            logits = self.base_model.lm_head(hidden_states[:, -logits_to_keep:, :])
-        else:
-            logits = self.base_model.lm_head(hidden_states)
 
         loss = None
+        logits = None
         if prepared["labels"] is not None:
-            loss = self.base_model.loss_function(
-                logits=logits,
-                labels=prepared["labels"],
-                vocab_size=self.base_model.config.text_config.vocab_size,
+            loss = masked_answer_cross_entropy(
+                hidden_states,
+                prepared["labels"],
+                self.base_model.lm_head,
+                ignore_index=self.config.answer_ignore_index,
             )
+        if return_logits:
+            if logits_to_keep > 0:
+                logits = self.base_model.lm_head(hidden_states[:, -logits_to_keep:, :])
+            else:
+                logits = self.base_model.lm_head(hidden_states)
 
         return ReInspectionOutput(
             loss=loss,

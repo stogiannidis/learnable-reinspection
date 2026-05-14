@@ -31,6 +31,7 @@ spec:
           - |
             set -euo pipefail
             mkdir -p logs models
+            STAGE1_CHECKPOINT=models/internvl3/stage1/epoch_5/reinspection_module.pt \
             REINSPECTION_EXPERIMENT_STAGE2=s2_internvl_grounding \
               bash src/scripts/run_train_stage2.sh
         imagePullPolicy: Always
@@ -38,8 +39,8 @@ spec:
           - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
           - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
         resources:
-          requests: { cpu: 16, memory: "128Gi", nvidia.com/gpu: 4 }
-          limits:   { cpu: 16, memory: "128Gi", nvidia.com/gpu: 4 }
+          requests: { cpu: 32, memory: "256Gi", nvidia.com/gpu: 4 }
+          limits:   { cpu: 32, memory: "256Gi", nvidia.com/gpu: 4 }
         volumeMounts:
           - { mountPath: /dev/shm, name: dshm }
           - { mountPath: /data,    name: nfs }

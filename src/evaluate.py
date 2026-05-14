@@ -459,20 +459,39 @@ def load_condition_model(
         FileNotFoundError: When expected LoRA weights are missing on disk.
     """
     def _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir):
-        """Load reinspection weights and optional LoRA into a *WithReInspection wrapper."""
-        if checkpoint_dir:
-            path = os.path.join(checkpoint_dir, "reinspection_module.pt")
-            if os.path.exists(path):
-                state_dict = torch.load(path, map_location="cpu", weights_only=True)
-                model.reinspection.load_state_dict(state_dict)
-            model.reinspection.to(model.device)
-            lora_path = os.path.join(checkpoint_dir, "lora_weights")
-            if not os.path.exists(lora_path) and lora_checkpoint_dir:
-                lora_path = os.path.join(lora_checkpoint_dir, "lora_weights")
-            if os.path.exists(lora_path):
-                model.base_model.model.language_model = PeftModel.from_pretrained(
-                    model.base_model.model.language_model, lora_path
-                )
+        """Load reinspection weights and optional LoRA into a *WithReInspection wrapper.
+
+        Reinspection module: prefer ``lora_checkpoint_dir`` when it carries one
+        (Stage-2 retrains the module jointly with LoRA; pairing Stage-1's module
+        with Stage-2's LoRA produces catastrophic collapse to grounding outputs).
+        """
+        ri_path = None
+        for cand_dir in (lora_checkpoint_dir, checkpoint_dir):
+            if not cand_dir:
+                continue
+            cand = os.path.join(cand_dir, "reinspection_module.pt")
+            if os.path.exists(cand):
+                ri_path = cand
+                break
+        if ri_path is not None:
+            state_dict = torch.load(ri_path, map_location="cpu", weights_only=True)
+            model.reinspection.load_state_dict(state_dict)
+        model.reinspection.to(model.device)
+        print(f"[reinspection] loaded module from: {ri_path}", flush=True)
+
+        lora_path = None
+        for cand_dir in (checkpoint_dir, lora_checkpoint_dir):
+            if not cand_dir:
+                continue
+            cand = os.path.join(cand_dir, "lora_weights")
+            if os.path.exists(cand):
+                lora_path = cand
+                break
+        if lora_path is not None:
+            model.base_model.model.language_model = PeftModel.from_pretrained(
+                model.base_model.model.language_model, lora_path
+            )
+        print(f"[reinspection] loaded LoRA from: {lora_path}", flush=True)
 
     def _load_lora_only(base_model, checkpoint_dir, lora_checkpoint_dir):
         ckpt = lora_checkpoint_dir or checkpoint_dir
@@ -790,6 +809,23 @@ def main(cfg: DictConfig) -> None:
             print(f"Skipping {condition}: no checkpoint_dir")
             continue
 
+        # Load frozen baseline from cache if available (skips GPU inference).
+        if condition == "frozen" and config.frozen_cache_file and os.path.exists(config.frozen_cache_file):
+            print(f"\n{'=' * 60}\nCondition: frozen  [loaded from cache: {config.frozen_cache_file}]\n{'=' * 60}")
+            with open(config.frozen_cache_file, "r", encoding="utf-8") as _f:
+                cached = json.load(_f)
+            for r in cached:
+                r["condition"] = "frozen"
+                all_results.append(r)
+                m = {
+                    f"{prefix}/frozen/{r['benchmark']}/accuracy": r["accuracy"],
+                    f"{prefix}/frozen/{r['benchmark']}/correct": r["correct"],
+                    f"{prefix}/frozen/{r['benchmark']}/total": r["total"],
+                }
+                _log_wandb(m, wandb_step)
+                wandb_step += 1
+            continue
+
         print(f"\n{'=' * 60}\nCondition: {condition}\n{'=' * 60}")
         model, is_ri = load_condition_model(
             backend, condition, config, processor,
@@ -798,6 +834,7 @@ def main(cfg: DictConfig) -> None:
         )
         model.eval()
 
+        condition_results = []
         for bm in config.benchmarks:
             if bm not in BENCHMARK_CONFIGS:
                 continue
@@ -817,6 +854,7 @@ def main(cfg: DictConfig) -> None:
                 max_samples=config.max_samples,
             )
             result["condition"] = condition
+            condition_results.append(result)
             all_results.append(result)
             m = {
                 f"{prefix}/{condition}/{bm}/accuracy": result["accuracy"],
@@ -827,6 +865,14 @@ def main(cfg: DictConfig) -> None:
                 m[f"{prefix}/{condition}/{bm}/attention_entropy"] = result["mean_attention_entropy"]
             _log_wandb(m, wandb_step)
             wandb_step += 1
+
+        # Persist frozen results so future runs can skip this pass.
+        if condition == "frozen" and config.frozen_cache_file:
+            os.makedirs(os.path.dirname(config.frozen_cache_file) or ".", exist_ok=True)
+            cache_records = [{k: v for k, v in r.items() if k != "samples"} for r in condition_results]
+            with open(config.frozen_cache_file, "w", encoding="utf-8") as _f:
+                json.dump(cache_records, _f, indent=2)
+            print(f"  Frozen baseline saved to {config.frozen_cache_file}")
 
         del model
         torch.cuda.empty_cache()

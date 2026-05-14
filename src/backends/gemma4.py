@@ -20,6 +20,7 @@ from transformers import AutoProcessor, Gemma4ForConditionalGeneration
 
 from src.backends.hf_hub_utils import resolve_pretrained_local_path
 from src.config import ReInspectionConfig
+from src.model.lm_loss import masked_answer_cross_entropy
 from src.model.outputs import ReInspectionOutput
 from src.model.reinspection_module import ReInspectionModule
 
@@ -371,6 +372,7 @@ class Gemma4WithReInspection(nn.Module):
         pixel_values: Optional[torch.Tensor] = None,
         image_position_ids: Optional[torch.LongTensor] = None,
         mm_token_type_ids: Optional[torch.LongTensor] = None,
+        need_weights: bool = True,
     ) -> dict:
         if inputs_embeds is None:
             inputs_embeds = self.base_model.get_input_embeddings()(input_ids)
@@ -394,11 +396,11 @@ class Gemma4WithReInspection(nn.Module):
         )
 
         R, A_task, A_vis, R_r, Q_task, T_down = self.reinspection(
-            V, T, V_mask=V_mask, T_mask=T_mask, need_weights=True,
+            V, T, V_mask=V_mask, T_mask=T_mask, need_weights=need_weights,
         )
 
-        self._last_attn_task = A_task.detach()
-        self._last_attn_vis = A_vis.detach()
+        self._last_attn_task = A_task.detach() if A_task is not None else None
+        self._last_attn_vis = A_vis.detach() if A_vis is not None else None
 
         inserted = self._insert_tokens(
             inputs_embeds, R, insert_positions,
@@ -436,11 +438,13 @@ class Gemma4WithReInspection(nn.Module):
         logits_to_keep: int = 0,
         return_attn_maps: bool = False,
         return_query_text_tensors: bool = False,
+        return_logits: bool = True,
         **kwargs,
     ) -> ReInspectionOutput:
         prepared = self._prepare_reinspection_inputs(
             input_ids, inputs_embeds, attention_mask, position_ids, labels,
             pixel_values, image_position_ids, mm_token_type_ids,
+            need_weights=return_attn_maps,
         )
 
         prepared["inputs_embeds"] = prepared["inputs_embeds"].to(self.base_model.dtype)
@@ -463,14 +467,18 @@ class Gemma4WithReInspection(nn.Module):
 
         hidden_states = outputs.last_hidden_state
 
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.base_model.lm_head(hidden_states[:, slice_indices, :])
-
         loss = None
+        logits = None
         if prepared["labels"] is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = prepared["labels"][..., 1:].contiguous()
-            loss = _chunked_cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+            loss = masked_answer_cross_entropy(
+                hidden_states,
+                prepared["labels"],
+                self.base_model.lm_head,
+                ignore_index=self.config.answer_ignore_index,
+            )
+        if return_logits:
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            logits = self.base_model.lm_head(hidden_states[:, slice_indices, :])
 
         return ReInspectionOutput(
             loss=loss,
@@ -512,13 +520,12 @@ class Gemma4WithReInspection(nn.Module):
             input_ids, None, attention_mask, None, None,
             pixel_values, image_position_ids, mm_token_type_ids,
         )
-        self._last_generation_prompt_lengths = self._sequence_lengths(
-            prepared["input_ids"], prepared["attention_mask"]
-        ).detach().cpu()
+        batch_size = prepared["inputs_embeds"].shape[0]
+        self._last_generation_prompt_lengths = torch.zeros(batch_size, dtype=torch.long)
 
         return self.base_model.generate(
-            input_ids=prepared["input_ids"],
-            inputs_embeds=prepared["inputs_embeds"],
+            input_ids=None,
+            inputs_embeds=prepared["inputs_embeds"].to(self.base_model.dtype),
             attention_mask=prepared["attention_mask"],
             **kwargs,
         )
