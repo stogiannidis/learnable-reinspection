@@ -1,0 +1,5 @@
+# @package _global_
+stage: 1
+output_dir: models
+stage1_checkpoint: null
+wandb_run_name: stage1-internvl3

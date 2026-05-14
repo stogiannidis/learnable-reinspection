@@ -1,0 +1,14 @@
+# @package _global_
+# Legacy InternVL3: checkpoints trained with d_bottleneck=256, n_queries=32, n_heads=4
+# and the stage1/stage2 batch recipe below. Composes ``internvl3`` then applies overrides.
+defaults:
+  - internvl3
+  - _self_
+
+d_bottleneck: 256
+n_queries: 32
+n_heads: 4
+stage1_batch_size: 4
+stage1_grad_accum: 16
+stage1_attn_loss_weight: 0.4
+stage2_batch_size: 8

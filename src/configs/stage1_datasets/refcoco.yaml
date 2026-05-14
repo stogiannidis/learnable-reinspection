@@ -1,0 +1,6 @@
+# @package _global_
+# RefCOCO family base. Combine with `+stage1_extra_datasets=[grit,grefcoco,vg_grounding]`.
+stage1_dataset_names:
+  - refcoco
+  - refcoco+
+  - refcocog

@@ -4,7 +4,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 ENV TORCH_HOME=/data/users/stogian/.torch \
     HF_HOME=/data/Huggingface \
-    HF_DATASETS_CACHE=/data/Huggingface \
     HF_HUB_ENABLE_HF_TRANSFER=1 \
     DNNLIB_CACHE_DIR=/data/users/stogian/.cache/dnnlib \
     TORCH_EXTENSIONS_DIR=/data/users/stogian/.torch/torch_extensions \
@@ -26,29 +25,26 @@ RUN apt-get update && \
         python3.12 \
         python3.12-venv \
         python3.12-dev \
-        python3-pip \
+        curl \
         git \
         build-essential && \
     ln -sf /usr/bin/python3.12 /usr/bin/python && \
     ln -sf /usr/bin/python3.12 /usr/bin/python3 && \
+    curl -Ls https://astral.sh/uv/install.sh | sh && \
+    ln -sf /root/.local/bin/uv /usr/local/bin/uv && \
     apt-get clean && \
-    rm -rf /var/lib/apt/lists/* 
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /data/users/stogian/learnable-reinspection
 
-COPY requirements.vlm.txt requirements.vlm.txt
-COPY reinspection_qwen3vl/requirements.txt reinspection_qwen3vl/requirements.txt
-COPY reinspection_internvl3/requirements.txt reinspection_internvl3/requirements.txt
-COPY reinspection_vlm/requirements.txt reinspection_vlm/requirements.txt
+COPY requirements.txt .
 
-RUN python -m pip install --no-cache-dir --break-system-packages -r requirements.vlm.txt
+RUN uv pip install --system --no-cache --break-system-packages -r requirements.txt
 
-COPY reinspection_vlm/ reinspection_vlm/
-COPY reinspection_qwen3vl/ reinspection_qwen3vl/
-COPY reinspection_internvl3/ reinspection_internvl3/
-COPY doc.md simpledoc.md CLAUDE.md ./
+COPY src/ src/
 
 RUN mkdir -p \
+        /data/Huggingface \
         /data/users/stogian/.torch \
         /data/users/stogian/.cache/dnnlib \
         /data/users/stogian/.torch/torch_extensions \
@@ -58,7 +54,7 @@ RUN mkdir -p \
         /data/users/stogian/.cache/triton && \
     groupadd --gid 4451 stogian_ph && \
     useradd -u 30545 -g 4451 -m -s /bin/bash stogian_ph && \
-    chown -R stogian_ph /data/users/stogian
+    chown -R stogian_ph /data/users/stogian /data/Huggingface
 
 RUN chown -R stogian_ph /data/users/stogian/learnable-reinspection
 

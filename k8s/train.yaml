@@ -1,21 +1,19 @@
+# Standard 4x H100 training job. Non-secret env (experiments, OMP, HF_HOME, …)
+# lives in src/scripts/run_train.sh; this manifest only injects secrets.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  generateName: reinspection-internvl-stage1-
+  generateName: reinspection-train-
   namespace: eidf098ns
   labels:
     kueue.x-k8s.io/queue-name: eidf098ns-user-queue
 spec:
   ttlSecondsAfterFinished: 36000
-  parallelism: 1
-  completions: 1
   backoffLimit: 0
   template:
-    metadata:
-      name: reinspection-internvl-stage1
     spec:
       containers:
-      - name: reinspection-internvl-stage1
+      - name: train
         image: stogian/l_reinspection:latest
         workingDir: /data/users/stogian/learnable-reinspection
         command:
@@ -24,12 +22,11 @@ spec:
           - |
             set -euo pipefail
             mkdir -p logs models
-            REINSPECTION_EXPERIMENT=s1_internvl REINSPECTION_EXPERIMENT_STAGE2= \
-              bash src/scripts/run_train.sh
-        imagePullPolicy: Always
+            bash src/scripts/run_train.sh
         env:
           - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
           - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+        imagePullPolicy: Always
         resources:
           requests: { cpu: 32, memory: "128Gi", nvidia.com/gpu: 4 }
           limits:   { cpu: 32, memory: "128Gi", nvidia.com/gpu: 4 }

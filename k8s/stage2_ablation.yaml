@@ -1,7 +1,14 @@
+# Stage 2 ablation — InternVL3 from a specific Stage-1 checkpoint.
+# Set REINSPECTION_EXPERIMENT_STAGE2 inline (in the command below) to one of:
+#   s2_internvl_grounding  (from grounding Stage-1)
+#   s2_internvl_focal      (from focal Stage-1)
+#   s2_internvl_kl         (from kl Stage-1)
+# Edit stage1_checkpoint in the chosen src/configs/experiment/<name>.yaml
+# if the default epoch path is wrong.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  generateName: reinspection-internvl-stage1-
+  generateName: reinspection-internvl-stage2-ablation-
   namespace: eidf098ns
   labels:
     kueue.x-k8s.io/queue-name: eidf098ns-user-queue
@@ -12,10 +19,10 @@ spec:
   backoffLimit: 0
   template:
     metadata:
-      name: reinspection-internvl-stage1
+      name: reinspection-internvl-stage2-ablation
     spec:
       containers:
-      - name: reinspection-internvl-stage1
+      - name: reinspection-internvl-stage2-ablation
         image: stogian/l_reinspection:latest
         workingDir: /data/users/stogian/learnable-reinspection
         command:
@@ -24,15 +31,16 @@ spec:
           - |
             set -euo pipefail
             mkdir -p logs models
-            REINSPECTION_EXPERIMENT=s1_internvl REINSPECTION_EXPERIMENT_STAGE2= \
-              bash src/scripts/run_train.sh
+            STAGE1_CHECKPOINT=models/internvl3/stage1/epoch_5/reinspection_module.pt \
+            REINSPECTION_EXPERIMENT_STAGE2=s2_internvl_grounding \
+              bash src/scripts/run_train_stage2.sh
         imagePullPolicy: Always
         env:
           - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
           - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
         resources:
-          requests: { cpu: 32, memory: "128Gi", nvidia.com/gpu: 4 }
-          limits:   { cpu: 32, memory: "128Gi", nvidia.com/gpu: 4 }
+          requests: { cpu: 32, memory: "256Gi", nvidia.com/gpu: 4 }
+          limits:   { cpu: 32, memory: "256Gi", nvidia.com/gpu: 4 }
         volumeMounts:
           - { mountPath: /dev/shm, name: dshm }
           - { mountPath: /data,    name: nfs }

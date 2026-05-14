@@ -1,0 +1,9 @@
+# @package _global_
+# Stage 1 — grounding. Qwen2.5-VL. RefCOCO family only (stage1_datasets/refcoco).
+defaults:
+  - override /backend: qwen25vl
+  - override /stage: stage1
+  - override /stage1_datasets: refcoco
+
+wandb_run_name: s1_qwen
+experiment_name: s1_qwen
