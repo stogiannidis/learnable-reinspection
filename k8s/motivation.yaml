@@ -54,8 +54,8 @@ spec:
           - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
           - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
         resources:
-          requests: { cpu: 16, memory: "64Gi", nvidia.com/gpu: 1 }
-          limits:   { cpu: 16, memory: "64Gi", nvidia.com/gpu: 1 }
+          requests: { cpu: 64, memory: "64Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 64, memory: "64Gi", nvidia.com/gpu: 1 }
         volumeMounts:
           - { mountPath: /dev/shm, name: dshm }
           - { mountPath: /data,    name: nfs }

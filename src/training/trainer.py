@@ -616,6 +616,77 @@ def _setup_model_gemma4_stage2(config: ReInspectionConfig, processor, stage1_che
     return model, optimizer
 
 
+# ---- LLaVA-Next (Mistral-7B) setup ----
+
+def _setup_model_llava_stage1(config: ReInspectionConfig, processor):
+    from src.backends.llava_next import load_model
+
+    model = load_model(config, device_map=None, processor=processor)
+    for parameter in model.base_model.parameters():
+        parameter.requires_grad = False
+    for parameter in model.reinspection.parameters():
+        parameter.requires_grad = True
+    optim_groups = [
+        {
+            "params": list(model.reinspection.parameters()),
+            "lr": config.stage1_lr_module,
+            "name": "reinspection",
+        }
+    ]
+    # bbox_head and roi_proj are only attached when their loss flags are set,
+    # mirroring the InternVL3 stage-1 setup.
+    if config.stage1_use_grounding_loss:
+        _attach_bbox_head(model, config)
+        optim_groups.append(
+            {
+                "params": list(model.bbox_head.parameters()),
+                "lr": config.stage1_lr_module,
+                "name": "bbox_head",
+            }
+        )
+    if config.stage1_use_roi_feature_loss:
+        _attach_roi_projection(model, config)
+        optim_groups.append(
+            {
+                "params": list(model.roi_proj.parameters()),
+                "lr": config.stage1_lr_module,
+                "name": "roi_proj",
+            }
+        )
+    optimizer = torch.optim.AdamW(optim_groups, weight_decay=0.01)
+    return model, optimizer
+
+
+def _setup_model_llava_stage2(config: ReInspectionConfig, processor, stage1_checkpoint: Optional[str]):
+    from src.backends.llava_next import load_model
+
+    model = load_model(config, device_map=None, processor=processor)
+    if stage1_checkpoint:
+        _load_stage1_weights(model, stage1_checkpoint)
+    for parameter in model.base_model.parameters():
+        parameter.requires_grad = False
+    for parameter in model.reinspection.parameters():
+        parameter.requires_grad = config.stage2_train_reinspection
+    _attach_stage2_aux_modules(model, config, stage1_checkpoint)
+    lora_config = LoraConfig(
+        r=config.lora_r,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+        target_modules=config.lora_target_modules,
+        bias="none",
+        task_type=TaskType.FEATURE_EXTRACTION,
+    )
+    model.base_model.model.language_model = get_peft_model(
+        model.base_model.model.language_model,
+        lora_config,
+    )
+    lora_params = [
+        param for _, param in model.base_model.model.language_model.named_parameters() if param.requires_grad
+    ]
+    optimizer = _stage2_optimizer(config, model, lora_params)
+    return model, optimizer
+
+
 def _build_dataset(
     backend: str,
     stage: int,
@@ -662,7 +733,34 @@ def _build_stage2_aux_grounding_dataset(
     data_root: str,
     processor,
 ):
-    """Build the optional Stage-2 grounding stream from Stage-1 datasets."""
+    """Build the optional Stage-2 grounding stream.
+
+    Default source is the RefCOCO Stage-1 family; setting
+    ``stage2_aux_use_gqa_scene_graphs=True`` swaps in GQA scene graphs
+    (per-object referring expressions over the gqa_spatial images), keeping
+    the rest of the aux machinery (KL attn loss + ROI loss) unchanged.
+    """
+    if config.stage2_aux_use_gqa_scene_graphs:
+        from src.data.gqa_scene_graphs import GQASceneGraphGroundingDataset
+
+        log(
+            "Stage-2 aux grounding source: GQA scene graphs "
+            f"({config.stage2_aux_gqa_scene_graphs_path})"
+        )
+        return GQASceneGraphGroundingDataset(
+            scene_graphs_path=config.stage2_aux_gqa_scene_graphs_path,
+            image_root=config.stage2_aux_gqa_images_dir,
+            processor=processor,
+            backend=backend,
+            split="train",
+            max_pixels=config.max_pixels,
+            min_pixels=config.min_pixels,
+            crop_to_patches=config.crop_to_patches_stage1,
+            system_prompt=config.system_prompt,
+            answer_ignore_index=config.answer_ignore_index,
+            seed=config.seed,
+        )
+
     aux_names = list(config.stage2_aux_stage1_dataset_names or stage1_defaults())
     if config.stage2_aux_stage1_extra_datasets:
         for name in config.stage2_aux_stage1_extra_datasets:
@@ -946,6 +1044,9 @@ def _train_forward_kwargs(
         "labels": batch["labels"] if use_lm_ce else None,
         "return_attn_maps": return_attn_maps,
         "return_query_text_tensors": return_query_text_tensors,
+        # masked_answer_cross_entropy already applies lm_head only to supervised
+        # positions; skip the full-sequence lm_head matmul that produces logits.
+        "return_logits": False,
     }
     if backend == "qwen25vl":
         fwd["image_grid_thw"] = batch.get("image_grid_thw")
@@ -953,6 +1054,8 @@ def _train_forward_kwargs(
     elif backend == "gemma4":
         fwd["image_position_ids"] = batch.get("image_position_ids")
         fwd["mm_token_type_ids"] = batch.get("mm_token_type_ids")
+    elif backend == "llava_next":
+        fwd["image_sizes"] = batch.get("image_sizes")
     return fwd
 
 
@@ -1318,6 +1421,10 @@ def run_training(config: ReInspectionConfig) -> None:
         from src.backends.gemma4 import load_processor as load_gemma4_proc
 
         processor = load_gemma4_proc(config)
+    elif backend == "llava_next":
+        from src.backends.llava_next import load_processor as load_llava_proc
+
+        processor = load_llava_proc(config)
     _init_wandb(config)
 
     if backend == "qwen25vl":
@@ -1330,6 +1437,13 @@ def run_training(config: ReInspectionConfig) -> None:
             model, optimizer = _setup_model_gemma4_stage1(config, processor)
         else:
             model, optimizer = _setup_model_gemma4_stage2(
+                config, processor, config.stage1_checkpoint
+            )
+    elif backend == "llava_next":
+        if is_stage1:
+            model, optimizer = _setup_model_llava_stage1(config, processor)
+        else:
+            model, optimizer = _setup_model_llava_stage2(
                 config, processor, config.stage1_checkpoint
             )
     else:
@@ -1395,6 +1509,14 @@ def run_training(config: ReInspectionConfig) -> None:
         dist.barrier()
 
     num_workers = config.num_workers
+    # ``prefetch_factor`` and ``persistent_workers`` are only honored by
+    # DataLoader when num_workers > 0.
+    extra_loader_kw = {}
+    if num_workers > 0:
+        if config.dataloader_prefetch_factor is not None:
+            extra_loader_kw["prefetch_factor"] = int(config.dataloader_prefetch_factor)
+        if config.dataloader_persistent_workers:
+            extra_loader_kw["persistent_workers"] = True
     sampler = DistributedSampler(train_dataset) if dist.is_initialized() else None
     train_loader = DataLoader(
         train_dataset,
@@ -1404,6 +1526,7 @@ def run_training(config: ReInspectionConfig) -> None:
         collate_fn=collate_fn,
         num_workers=num_workers,
         pin_memory=True,
+        **extra_loader_kw,
     )
 
     val_loader = None
@@ -1422,6 +1545,7 @@ def run_training(config: ReInspectionConfig) -> None:
             collate_fn=collate_fn,
             num_workers=num_workers,
             pin_memory=True,
+            **extra_loader_kw,
         )
 
     aux_grounding_loader = None
@@ -1448,6 +1572,7 @@ def run_training(config: ReInspectionConfig) -> None:
                 collate_fn=collate_fn,
                 num_workers=num_workers,
                 pin_memory=True,
+                **extra_loader_kw,
             )
             aux_grounding_iter = _cycle_loader(aux_grounding_loader)
             log(
@@ -1497,6 +1622,7 @@ def run_training(config: ReInspectionConfig) -> None:
         if sampler is not None:
             sampler.set_epoch(epoch)
 
+        _early_exit_via_max_steps = False
         epoch_loss = 0.0
         epoch_ce = 0.0
         epoch_attn = 0.0
@@ -1530,7 +1656,7 @@ def run_training(config: ReInspectionConfig) -> None:
 
             ce_loss = outputs.loss
             if ce_loss is None:
-                if use_lm_ce and backend in ("internvl3", "gemma4"):
+                if use_lm_ce and backend in ("internvl3", "gemma4", "llava_next"):
                     raise RuntimeError("Model did not return a loss. Check dataset labels.")
                 ce_loss = torch.zeros((), device=device)
 
@@ -1728,9 +1854,26 @@ def run_training(config: ReInspectionConfig) -> None:
             ):
                 if is_main_process():
                     log(f"Reached stage1_max_steps={config.stage1_max_steps}; stopping early.")
+                _early_exit_via_max_steps = True
+                break
+            if (
+                (not is_stage1)
+                and config.stage2_max_steps is not None
+                and global_step >= config.stage2_max_steps
+            ):
+                if is_main_process():
+                    log(f"Reached stage2_max_steps={config.stage2_max_steps}; stopping early.")
+                _early_exit_via_max_steps = True
                 break
 
         pbar.close()
+        # When the inner loop tripped a max-steps early exit, skip the rest of
+        # the epoch boilerplate (validation, checkpoint save, artifact upload).
+        # Smoke runs and short ablation sweeps depend on hard-exiting here.
+        if _early_exit_via_max_steps:
+            if is_main_process():
+                log("Skipping end-of-epoch validation/checkpoint due to max_steps early exit.")
+            break
 
         num_steps = max(1, len(train_loader))
         avg_epoch_loss = epoch_loss / num_steps
@@ -1833,6 +1976,12 @@ def run_training(config: ReInspectionConfig) -> None:
             is_stage1
             and config.stage1_max_steps is not None
             and global_step >= config.stage1_max_steps
+        ):
+            break
+        if (
+            (not is_stage1)
+            and config.stage2_max_steps is not None
+            and global_step >= config.stage2_max_steps
         ):
             break
 

@@ -26,14 +26,15 @@ spec:
             mkdir -p logs models
             REINSPECTION_EXPERIMENT=s1_internvl \
             REINSPECTION_EXPERIMENT_STAGE2=s2_internvl \
-              bash src/scripts/run_train.sh
+              bash src/scripts/run_train.sh \
+                deepspeed_config=src/configs/deepspeed_z2.json
         imagePullPolicy: Always
         env:
           - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
           - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
         resources:
-          requests: { cpu: 16, memory: "128Gi", nvidia.com/gpu: 4 }
-          limits:   { cpu: 16, memory: "128Gi", nvidia.com/gpu: 4 }
+          requests: { cpu: 64, memory: "128Gi", nvidia.com/gpu: 4 }
+          limits:   { cpu: 64, memory: "128Gi", nvidia.com/gpu: 4 }
         volumeMounts:
           - { mountPath: /dev/shm, name: dshm }
           - { mountPath: /data,    name: nfs }

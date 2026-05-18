@@ -44,7 +44,12 @@ class ReInspectionConfig:
     pbar_enabled: bool = False
     pbar_api_url: str = "https://pbar.io/api"
     pbar_update_interval: float = 0.5
-    num_workers: int = 4
+    num_workers: int = 8
+    dataloader_prefetch_factor: Optional[int] = 4
+    # Keep DataLoader workers alive across epochs so dataset state (e.g. open
+    # JSONL handles, RNG, processor caches) survives instead of being torn down
+    # and rebuilt every epoch. No effect when num_workers == 0.
+    dataloader_persistent_workers: bool = True
 
     # Eval-specific
     checkpoint_dir: Optional[str] = None
@@ -52,9 +57,10 @@ class ReInspectionConfig:
     output_file: str = "eval_results.json"
     benchmarks: List[str] = field(
         default_factory=lambda: [
-            "vsr", "gqa_spatial", "whatsup",
+            "vsr_zeroshot", "gqa_spatial", "whatsup",
             "3dsrbench", "mindcube", "blink", "srbench",
-            "qspatial", "embspatial",
+            "qspatial", "embspatial", "realworldqa",
+            "cv_bench", "vstar_bench", "mmvp",
         ]
     )
     eval_condition: str = "reinspection"
@@ -80,6 +86,10 @@ class ReInspectionConfig:
     processor_name_or_path: Optional[str] = None
     image_seq_length: int = 256
     answer_ignore_index: int = -100
+    # HF attention backend. flash_attention_2 needs the `flash-attn` package
+    # (installed in the container). Override to "sdpa" or "eager" at eval time
+    # when attention maps must be exposed.
+    attn_implementation: Optional[str] = "flash_attention_2"
 
     # ------------------------------------------------------------------ #
     # LoRA (Stage 2)                                                       #
@@ -103,6 +113,7 @@ class ReInspectionConfig:
     stage1_warmup_ratio: float = 0.03
     stage1_warmup_steps: Optional[int] = None
     stage1_max_steps: Optional[int] = None
+    stage2_max_steps: Optional[int] = None
     # ---- Stage 1 auxiliary losses (each independently toggleable) ----
     # Stage 1 is a pure grounding stage; LM CE / NTP is disabled by default.
     stage1_use_lm_ce: bool = False
@@ -149,6 +160,13 @@ class ReInspectionConfig:
     stage2_aux_batch_size: Optional[int] = None
     stage2_aux_stage1_dataset_names: Optional[List[str]] = None
     stage2_aux_stage1_extra_datasets: Optional[List[str]] = None
+    # When True, the Stage-2 auxiliary grounding stream is sourced from GQA
+    # scene graphs (per-object referring expressions over the gqa_spatial
+    # images) instead of RefCOCO. More aligned with the Stage-2 image
+    # distribution but doesn't supervise RefCOCO-style canonical phrases.
+    stage2_aux_use_gqa_scene_graphs: bool = False
+    stage2_aux_gqa_scene_graphs_path: str = "/data/datasets/gqa_spatial/train_sceneGraphs.json"
+    stage2_aux_gqa_images_dir: str = "/data/datasets/gqa_spatial/images"
 
     # ------------------------------------------------------------------ #
     # Data                                                                 #

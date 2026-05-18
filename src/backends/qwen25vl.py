@@ -556,12 +556,19 @@ class Qwen25VLWithReInspection(nn.Module):
             handle.remove()
 
 
-def load_model(config: ReInspectionConfig, device_map: str = "auto") -> Qwen25VLWithReInspection:
+def load_model(
+    config: ReInspectionConfig,
+    device_map: str = "auto",
+    attn_implementation: Optional[str] = None,
+) -> Qwen25VLWithReInspection:
     """Load Qwen2.5-VL and wrap with Re-Inspection Module."""
     resolved = resolve_pretrained_local_path(config.model_name_or_path)
-    base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        resolved,
+    attn_impl = attn_implementation if attn_implementation is not None else config.attn_implementation
+    load_kw = dict(
         torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
         device_map=device_map,
     )
+    if attn_impl is not None:
+        load_kw["attn_implementation"] = attn_impl
+    base_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(resolved, **load_kw)
     return Qwen25VLWithReInspection(config, base_model)

@@ -80,8 +80,6 @@ class InternVL3WithReInspection(nn.Module):
         self._last_attn_vis = None
         self._last_generation_prompt_lengths = None
         self._assistant_generation_suffix = self._resolve_generation_suffix(processor)
-        self._debug_tokenizer = getattr(processor, "tokenizer", None) if processor is not None else None
-        self._debug_emitted = {"train": False, "eval": False}
 
     @property
     def device(self):
@@ -300,43 +298,6 @@ class InternVL3WithReInspection(nn.Module):
             "input_ids": new_input_ids,
         }
 
-    def _debug_emit_insertion(
-        self,
-        mode: str,
-        input_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor],
-        insert_positions: torch.LongTensor,
-    ) -> None:
-        """Print decoded context around R-token insertion point (once per mode).
-
-        Use to verify train vs eval insertion alignment. Set
-        ``self._debug_emitted[mode] = False`` to re-emit.
-        """
-        if self._debug_emitted.get(mode, True):
-            return
-        tok = self._debug_tokenizer
-        if tok is None:
-            return
-        pos = int(insert_positions[0].item())
-        if attention_mask is not None:
-            seq_len = int(attention_mask[0].sum().item())
-        else:
-            seq_len = int(input_ids.shape[1])
-        N_q = int(self.config.n_queries)
-        # window of 8 tokens on each side, skip image-token runs for readability
-        lo = max(0, pos - 8)
-        hi = min(seq_len, pos + 8)
-        ids = input_ids[0, lo:hi].tolist()
-        decoded = [tok.decode([i], skip_special_tokens=False) for i in ids]
-        marker_idx = pos - lo
-        decoded.insert(marker_idx, f"<<R×{N_q}>>")
-        print(
-            f"[R-INSERT DEBUG | {mode}] seq_len={seq_len} insert_pos={pos} "
-            f"window[{lo}:{hi}]:\n  {' | '.join(repr(t) for t in decoded)}",
-            flush=True,
-        )
-        self._debug_emitted[mode] = True
-
     def _nan_check(self, tensor: torch.Tensor, name: str, step: int) -> None:
         if tensor is not None and torch.isnan(tensor).any():
             raise RuntimeError(f"NaN detected in {name} at step {step}")
@@ -396,10 +357,6 @@ class InternVL3WithReInspection(nn.Module):
             self._nan_check(image_features, "image_features", step)
 
         insert_positions = self._find_insert_positions(input_ids, attention_mask=attention_mask, labels=labels)
-        self._debug_emit_insertion(
-            "train" if labels is not None else "eval",
-            input_ids, attention_mask, insert_positions,
-        )
         V, T, V_mask, T_mask = self._extract_vision_and_text(
             inputs_embeds,
             input_ids,
@@ -554,9 +511,10 @@ def load_model(
     """Load InternVL3-8B and wrap it with the re-inspection module."""
     dtype = torch.bfloat16 if config.bf16 else torch.float32
     resolved = resolve_pretrained_local_path(config.model_name_or_path)
+    attn_impl = attn_implementation if attn_implementation is not None else config.attn_implementation
     load_kw = dict(torch_dtype=dtype, device_map=device_map)
-    if attn_implementation is not None:
-        load_kw["attn_implementation"] = attn_implementation
+    if attn_impl is not None:
+        load_kw["attn_implementation"] = attn_impl
     base_model = InternVLForConditionalGeneration.from_pretrained(resolved, **load_kw)
 
     return InternVL3WithReInspection(
