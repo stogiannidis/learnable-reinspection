@@ -19,10 +19,11 @@ from torch.utils.data import ConcatDataset, Dataset
 from .utils import build_chat_messages as qwen_build_chat
 from .chat_template import build_chat_messages as intern_build_chat
 from .gemma4_chat import build_chat_messages as gemma4_build_chat
+from .llava_next_chat import build_chat_messages as llava_next_build_chat
 from .registry import dataset_path_configs, stage2_defaults
 
 _QWEN_BACKENDS = ("qwen25vl",)
-_VALID_BACKENDS = ("qwen25vl", "internvl3", "gemma4")
+_VALID_BACKENDS = ("qwen25vl", "internvl3", "gemma4", "llava_next")
 
 logger = logging.getLogger(__name__)
 _MAX_RETRIES = 10
@@ -120,8 +121,13 @@ class SpatialVQADataset(Dataset):
         InternVL/Gemma paths retry on corrupt images by resampling indices; Qwen
         advances sequentially on read errors before failing hard.
         """
-        if self.backend in ("internvl3", "gemma4"):
-            getter = self._getitem_gemma4 if self.backend == "gemma4" else self._getitem_intern
+        if self.backend in ("internvl3", "gemma4", "llava_next"):
+            if self.backend == "gemma4":
+                getter = self._getitem_gemma4
+            elif self.backend == "llava_next":
+                getter = self._getitem_llava
+            else:
+                getter = self._getitem_intern
             for _ in range(_MAX_RETRIES):
                 try:
                     return getter(idx)
@@ -237,6 +243,49 @@ class SpatialVQADataset(Dataset):
         labels[:, :prompt_len] = self.answer_ignore_index
         full_inputs["labels"] = labels
         result = _squeeze_intern(full_inputs)
+        result["image_path"] = image_path
+        return result
+
+    def _getitem_llava(self, idx: int) -> Dict:
+        """Tokenize a LLaVA-Next (Mistral) sample. Same prompt-masking contract
+        as InternVL/Gemma; ``image_sizes`` is preserved alongside ``pixel_values``
+        because the AnyRes patch unpacking needs it at forward time."""
+        sample = self.samples[idx]
+        image_path = os.path.join(self.image_root, sample["image"])
+        image = Image.open(image_path).convert("RGB")
+
+        prompt_messages = llava_next_build_chat(
+            question=sample["question"],
+            image_path=image_path,
+            system_prompt=self.system_prompt,
+        )
+        full_messages = llava_next_build_chat(
+            question=sample["question"],
+            answer=sample["answer"],
+            image_path=image_path,
+            system_prompt=self.system_prompt,
+        )
+        prompt_text = self.processor.apply_chat_template(
+            prompt_messages, tokenize=False, add_generation_prompt=True,
+        )
+        full_text = self.processor.apply_chat_template(
+            full_messages, tokenize=False, add_generation_prompt=False,
+        )
+        pk = {"return_tensors": "pt", "images": [image]}
+        prompt_inputs = self.processor(text=[prompt_text], **pk)
+        full_inputs = self.processor(text=[full_text], **pk)
+        prompt_len = prompt_inputs["input_ids"].shape[-1]
+        labels = full_inputs["input_ids"].clone()
+        labels[:, :prompt_len] = self.answer_ignore_index
+        full_inputs["labels"] = labels
+        # ``pixel_values`` is (1, num_patches, C, H, W); ``image_sizes`` is (1, 2).
+        # Squeeze the leading batch dim on everything *except* those two — the
+        # DataLoader's default collate will re-batch them across samples.
+        _no_squeeze = {"pixel_values", "image_sizes"}
+        result = {
+            k: (v.squeeze(0) if isinstance(v, torch.Tensor) and k not in _no_squeeze else v)
+            for k, v in full_inputs.items()
+        }
         result["image_path"] = image_path
         return result
 

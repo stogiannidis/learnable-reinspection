@@ -1,0 +1,32 @@
+# @package _global_
+# Stage 2 — gqa_spatial-only main stream + GQA scene-graph bboxes for the
+# auxiliary grounding stream. Keeps the InternVL3 grounding Stage-1 checkpoint
+# as the re-inspection module init.
+defaults:
+  - override /backend: internvl3
+  - override /stage: stage2
+  - override /stage2_datasets: default  # registry default → [gqa_spatial]
+
+stage1_checkpoint: models/internvl3/stage1/epoch_5/reinspection_module.pt
+wandb_run_name: internvl-stage2-gqa-sg
+experiment_name: gqa_sg
+
+# Effective batch matches the existing grounding run (16 × 8 × 4 GPUs = 512).
+stage2_batch_size: 16
+stage2_grad_accum: 8
+wandb_gradient_log_interval: 100
+num_workers: 8
+dataloader_prefetch_factor: 4
+
+# Auxiliary grounding stream — same weights as the s2_internvl_grounding
+# baseline, but the source data is GQA scene graphs instead of RefCOCO.
+stage2_train_reinspection: true
+stage2_aux_grounding_weight: 0.05
+stage2_aux_attn_loss_weight: 1.0
+stage2_aux_roi_feature_loss_weight: 0.2
+stage2_aux_every_n_steps: 4
+stage2_aux_batch_size: 2
+
+# Source the aux stream from GQA scene graphs (per-object referring
+# expressions over the gqa_spatial images, name + attributes + relations).
+stage2_aux_use_gqa_scene_graphs: true

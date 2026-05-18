@@ -24,3 +24,7 @@ pbar_api_url: "https://pbar.io/api"
 pbar_update_interval: 0.5
 num_workers: 16
 stage1_max_steps: null
+stage2_max_steps: null
+stage2_aux_use_gqa_scene_graphs: false
+stage2_aux_gqa_scene_graphs_path: /data/datasets/gqa_spatial/train_sceneGraphs.json
+stage2_aux_gqa_images_dir: /data/datasets/gqa_spatial/images

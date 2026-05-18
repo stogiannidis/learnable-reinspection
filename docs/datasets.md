@@ -93,7 +93,9 @@ concatenates any subset under a common `data_root`.
   download. Tunable via `--clevr_num_scenes`, `--clevr_canvas_size`,
   `--clevr_max_qa`.
 - **Images.** Rendered on the fly; **unique to this dataset**.
-- **Default in mix.** Yes.
+- **Default in mix.** **No** (synthetic; excluded from the standard mix in
+  favour of real-data spatial supervision). Opt in via
+  `stage2_datasets=clevr_only` / `stage2_datasets=all`.
 
 ### vg_spatial
 - **Task.** Synthetic spatial QA pairs mined from Visual Genome
@@ -103,7 +105,9 @@ concatenates any subset under a common `data_root`.
 - **Images.** VG `VG_100K/` + `VG_100K_2/` — **shared with `vg_grounding`
   and the VG branch of `cambrian_spatial`**, and overlapping with
   `gqa_spatial`'s underlying pool.
-- **Default in mix.** Yes.
+- **Default in mix.** **No** (template-mined; excluded from the standard mix
+  in favour of real-data spatial supervision). Opt in via
+  `stage2_datasets=vg_only` / `stage2_datasets=all`.
 
 ### rel3d
 - **Task.** Rel3D 3D spatial relations benchmark.
@@ -297,7 +301,8 @@ Default suite (7 benchmarks, all present under `/data/datasets/`):
 
 | Benchmark     | Task                                                        | Images                                      | Format     |
 |---------------|-------------------------------------------------------------|---------------------------------------------|------------|
-| `vsr`         | Binary T/F over 66 English spatial relations                | COCO                                        | `.jsonl`   |
+| `vsr`         | Binary T/F over 66 English spatial relations (random split) | COCO                                        | `.jsonl`   |
+| `vsr_zeroshot`| Binary T/F over 66 spatial relations, held-out object pairs | COCO (symlinked from `coco/train2017`)      | `.jsonl`   |
 | `gqa_spatial` | Spatial subset of GQA questions                             | GQA (photo-overlaps with VG)                | `.json`    |
 | `whatsup`     | Controlled L/R/above/below probes on staged objects         | Bespoke photographs — no overlap            | `.json`    |
 | `3dsrbench`   | 3D spatial reasoning benchmark                              | Bespoke — no overlap                        | `.json`    |
@@ -306,19 +311,29 @@ Default suite (7 benchmarks, all present under `/data/datasets/`):
 | `srbench`     | Spatial Reasoning Benchmark                                 | Bespoke — no overlap                        | `.json`    |
 | `qspatial`    | Quantitative spatial (distance/height/width with reference) | Bespoke photographs — no overlap            | `.json`    |
 | `embspatial`  | Embodied egocentric MCQ (above/below/L/R/close/far)         | Indoor embodied scenes — no overlap         | `.json`    |
+| `realworldqa` | Real-world spatial / physical reasoning (MCQ + free-form)   | xAI in-the-wild photos (driving-heavy) — no overlap | `.json` |
+| `cv_bench`    | 2D+3D vision-centric MCQ (Count/Relation/Depth/Distance)    | ADE20K / COCO / Omni3D — COCO subset photo-overlaps RefCOCO/VSR | `.json` |
+| `vstar_bench` | Detailed visual search (direct_attributes + relative_position) | SAM-1B web photos — no overlap                  | `.json`    |
+| `mmvp`        | CLIP-blind visual-pattern binary MCQ                        | Mixed web — effectively no overlap          | `.json`    |
 
 ### Overlap with training data
 
-- `vsr` images are drawn from COCO, i.e. the same photo pool as the Stage-1
-  RefCOCO family. If you train on `refcoco*` / `grefcoco` and evaluate on
-  VSR, some *photos* will be seen during training even though the *tasks*
-  (grounding vs. T/F VQA) are different. Report this caveat in result tables.
+- `vsr` and `vsr_zeroshot` images are drawn from COCO, i.e. the same photo
+  pool as the Stage-1 RefCOCO family. If you train on `refcoco*` / `grefcoco`
+  and evaluate on VSR, some *photos* will be seen during training even though
+  the *tasks* (grounding vs. T/F VQA) are different. Report this caveat in
+  result tables. The `vsr_zeroshot` split additionally holds out
+  (subject, object) **relation pairs** between its own train and test, which
+  is the literature-standard split for fair VLM comparison
+  (cf. SpatialVLM / SpatialBot / Cambrian / RoboPoint).
 - `gqa_spatial` (eval) and `gqa_spatial` (train) are drawn from GQA; ensure
   you respect GQA's official train/val/test splits when preparing the train
   side. The eval `test.json` should come from GQA's held-out split.
-- `whatsup`, `3dsrbench`, `mindcube`, `blink`, `srbench`, `qspatial`, and
-  `embspatial` have no image overlap with any training dataset in
-  `registry.py`.
+- `whatsup`, `3dsrbench`, `mindcube`, `blink`, `srbench`, `qspatial`,
+  `embspatial`, `realworldqa`, `vstar_bench`, and `mmvp` have no image
+  overlap with any training dataset in `registry.py`. `cv_bench`'s COCO
+  subset (~805/2638 samples) shares the COCO photo pool with VSR and the
+  RefCOCO family — report this caveat or split per-source accuracy.
 
 ### Choosing benchmarks
 

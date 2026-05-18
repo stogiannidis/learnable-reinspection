@@ -20,10 +20,11 @@ from .utils import (
 )
 from .chat_template import build_chat_messages as intern_build_chat
 from .gemma4_chat import build_chat_messages as gemma4_build_chat
+from .llava_next_chat import build_chat_messages as llava_next_build_chat
 from .registry import stage1_defaults
 
 _QWEN_BACKENDS = ("qwen25vl",)
-_VALID_BACKENDS = ("qwen25vl", "internvl3", "gemma4")
+_VALID_BACKENDS = ("qwen25vl", "internvl3", "gemma4", "llava_next")
 _COCO_IMAGE_DATASETS = {"refcoco", "refcoco+", "refcocog"}
 
 
@@ -275,6 +276,41 @@ class RefCOCODataset(Dataset):
             labels[:, :prompt_len] = self.answer_ignore_index
             full_inputs["labels"] = labels
             result = _squeeze_intern(full_inputs)
+            result["attn_target_mask"] = torch.tensor([])
+            result["bbox_norm"] = torch.tensor(bbox_norm, dtype=torch.float32)
+            return result
+
+        if self.backend == "llava_next":
+            question = f"Locate the following object in the image: {expression}"
+            image = Image.open(image_path).convert("RGB")
+            prompt_messages = llava_next_build_chat(
+                question=question, image_path=image_path, system_prompt=self.system_prompt,
+            )
+            full_messages = llava_next_build_chat(
+                question=question, answer=answer, image_path=image_path, system_prompt=self.system_prompt,
+            )
+            prompt_text = self.processor.apply_chat_template(
+                prompt_messages, tokenize=False, add_generation_prompt=True,
+            )
+            full_text = self.processor.apply_chat_template(
+                full_messages, tokenize=False, add_generation_prompt=False,
+            )
+            pk = {"return_tensors": "pt", "images": [image]}
+            prompt_inputs = self.processor(text=[prompt_text], **pk)
+            full_inputs = self.processor(text=[full_text], **pk)
+            prompt_len = prompt_inputs["input_ids"].shape[-1]
+            labels = full_inputs["input_ids"].clone()
+            labels[:, :prompt_len] = self.answer_ignore_index
+            full_inputs["labels"] = labels
+            _no_squeeze = {"pixel_values", "image_sizes"}
+            result = {
+                k: (v.squeeze(0) if isinstance(v, torch.Tensor) and k not in _no_squeeze else v)
+                for k, v in full_inputs.items()
+            }
+            # L_attn target — not wired for LLaVA-Next yet (would need a custom
+            # patch-mask aligned to AnyRes packing). Leave empty so the trainer's
+            # nan-safe fallback degenerates to uniform supervision (same as
+            # Gemma4's current Stage-1 contract).
             result["attn_target_mask"] = torch.tensor([])
             result["bbox_norm"] = torch.tensor(bbox_norm, dtype=torch.float32)
             return result

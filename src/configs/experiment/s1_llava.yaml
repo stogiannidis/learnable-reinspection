@@ -1,0 +1,9 @@
+# @package _global_
+# Stage 1 — grounding. LLaVA-Next-Mistral-7B. RefCOCO family only.
+defaults:
+  - override /backend: llava_next
+  - override /stage: stage1
+  - override /stage1_datasets: refcoco
+
+wandb_run_name: llava_next-stage1
+experiment_name: grounding

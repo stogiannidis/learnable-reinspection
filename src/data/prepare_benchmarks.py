@@ -20,7 +20,19 @@ from urllib.request import urlretrieve
 from PIL import Image
 from tqdm import tqdm
 
-ALL_BENCHMARKS = ["3dsrbench", "mindcube", "blink", "srbench", "qspatial", "embspatial"]
+ALL_BENCHMARKS = [
+    "3dsrbench", "mindcube", "blink", "srbench", "qspatial", "embspatial",
+    "realworldqa", "vsr_zeroshot", "cv_bench", "vstar_bench", "mmvp",
+]
+
+VSR_ZEROSHOT_COCO_DIR = "/data/datasets/coco/train2017"
+
+
+def _save_jsonl(data: list, path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for row in data:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"  Saved {len(data)} samples to {path}")
 
 
 def _ensure_dir(path: str) -> str:
@@ -438,11 +450,9 @@ def prepare_srbench(output_dir: str) -> None:
         image_filename = f"srbench_{i:05d}.jpg"
         image_path = os.path.join(img_dir, image_filename)
 
-        if not os.path.exists(image_path):
-            if isinstance(img, Image.Image):
-                img.convert("RGB").save(image_path)
-            else:
-                continue
+        if not isinstance(img, Image.Image):
+            continue
+        img.convert("RGB").save(image_path)
 
         # SRBench may already include MCQ formatting in the question.
         # If it has choices, ensure consistent formatting.
@@ -625,6 +635,357 @@ def prepare_embspatial(output_dir: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# RealWorldQA                                                                  #
+# --------------------------------------------------------------------------- #
+def prepare_realworldqa(output_dir: str) -> None:
+    """Download xai-org/RealworldQA and convert.
+
+    Real-world spatial / physical reasoning over natural photographs (largely
+    driving/in-the-wild scenes). 765 test samples; PIL images plus pre-formatted
+    questions (MCQ or open-ended) whose answer-format instruction is already
+    embedded in the question string — passed through verbatim. Answers are
+    either a single MCQ letter (A-D) or a short free-form string.
+    """
+    from datasets import load_dataset
+
+    print("\n=== Preparing RealWorldQA ===")
+    bench_dir = _ensure_dir(os.path.join(output_dir, "realworldqa"))
+    img_dir = _ensure_dir(os.path.join(bench_dir, "images"))
+
+    try:
+        ds = load_dataset("xai-org/RealworldQA", split="test")
+    except Exception as e:
+        print(f"  Could not load xai-org/RealworldQA: {e}")
+        return
+
+    samples = []
+    skipped = 0
+    for i, row in enumerate(tqdm(ds, desc="RealWorldQA")):
+        img = row.get("image")
+        question = row.get("question", "")
+        answer = row.get("answer", "")
+
+        if img is None or not question or answer == "":
+            skipped += 1
+            continue
+
+        image_filename = f"realworldqa_{i:05d}.jpg"
+        image_path = os.path.join(img_dir, image_filename)
+        if not os.path.exists(image_path):
+            if isinstance(img, Image.Image):
+                img.convert("RGB").save(image_path)
+            elif isinstance(img, str) and os.path.exists(img):
+                Image.open(img).convert("RGB").save(image_path)
+            else:
+                skipped += 1
+                continue
+
+        samples.append({
+            "image": image_filename,
+            "question": question,
+            "answer": str(answer),
+            "split": "test",
+            "category": "realworld",
+            "benchmark": "realworldqa",
+        })
+
+    print(f"  Skipped {skipped} rows (missing image/question/answer)")
+    _save_json(samples, os.path.join(bench_dir, "test.json"))
+
+
+# --------------------------------------------------------------------------- #
+# VSR zero-shot (held-out object pairs)                                        #
+# --------------------------------------------------------------------------- #
+def prepare_vsr_zeroshot(output_dir: str) -> None:
+    """Download cambridgeltl/vsr_zeroshot test split and convert.
+
+    The zero-shot split holds out (subject, object) pairs at test time so train
+    and test share no relation instances — the literature-standard split for
+    fair VLM comparisons (SpatialVLM / SpatialBot / Cambrian / RoboPoint).
+
+    Output schema matches the existing `vsr/test.jsonl`:
+        {image, question, answer, split}
+    Question text and True/False answer phrasing are identical to vsr (random)
+    so the same MCQ-aware answer matcher works without changes.
+
+    Images are COCO train2017. Where they exist locally under
+    ``/data/datasets/coco/train2017/``, we symlink rather than copy (mirrors
+    the convention for RefCOCO/VSR random); otherwise we download from
+    ``image_link`` as a fallback.
+    """
+    from datasets import load_dataset
+
+    print("\n=== Preparing VSR zero-shot ===")
+    bench_dir = _ensure_dir(os.path.join(output_dir, "vsr_zeroshot"))
+    img_dir = _ensure_dir(os.path.join(bench_dir, "images"))
+
+    try:
+        ds = load_dataset("cambridgeltl/vsr_zeroshot", split="test")
+    except Exception as e:
+        print(f"  Could not load cambridgeltl/vsr_zeroshot: {e}")
+        return
+
+    samples = []
+    skipped = 0
+    symlinked = 0
+    downloaded = 0
+    for row in tqdm(ds, desc="VSR-zeroshot"):
+        image_name = row.get("image")
+        caption = row.get("caption", "")
+        label = row.get("label")
+        if not image_name or not caption or label is None:
+            skipped += 1
+            continue
+
+        dest = os.path.join(img_dir, image_name)
+        if not os.path.exists(dest):
+            src = os.path.join(VSR_ZEROSHOT_COCO_DIR, image_name)
+            if os.path.exists(src):
+                os.symlink(os.path.relpath(src, img_dir), dest)
+                symlinked += 1
+            else:
+                url = row.get("image_link")
+                if url:
+                    try:
+                        urlretrieve(url, dest)
+                        downloaded += 1
+                    except Exception as e:
+                        print(f"  Failed to fetch {url}: {e}")
+                        skipped += 1
+                        continue
+                else:
+                    skipped += 1
+                    continue
+
+        samples.append({
+            "image": image_name,
+            "question": (
+                f'Is the following statement true or false about the image? '
+                f'"{caption}" Answer with just True or False.'
+            ),
+            "answer": "True" if int(label) == 1 else "False",
+            "split": "test",
+        })
+
+    print(f"  Symlinked {symlinked} images, downloaded {downloaded}, skipped {skipped}")
+    _save_jsonl(samples, os.path.join(bench_dir, "test.jsonl"))
+
+
+# --------------------------------------------------------------------------- #
+# CV-Bench (Cambrian-1 NeurIPS 2024)                                           #
+# --------------------------------------------------------------------------- #
+_CV_BENCH_ANS_RE = __import__("re").compile(r"\(?([A-Fa-f])\)?")
+
+
+def prepare_cv_bench(output_dir: str) -> None:
+    """Download nyu-visionx/CV-Bench and convert.
+
+    Cambrian-1's 2D+3D vision-centric benchmark: 2638 MCQ samples across
+    Count (788), Relation (650), Depth (600), Distance (600), drawn from
+    COCO / ADE20K / Omni3D. Pre-formatted ``prompt`` (MCQ with A-D) is used
+    verbatim; ``answer`` like "(C)" is normalized to a single letter.
+    """
+    from datasets import load_dataset
+
+    print("\n=== Preparing CV-Bench ===")
+    bench_dir = _ensure_dir(os.path.join(output_dir, "cv_bench"))
+    img_dir = _ensure_dir(os.path.join(bench_dir, "images"))
+
+    try:
+        ds = load_dataset("nyu-visionx/CV-Bench", split="test")
+    except Exception as e:
+        print(f"  Could not load nyu-visionx/CV-Bench: {e}")
+        return
+
+    samples = []
+    skipped = 0
+    for row in tqdm(ds, desc="CV-Bench"):
+        prompt = row.get("prompt") or row.get("question")
+        raw_answer = row.get("answer", "")
+        img = row.get("image")
+        if not prompt or raw_answer is None or img is None:
+            skipped += 1
+            continue
+
+        m = _CV_BENCH_ANS_RE.match(str(raw_answer).strip())
+        if not m:
+            skipped += 1
+            continue
+        answer_letter = m.group(1).upper()
+
+        image_filename = f"cvbench_{row['idx']:05d}.jpg"
+        image_path = os.path.join(img_dir, image_filename)
+        if not os.path.exists(image_path):
+            if isinstance(img, Image.Image):
+                img.convert("RGB").save(image_path)
+            else:
+                skipped += 1
+                continue
+
+        samples.append({
+            "image": image_filename,
+            "question": prompt,
+            "answer": answer_letter,
+            "split": "test",
+            "category": f"{row.get('type', '')}/{row.get('task', '')}".strip("/"),
+            "benchmark": "cv_bench",
+        })
+
+    print(f"  Skipped {skipped} rows (missing fields / unparseable answer)")
+    _save_json(samples, os.path.join(bench_dir, "test.json"))
+
+
+# --------------------------------------------------------------------------- #
+# V*Bench (SEAL, CVPR 2024)                                                    #
+# --------------------------------------------------------------------------- #
+def prepare_vstar_bench(output_dir: str) -> None:
+    """Download craigwu/vstar_bench and convert.
+
+    Detailed-visual-search benchmark: 191 MCQ samples (115 direct_attributes
+    + 76 relative_position). Images live as files inside the HF repo at paths
+    like ``direct_attributes/sa_80352.jpg``; we pull each via
+    ``hf_hub_download`` and re-save as ``vstar_{i:05d}.jpg``. The OCR and
+    GPT4V-hard subtasks in the repo are excluded — they're not part of the
+    standard V* eval split.
+    """
+    from datasets import load_dataset
+    from huggingface_hub import hf_hub_download
+
+    print("\n=== Preparing V*Bench ===")
+    bench_dir = _ensure_dir(os.path.join(output_dir, "vstar_bench"))
+    img_dir = _ensure_dir(os.path.join(bench_dir, "images"))
+
+    try:
+        ds = load_dataset("craigwu/vstar_bench", split="test")
+    except Exception as e:
+        print(f"  Could not load craigwu/vstar_bench: {e}")
+        return
+
+    samples = []
+    skipped = 0
+    for i, row in enumerate(tqdm(ds, desc="V*Bench")):
+        rel_image = row.get("image")
+        text = row.get("text", "")
+        label = row.get("label", "")
+        if not rel_image or not text or not label:
+            skipped += 1
+            continue
+
+        image_filename = f"vstar_{i:05d}.jpg"
+        image_path = os.path.join(img_dir, image_filename)
+        if not os.path.exists(image_path):
+            try:
+                src = hf_hub_download(
+                    "craigwu/vstar_bench", rel_image, repo_type="dataset"
+                )
+                Image.open(src).convert("RGB").save(image_path)
+            except Exception as e:
+                print(f"  Failed to fetch {rel_image}: {e}")
+                skipped += 1
+                continue
+
+        samples.append({
+            "image": image_filename,
+            "question": text,
+            "answer": str(label).strip().upper(),
+            "split": "test",
+            "category": row.get("category", ""),
+            "benchmark": "vstar_bench",
+        })
+
+    print(f"  Skipped {skipped} rows")
+    _save_json(samples, os.path.join(bench_dir, "test.json"))
+
+
+# --------------------------------------------------------------------------- #
+# MMVP (Tong et al., CVPR 2024)                                                #
+# --------------------------------------------------------------------------- #
+def prepare_mmvp(output_dir: str) -> None:
+    """Download MMVP/MMVP and convert.
+
+    Eyes Wide Shut visual-pattern benchmark: 300 binary MCQ samples spanning
+    150 paired questions on CLIP-blind image pairs. The HF repo ships images
+    under ``MMVP Images/{N}.jpg`` (N=1..300) and a separate ``Questions.csv``
+    with columns Index, Question, Options ("(a) X (b) Y"), Correct Answer
+    ("(a)"). We parse the options string into A/B letters (to match the rest
+    of the suite's MCQ matcher) and write the standard schema.
+    """
+    import csv
+    import re
+    from huggingface_hub import hf_hub_download
+
+    print("\n=== Preparing MMVP ===")
+    bench_dir = _ensure_dir(os.path.join(output_dir, "mmvp"))
+    img_dir = _ensure_dir(os.path.join(bench_dir, "images"))
+
+    try:
+        csv_path = hf_hub_download("MMVP/MMVP", "Questions.csv", repo_type="dataset")
+    except Exception as e:
+        print(f"  Could not fetch MMVP Questions.csv: {e}")
+        return
+
+    with open(csv_path, newline="") as f:
+        rows = list(csv.DictReader(f))
+
+    opt_re = re.compile(r"\(([a-d])\)\s*([^()]+?)(?=\s*\([a-d]\)|$)", re.IGNORECASE)
+    ans_re = re.compile(r"\(?([a-dA-D])\)?")
+
+    samples = []
+    skipped = 0
+    for row in tqdm(rows, desc="MMVP"):
+        idx_raw = row.get("Index", "").strip()
+        question = (row.get("Question") or "").strip()
+        options_str = (row.get("Options") or "").strip()
+        correct = (row.get("Correct Answer") or "").strip()
+        if not idx_raw.isdigit() or not question or not options_str or not correct:
+            skipped += 1
+            continue
+        idx = int(idx_raw)
+
+        pairs = [(L.lower(), t.strip()) for L, t in opt_re.findall(options_str)]
+        if not pairs:
+            skipped += 1
+            continue
+        letter_map = {lower: upper for lower, upper in zip("abcd", "ABCD")}
+        choices = {letter_map[lo]: text for lo, text in pairs if lo in letter_map}
+        if not choices:
+            skipped += 1
+            continue
+
+        m = ans_re.match(correct)
+        if not m:
+            skipped += 1
+            continue
+        answer_letter = m.group(1).upper()
+
+        try:
+            src = hf_hub_download(
+                "MMVP/MMVP", f"MMVP Images/{idx}.jpg", repo_type="dataset"
+            )
+        except Exception as e:
+            print(f"  Failed to fetch MMVP image {idx}: {e}")
+            skipped += 1
+            continue
+
+        image_filename = f"mmvp_{idx:03d}.jpg"
+        image_path = os.path.join(img_dir, image_filename)
+        if not os.path.exists(image_path):
+            Image.open(src).convert("RGB").save(image_path)
+
+        samples.append({
+            "image": image_filename,
+            "question": _format_mcq(question, choices),
+            "answer": answer_letter,
+            "split": "test",
+            "category": "visual_pattern",
+            "benchmark": "mmvp",
+        })
+
+    print(f"  Skipped {skipped} rows")
+    _save_json(samples, os.path.join(bench_dir, "test.json"))
+
+
+# --------------------------------------------------------------------------- #
 # CLI                                                                          #
 # --------------------------------------------------------------------------- #
 PREPARE_FNS = {
@@ -634,6 +995,11 @@ PREPARE_FNS = {
     "srbench": prepare_srbench,
     "qspatial": prepare_qspatial,
     "embspatial": prepare_embspatial,
+    "realworldqa": prepare_realworldqa,
+    "vsr_zeroshot": prepare_vsr_zeroshot,
+    "cv_bench": prepare_cv_bench,
+    "vstar_bench": prepare_vstar_bench,
+    "mmvp": prepare_mmvp,
 }
 
 

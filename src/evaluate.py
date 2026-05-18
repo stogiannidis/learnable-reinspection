@@ -41,6 +41,7 @@ from src.backends.hf_hub_utils import resolve_pretrained_local_path
 from src.config import ReInspectionConfig
 from src.data.chat_template import build_chat_messages as intern_build_chat
 from src.data.gemma4_chat import build_chat_messages as gemma4_build_chat
+from src.data.llava_next_chat import build_chat_messages as llava_next_build_chat
 from src.data.spatial_dataset import SpatialVQADataset
 from src.data.utils import build_chat_messages as qwen_build_chat
 from src.utils.hydra_util import strip_deepspeed_local_rank_argv
@@ -84,6 +85,11 @@ BENCHMARK_CONFIGS = {
     "srbench": {"data_file": "srbench/test.json", "image_root": "srbench/images"},
     "qspatial": {"data_file": "qspatial/test.json", "image_root": "qspatial/images"},
     "embspatial": {"data_file": "embspatial/test.json", "image_root": "embspatial/images"},
+    "realworldqa": {"data_file": "realworldqa/test.json", "image_root": "realworldqa/images"},
+    "vsr_zeroshot": {"data_file": "vsr_zeroshot/test.jsonl", "image_root": "vsr_zeroshot/images"},
+    "cv_bench": {"data_file": "cv_bench/test.json", "image_root": "cv_bench/images"},
+    "vstar_bench": {"data_file": "vstar_bench/test.json", "image_root": "vstar_bench/images"},
+    "mmvp": {"data_file": "mmvp/test.json", "image_root": "mmvp/images"},
 }
 
 # tqdm refresh and explicit acc line (both avoid per-instance log spam when tee'd to a file).
@@ -283,22 +289,88 @@ def normalize_answer(text: str) -> str:
     return " ".join(text.strip().lower().split())
 
 
+_MCQ_LETTERS = frozenset("ABCDEF")
+
+
 def _extract_mcq_letter(text: str) -> Optional[str]:
-    """Extract a single MCQ letter (A-D) from model output, if present."""
+    """Extract a single MCQ letter (A-F) from model output, if present.
+
+    Most benchmarks in this suite use 2-4 choices (A-D); CV-Bench's Count
+    subtask uses up to 6 choices, so the matcher accepts A-F.
+    """
     import re
 
     text = text.strip()
-    # Exact single letter
-    if text.upper() in {"A", "B", "C", "D"}:
+    if text.upper() in _MCQ_LETTERS:
         return text.upper()
-    # "(A)" style
-    m = re.match(r"^\(?([A-Da-d])\)?[\.\s:]*$", text)
+    m = re.match(r"^\(?([A-Fa-f])\)?[\.\s:]*$", text)
     if m:
         return m.group(1).upper()
-    # Leading letter: "A. baseball glove" or "A) ..."
-    m = re.match(r"^\(?([A-Da-d])\)?[\.\)\s:]", text)
+    m = re.match(r"^\(?([A-Fa-f])\)?[\.\)\s:]", text)
     if m:
         return m.group(1).upper()
+    return None
+
+
+def _gt_mcq_letter(gt_norm: str) -> Optional[str]:
+    """If the ground truth itself looks like an MCQ option (``"c. top"`` /
+    ``"(b) above"``), return its leading letter. Used to credit terse
+    letter-only model outputs against verbose option-text ground truths.
+    """
+    import re
+
+    m = re.match(r"^\(?([a-f])\)?[\.\s)]", gt_norm)
+    if m:
+        return m.group(1).upper()
+    return None
+
+
+# Canonical-key mapping for short boolean / direction answers. Lets a verbose
+# baseline output ("yes, the bowl is...") credit against a terse GT ("True") and
+# vice versa. The match is anchored at the start of the model output so an
+# embedded keyword inside a contradiction ("no, it's not above") doesn't
+# falsely fire.
+_CANONICAL_GROUPS: Dict[str, str] = {}
+for _phrases, _key in [
+    (["true", "yes", "correct", "affirmative"],              "pos"),
+    (["false", "no", "incorrect", "negative"],               "neg"),
+    (["left", "to the left", "to the left of",
+      "on the left", "on the left of", "left of",
+      "left side"],                                          "left"),
+    (["right", "to the right", "to the right of",
+      "on the right", "on the right of", "right of",
+      "right side"],                                         "right"),
+    (["above", "on top of", "on top", "over"],               "above"),
+    (["below", "underneath", "under", "beneath"],            "below"),
+    (["behind", "in back of", "at the back of"],             "behind"),
+    (["in front of", "in front", "front of", "ahead of"],    "front"),
+    (["inside", "within", "into"],                           "inside"),
+    (["outside", "out of"],                                  "outside"),
+]:
+    for _p in _phrases:
+        _CANONICAL_GROUPS[_p] = _key
+
+# Phrases sorted longest-first so "to the left of" matches before "left".
+_CANONICAL_PHRASES = sorted(_CANONICAL_GROUPS.keys(), key=len, reverse=True)
+
+
+def _leading_canonical(text: Optional[str]) -> Optional[str]:
+    """Return the canonical key for the first answer-bearing token in ``text``.
+
+    Looks within the first 60 normalized characters and requires a word
+    boundary at the end of the phrase, so verbose answers like ``"yes, the
+    apple is above..."`` resolve to ``"pos"`` while ``"no, not yes"`` resolves
+    to ``"neg"`` (the leading token, not an embedded one).
+    """
+    import re
+
+    n = " ".join((text or "").strip().lower().split())
+    if not n:
+        return None
+    head = n[:60]
+    for phrase in _CANONICAL_PHRASES:
+        if re.match(r"\W*" + re.escape(phrase) + r"\b", head):
+            return _CANONICAL_GROUPS[phrase]
     return None
 
 
@@ -319,15 +391,37 @@ def match_answer(generated: str, ground_truth: str) -> bool:
     gen_norm = normalize_answer(generated)
     gt_norm = normalize_answer(ground_truth)
 
-    # Single-letter MCQ (A–D): never use substring — e.g. gt "A" must not match
+    # Single-letter MCQ (A-F): never use substring — e.g. gt "A" must not match
     # the character "a" inside "space" / "shape" in long free-form answers.
-    if len(gt_norm) == 1 and gt_norm.upper() in {"A", "B", "C", "D"}:
+    if len(gt_norm) == 1 and gt_norm.upper() in _MCQ_LETTERS:
         if gen_norm == gt_norm:
             return True
         gen_letter = _extract_mcq_letter(generated)
         if gen_letter is not None:
             return gen_letter == gt_norm.upper()
         return False
+
+    # MCQ with option-text suffix (e.g. gt="C. top" / "(b) above"): credit a
+    # bare-letter model output ("c") when its letter matches gt's letter.
+    # Falls through to the free-form path on no match so verbose answers like
+    # "c. top" still credit via substring.
+    gt_letter = _gt_mcq_letter(gt_norm)
+    if gt_letter is not None:
+        gen_letter = _extract_mcq_letter(generated)
+        if gen_letter is not None:
+            return gen_letter == gt_letter
+        # gen_letter is None → no clean letter extractable, fall through to
+        # substring rule so we don't regress against the previous matcher.
+
+    # Canonical short-answer equivalence: ``"True"`` <-> ``"yes"``, ``"left"``
+    # <-> ``"to the left of"``, etc. Symmetric so verbose baselines and terse
+    # re-inspection outputs are credited on equal footing.
+    gt_key = _CANONICAL_GROUPS.get(gt_norm)
+    if gt_key is not None:
+        gen_key = _leading_canonical(generated)
+        if gen_key is not None:
+            return gen_key == gt_key
+        # No clean leading canonical word → fall through to substring rule.
 
     if gen_norm == gt_norm or gt_norm in gen_norm:
         return True
@@ -538,6 +632,24 @@ def load_condition_model(
             _load_lora_only(model, checkpoint_dir, lora_checkpoint_dir)
         return model, False
 
+    if backend == "llava_next":
+        from src.backends.llava_next import load_model as load_llava_ri
+        from transformers import LlavaNextForConditionalGeneration
+
+        if condition == "reinspection":
+            model = load_llava_ri(config, device_map="auto", processor=processor)
+            _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir)
+            return model, True
+        resolved = resolve_pretrained_local_path(config.model_name_or_path)
+        model = LlavaNextForConditionalGeneration.from_pretrained(
+            resolved,
+            torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
+            device_map="auto",
+        )
+        if condition == "lora_only":
+            _load_lora_only(model, checkpoint_dir, lora_checkpoint_dir)
+        return model, False
+
     from src.backends.internvl3 import load_model as load_intern_ri
 
     intern_attn_kw = {}
@@ -622,7 +734,7 @@ def evaluate_benchmark(
     from src.backends.gemma4 import Gemma4WithReInspection
 
     _QWEN_BACKENDS = ("qwen25vl",)
-    _PROMPT_LEN_BACKENDS = ("internvl3", "gemma4")
+    _PROMPT_LEN_BACKENDS = ("internvl3", "gemma4", "llava_next")
 
     pbar = tqdm_stdlib(
         range(n),
@@ -656,6 +768,18 @@ def evaluate_benchmark(
                 )
             elif backend == "gemma4":
                 messages = gemma4_build_chat(
+                    question=question,
+                    image_path=image_path,
+                    system_prompt=config.system_prompt,
+                )
+                text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                inputs = processor(
+                    text=[text],
+                    images=[image_path],
+                    return_tensors="pt",
+                )
+            elif backend == "llava_next":
+                messages = llava_next_build_chat(
                     question=question,
                     image_path=image_path,
                     system_prompt=config.system_prompt,
@@ -765,6 +889,10 @@ def main(cfg: DictConfig) -> None:
         from src.backends.gemma4 import load_processor as load_gemma4_proc
 
         processor = load_gemma4_proc(config)
+    elif backend == "llava_next":
+        from src.backends.llava_next import load_processor as load_llava_proc
+
+        processor = load_llava_proc(config)
     else:
         resolved = resolve_pretrained_local_path(config.model_name_or_path)
         processor = AutoProcessor.from_pretrained(
@@ -802,8 +930,25 @@ def main(cfg: DictConfig) -> None:
             if ckpt is None:
                 print(f"Skipping {condition}: no checkpoint directory")
                 continue
-            if not os.path.exists(os.path.join(ckpt, "lora_weights")):
-                print(f"Skipping {condition}: lora_weights not found")
+            lora_dir = os.path.join(ckpt, "lora_weights")
+            if not os.path.exists(lora_dir):
+                abs_ck = os.path.abspath(ckpt)
+                print(
+                    f"Skipping {condition}: lora_weights not found at {lora_dir}\n"
+                    f"  Checkpoint root (absolute): {abs_ck}\n"
+                    "  Fix: point checkpoint_dir or lora_checkpoint_dir at a Stage-2 epoch folder "
+                    "under models/<backend>/[experiment_name]/stage2/epoch_*/ — training only writes "
+                    "lora_weights/ when saving Stage 2. Stage-1 dirs have reinspection_module.pt but "
+                    "no LoRA. You can set lora_checkpoint_dir separately if LoRA lives elsewhere."
+                )
+                if os.path.isdir(abs_ck):
+                    try:
+                        print(
+                            "  Directory contents: "
+                            f"{sorted(os.listdir(abs_ck))}"
+                        )
+                    except OSError:
+                        pass
                 continue
         if condition == "reinspection" and config.checkpoint_dir is None:
             print(f"Skipping {condition}: no checkpoint_dir")

@@ -4,8 +4,9 @@ stage: 2
 checkpoint_dir: models/internvl3/stage1/epoch_5
 lora_checkpoint_dir: models/internvl3/stage2/epoch_2
 output_file: outputs/internvl3/eval_results.json
-benchmarks: [vsr, gqa_spatial, whatsup, 3dsrbench, mindcube, blink, srbench, qspatial, embspatial]
+benchmarks: [vsr_zeroshot, gqa_spatial, whatsup, 3dsrbench, mindcube, blink, srbench, qspatial, embspatial, realworldqa, cv_bench, vstar_bench, mmvp]
 eval_condition: reinspection
 eval_compare: true
-frozen_cache_file: outputs/internvl3/frozen_baseline.json
+# Omit path to always run frozen (vanilla) on GPU; set to a JSON path to load/save cached frozen results.
+frozen_cache_file: null
 max_samples: -1

@@ -20,21 +20,28 @@ class DatasetSpec:
 REGISTRY: List[DatasetSpec] = [
     # ------------------------------------------------------------------ #
     # Stage 1 — referring-expression grounding                            #
+    # Default mix is the RefCOCO family only. GRIT, grefcoco and          #
+    # vg_grounding remain in the registry (data is on disk) so they can be #
+    # opted into a future run via ``+stage1_extra_datasets=[grit, ...]``  #
+    # or the ``stage1_datasets/all`` Hydra group.                          #
     # ------------------------------------------------------------------ #
     DatasetSpec("refcoco",      1, "refcoco",      default=True),
     DatasetSpec("refcoco+",     1, "refcoco+",     default=True),
     DatasetSpec("refcocog",     1, "refcocog",     default=True),
-    DatasetSpec("grefcoco",     1, "grefcoco",     default=True),
-    DatasetSpec("vg_grounding", 1, "vg_grounding", default=True),
-    DatasetSpec("grit",         1, "grit",         default=True),
+    DatasetSpec("grefcoco",     1, "grefcoco",     default=False),
+    DatasetSpec("vg_grounding", 1, "vg_grounding", default=False),
+    DatasetSpec("grit",         1, "grit",         default=False),
     # ------------------------------------------------------------------ #
     # Stage 2 — spatial VQA                                               #
+    # Default mix is gqa_spatial only (per-image scene-graph supervision  #
+    # for the aux grounding stream lives in the same dataset directory).   #
+    # vsr / clevr_spatial / vg_spatial / rel3d / cambrian_spatial remain   #
+    # registered for opt-in via ``+stage2_extra_datasets=[...]``.          #
     # ------------------------------------------------------------------ #
-    DatasetSpec("vsr",              2, "vsr",              default=True),
+    DatasetSpec("vsr",              2, "vsr",              default=False),
     DatasetSpec("gqa_spatial",      2, "gqa_spatial",      default=True),
-    DatasetSpec("clevr_spatial",    2, "clevr_spatial",    default=True),
-    DatasetSpec("vg_spatial",       2, "vg_spatial",       default=True),
-    # default=False until annotations land on disk
+    DatasetSpec("clevr_spatial",    2, "clevr_spatial",    default=False),
+    DatasetSpec("vg_spatial",       2, "vg_spatial",       default=False),
     DatasetSpec("rel3d",            2, "rel3d",            default=False),
     DatasetSpec("cambrian_spatial", 2, "cambrian_spatial", default=False),
 ]

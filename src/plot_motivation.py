@@ -425,18 +425,21 @@ def _npz_signal_pair(data, signal):
     return None, None
 
 
-def _render_attention_condition(npz_files, output_dir, condition):
+def _render_attention_condition(npz_files, output_dir, condition, suffix=""):
     """Render one condition-specific attention figure from saved NPZ files.
 
     Layout per row: [reference image] [Q_A overlay] [Q_B overlay] (per signal).
     Question text is rendered as a wrapped caption *below* each overlay so
     titles cannot collide across columns. The reference image is shown once
-    per row at reduced width; overlays use a stronger alpha so attention mass
-    is clearly visible against the photograph.
+    per row at reduced width; overlays render the attention as a smoothly
+    blended heatmap over the photograph.
     """
     import textwrap
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
+    if not npz_files:
+        print(f"No NPZ files to render for condition={condition}{suffix or ''}.")
+        return
     available_signals = []
     for npz_file in npz_files:
         data = np.load(npz_file, allow_pickle=True)
@@ -457,20 +460,54 @@ def _render_attention_condition(npz_files, output_dir, condition):
     if n == 1:
         axes = axes[np.newaxis, :]
 
+    # Use a vivid perceptually-uniform colormap regardless of signal — the
+    # schema defaults (cividis/hot) blend into dark image regions.
+    _HEATMAP_CMAP = "turbo"
+
     def _overlay(ax, attn_map, h_p, w_p, img, cmap):
-        attn_2d = attn_map.reshape(h_p, w_p)
+        """Render `attn_map` as a heatmap blended over `img`.
+
+        Steps:
+          1. Reshape to the patch grid (h_p, w_p) and normalize by its max.
+             Max-normalization (not percentile clipping) is essential because
+             A_vis is extremely sparse — a single peak at 1.0 with the rest
+             near 1e-30 — so percentile clipping would erase the signal.
+          2. Lanczos-upsample to image resolution for smooth contours.
+          3. Dim the photograph slightly so warm-color peaks pop, then
+             stack the colorized heatmap with a smoothstep alpha curve so
+             the noise floor stays transparent and peaks saturate.
+        """
+        del cmap  # signal-specific cmap intentionally overridden for legibility
+
+        attn_2d = attn_map.reshape(h_p, w_p).astype(np.float32)
+        amax = float(attn_2d.max())
+        if amax < 1e-20:
+            norm = np.zeros_like(attn_2d)
+        else:
+            norm = np.clip(attn_2d / amax, 0.0, 1.0)
+
         img_w, img_h = img.size
-        attn_resized = np.array(
-            Image.fromarray(attn_2d.astype(np.float32)).resize(
-                (img_w, img_h), Image.BILINEAR
-            )
-        )
-        ax.imshow(img)
-        # Mask very low attention values so the photograph shows through.
-        amax = float(attn_resized.max()) if attn_resized.size else 1.0
-        thresh = 0.15 * amax
-        masked = np.ma.masked_less(attn_resized, thresh)
-        ax.imshow(masked, cmap=cmap, alpha=0.6, vmin=thresh, vmax=amax)
+        norm_img = np.asarray(
+            Image.fromarray((norm * 255.0).astype(np.uint8)).resize(
+                (img_w, img_h), Image.LANCZOS,
+            ),
+            dtype=np.float32,
+        ) / 255.0
+        norm_img = np.clip(norm_img, 0.0, 1.0)
+
+        cmap_obj = plt.get_cmap(_HEATMAP_CMAP)
+        rgba = cmap_obj(norm_img)
+
+        # Smoothstep alpha above a small knee: noise floor → transparent,
+        # peaks → ~0.9 alpha. 3y^2 - 2y^3 gives a smooth S-curve.
+        knee = 0.05
+        ramp = np.clip((norm_img - knee) / (1.0 - knee), 0.0, 1.0)
+        ramp = ramp * ramp * (3.0 - 2.0 * ramp)
+        rgba[..., 3] = ramp * 0.90
+
+        # Render the photograph slightly dimmed so the heatmap reads cleanly.
+        ax.imshow(img, alpha=0.85)
+        ax.imshow(rgba, interpolation="bilinear")
         ax.set_xticks([]); ax.set_yticks([])
         for spine in ax.spines.values():
             spine.set_visible(False)
@@ -549,22 +586,87 @@ def _render_attention_condition(npz_files, output_dir, condition):
 
     label = " + ".join(ATTN_SIGNAL_LABELS.get(sig, sig) for sig in display_signals)
     fig.suptitle(
-        f"Attention comparison ({condition}) \u2014 {label}",
+        f"Attention comparison ({condition}){suffix.replace('_', ' ')} \u2014 {label}",
         fontsize=13, fontweight="bold", y=0.995,
     )
-    out = Path(output_dir) / f"{condition}_attention_comparison.pdf"
+    out = Path(output_dir) / f"{condition}{suffix}_attention_comparison.pdf"
     fig.savefig(out, dpi=200, bbox_inches="tight")
     fig.savefig(out.with_suffix(".png"), dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out}")
 
 
-def plot_attention_comparison(output_dir, attn_dir="outputs/motivation/attention_figures"):
+def _correct(ans, gt) -> bool:
+    return str(ans).strip().lower() == str(gt).strip().lower()
+
+
+def _pair_key(data) -> tuple:
+    return (
+        str(data["image_path"]),
+        str(data["question_a"]).strip(),
+        str(data["question_b"]).strip(),
+    )
+
+
+def _select_reinspection_wins(reins_paths, frozen_paths):
+    """Return reinspection NPZ paths where the wrapper outperforms the frozen baseline.
+
+    A "win" = reinspection is correct on **both** Q_A and Q_B for the pair,
+    and the frozen baseline is wrong on at least one of them. Matching is by
+    (image_path, question_a, question_b) so it is robust to reordering across
+    runs. Falls back to "either question is a strict gain" when no clean wins
+    exist, then to all reinspection paths.
+    """
+    frozen_by_key = {}
+    for p in frozen_paths:
+        d = np.load(p, allow_pickle=True)
+        frozen_by_key[_pair_key(d)] = {
+            "a_correct": _correct(d["answer_a"], d["gt_a"]),
+            "b_correct": _correct(d["answer_b"], d["gt_b"]),
+        }
+
+    strong_wins, weak_wins = [], []
+    for p in reins_paths:
+        d = np.load(p, allow_pickle=True)
+        key = _pair_key(d)
+        if key not in frozen_by_key:
+            continue
+        fr = frozen_by_key[key]
+        ri_a = _correct(d["answer_a"], d["gt_a"])
+        ri_b = _correct(d["answer_b"], d["gt_b"])
+        ri_both = ri_a and ri_b
+        gained = (ri_a and not fr["a_correct"]) or (ri_b and not fr["b_correct"])
+        if ri_both and (not fr["a_correct"] or not fr["b_correct"]):
+            strong_wins.append(p)
+        elif gained:
+            weak_wins.append(p)
+
+    if strong_wins:
+        print(f"  reinspection wins (both correct, frozen errs): {len(strong_wins)}")
+        return strong_wins
+    if weak_wins:
+        print(f"  reinspection partial gains (no clean wins): {len(weak_wins)}")
+        return weak_wins
+    print("  no reinspection wins found — rendering all reinspection pairs")
+    return list(reins_paths)
+
+
+def plot_attention_comparison(
+    output_dir,
+    attn_dir="outputs/motivation/attention_figures",
+    wins_only=True,
+):
     """Re-render condition attention figures from saved NPZ files.
 
     The .npz files are generated by ``src.motivation.run_attention_visualization``
     during the motivation experiment.  This function allows regenerating the
     figure without re-running the model.
+
+    When ``wins_only`` is True, the reinspection figure is restricted to pairs
+    where the re-inspection module beats the frozen baseline (see
+    ``_select_reinspection_wins``), making the comparison story explicit. The
+    frozen figure always renders all pairs so the reader sees the failure
+    modes in context.
     """
     attn_path = Path(attn_dir)
     npz_files = sorted(set(attn_path.glob("*_attn_pair_*.npz")) | set(attn_path.glob("attn_pair_*.npz")))
@@ -584,7 +686,12 @@ def plot_attention_comparison(output_dir, attn_dir="outputs/motivation/attention
         grouped[condition].append(npz_file)
 
     for condition, paths in sorted(grouped.items()):
-        _render_attention_condition(sorted(paths), output_dir, condition)
+        sorted_paths = sorted(paths)
+        if condition == "reinspection" and wins_only and grouped.get("frozen"):
+            win_paths = _select_reinspection_wins(sorted_paths, sorted(grouped["frozen"]))
+            _render_attention_condition(win_paths, output_dir, condition)
+        else:
+            _render_attention_condition(sorted_paths, output_dir, condition)
 
 
 # ------------------------------------------------------------------ #
@@ -662,6 +769,11 @@ def main():
     parser.add_argument("--output_dir", type=str, default="outputs/motivation/figures")
     parser.add_argument("--attn_dir", type=str, default="outputs/motivation/attention_figures",
                         help="Directory containing attention .npz files")
+    parser.add_argument(
+        "--no-wins-only", dest="wins_only", action="store_false",
+        help="Render all reinspection pairs (default: only show pairs where reinspection beats the frozen baseline).",
+    )
+    parser.set_defaults(wins_only=True)
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -679,7 +791,7 @@ def main():
     plot_relation_heatmap(results, output_dir)
     plot_accuracy_asymmetry(results, output_dir)
     plot_mirror_test(results, output_dir)
-    plot_attention_comparison(output_dir, attn_dir=args.attn_dir)
+    plot_attention_comparison(output_dir, attn_dir=args.attn_dir, wins_only=args.wins_only)
 
     print(f"\nAll figures saved to {output_dir}/")
 
