@@ -27,14 +27,21 @@ spec:
             REINSPECTION_EXPERIMENT=s1_internvl \
             REINSPECTION_EXPERIMENT_STAGE2=s2_internvl \
               bash src/scripts/run_train.sh \
-                deepspeed_config=src/configs/deepspeed_z2.json
+                deepspeed_config=src/configs/deepspeed_z2.json \
+                stage1_grad_accum=8 \
+                stage2_grad_accum=8
         imagePullPolicy: Always
         env:
           - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
           - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+        # 8x H100 on one node. Effective batch held at 512 via stage{1,2}_grad_accum=8
+        # in the command above (8 micro-batch x 8 accum x 8 GPUs). cpu/mem bumped to
+        # feed 8 ranks x num_workers DataLoader processes. An 8-GPU node is the
+        # single-node ceiling here: >8 needs multi-node deepspeed (hostfile /
+        # --num_nodes), which this launcher does not set up.
         resources:
-          requests: { cpu: 64, memory: "128Gi", nvidia.com/gpu: 4 }
-          limits:   { cpu: 64, memory: "128Gi", nvidia.com/gpu: 4 }
+          requests: { cpu: 96, memory: "192Gi", nvidia.com/gpu: 8 }
+          limits:   { cpu: 96, memory: "192Gi", nvidia.com/gpu: 8 }
         volumeMounts:
           - { mountPath: /dev/shm, name: dshm }
           - { mountPath: /data,    name: nfs }
@@ -42,7 +49,7 @@ spec:
       securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
       volumes:
       - name: dshm
-        emptyDir: { medium: Memory, sizeLimit: "64Gi" }
+        emptyDir: { medium: Memory, sizeLimit: "96Gi" }
       - name: nfs
         nfs: { server: 10.24.6.66, path: / }
       nodeSelector:

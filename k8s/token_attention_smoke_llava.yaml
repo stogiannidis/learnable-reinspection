@@ -1,0 +1,75 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-token-attn-llava-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 86400
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-token-attn-llava
+    spec:
+      containers:
+      - name: reinspection-token-attn-llava
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            mkdir -p logs outputs/token_attn
+            export OMP_NUM_THREADS=4
+            export HYDRA_FULL_ERROR=1
+            export HF_HOME=/data/Huggingface
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+            export WANDB_MODE=offline
+            export PYTHONDONTWRITEBYTECODE=1
+
+            find src scripts -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+            echo "==== smoke env ===="
+            python -c "import torch, transformers; print('torch', torch.__version__, 'transformers', transformers.__version__, 'cuda', torch.cuda.is_available())"
+
+            # LLaVA-Next, FROZEN only (no llava_next reinspection checkpoint exists).
+            # First run downloads ~15GB weights to HF_HOME (shared NFS, reused after).
+            OUT=outputs/token_attn/llava_next_smoke
+            python scripts/analysis/visualize_token_attention.py \
+              --backend llava_next \
+              --image /data/datasets/vsr/images/000000000142.jpg \
+              --question "Is the cat to the left of the laptop?" \
+              --conditions frozen \
+              --output_dir outputs/token_attn \
+              --sample_name smoke \
+              --max_new_tokens 8 \
+              --max_input_tokens 32 \
+              2>&1 | tee logs/token_attn_llava_smoke.log
+
+            echo "==== outputs ===="
+            ls -la "$OUT"
+            test -f "$OUT/maps.npz" && test -f "$OUT/input_tokens.png" \
+              && echo "SMOKE SUCCESS" || { echo "SMOKE FAILED: expected outputs missing"; exit 1; }
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+        resources:
+          requests: { cpu: 16, memory: "48Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 16, memory: "48Gi", nvidia.com/gpu: 1 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "16Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3

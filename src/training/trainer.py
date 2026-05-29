@@ -16,6 +16,7 @@ import os
 import platform
 import subprocess
 import sys
+import time
 from dataclasses import asdict
 from typing import Iterable, Optional, Union
 
@@ -1455,14 +1456,15 @@ def run_training(config: ReInspectionConfig) -> None:
             )
 
     if config.gradient_checkpointing:
-        if backend == "internvl3":
-            model.base_model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": True}
-            )
-            log("Gradient checkpointing enabled (reentrant mode for InternVL3)")
-        else:
-            model.base_model.gradient_checkpointing_enable()
-            log("Gradient checkpointing enabled")
+        model.base_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={
+                "use_reentrant": config.gradient_checkpointing_use_reentrant
+            }
+        )
+        log(
+            "Gradient checkpointing enabled "
+            f"(use_reentrant={config.gradient_checkpointing_use_reentrant})"
+        )
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -1643,8 +1645,22 @@ def run_training(config: ReInspectionConfig) -> None:
             leave=True,
         )
 
+        # Throughput window: counts reset at every W&B log so samples/sec and
+        # tokens/sec reflect the most recent interval. Re-armed per epoch so
+        # end-of-epoch validation/checkpoint time never contaminates the rate.
+        _tput_t0 = time.perf_counter()
+        _tput_samples = 0
+        _tput_tokens = 0
+        _last_samples_per_sec = None
+
         for step, batch in enumerate(pbar):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            _tput_samples += int(batch["input_ids"].size(0))
+            _tput_tokens += int(
+                batch["attention_mask"].sum().item()
+                if "attention_mask" in batch
+                else batch["input_ids"].numel()
+            )
 
             outputs = model(
                 **_train_forward_kwargs(
@@ -1828,6 +1844,18 @@ def run_training(config: ReInspectionConfig) -> None:
                 metrics[f"{pfx}/system/gpu_mem_reserved_gb"] = torch.cuda.memory_reserved(device) / (1024 ** 3)
 
             if grad_metrics is not None or global_step % config.wandb_log_interval == 0:
+                _tput_elapsed = time.perf_counter() - _tput_t0
+                if _tput_elapsed > 0:
+                    _world = dist.get_world_size() if dist.is_initialized() else 1
+                    _sps = _tput_samples / _tput_elapsed
+                    _tps = _tput_tokens / _tput_elapsed
+                    _last_samples_per_sec = _sps * _world
+                    metrics[f"{pfx}/throughput/samples_per_sec"] = _sps * _world
+                    metrics[f"{pfx}/throughput/tokens_per_sec"] = _tps * _world
+                    metrics[f"{pfx}/throughput/samples_per_sec_per_gpu"] = _sps
+                _tput_t0 = time.perf_counter()
+                _tput_samples = 0
+                _tput_tokens = 0
                 _log_wandb(metrics, global_step)
 
             postfix: dict = {"loss": f"{loss.item():.4f}", "lr": f"{lr:.2e}"}
@@ -1845,6 +1873,8 @@ def run_training(config: ReInspectionConfig) -> None:
                 postfix["qt_nce"] = f"{qt_infonce_loss.item():.4f}"
             if grad_norm is not None:
                 postfix["gnorm"] = f"{grad_norm:.2f}"
+            if _last_samples_per_sec is not None:
+                postfix["sps"] = f"{_last_samples_per_sec:.1f}"
             pbar.set_postfix(postfix)
 
             if (

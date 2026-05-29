@@ -39,7 +39,15 @@ WORKDIR /data/users/stogian/learnable-reinspection
 
 COPY requirements.txt .
 
-RUN uv pip install --system --no-cache --break-system-packages -r requirements.txt
+# flash-attn must be built after torch is present; its build metadata is incomplete
+# under uv's default isolated build env.
+RUN uv pip install --system --no-cache --break-system-packages \
+        packaging setuptools wheel ninja psutil && \
+    uv pip install --system --no-cache --break-system-packages \
+        "torch>=2.9" "torchvision>=0.20" && \
+    uv pip install --system --no-cache --break-system-packages \
+        --no-build-isolation "flash-attn>=2.7.0" && \
+    uv pip install --system --no-cache --break-system-packages -r requirements.txt
 
 COPY src/ src/
 

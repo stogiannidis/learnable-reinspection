@@ -75,7 +75,7 @@ concatenates any subset under a common `data_root`.
 - **Images.** **COCO** — VSR is built on COCO images, shared with the Stage-1
   RefCOCO family. The loader expects them under `vsr/images/` (symlink to the
   COCO pool is standard).
-- **Default in mix.** Yes.
+- **Default in mix.** **No**.
 
 ### gqa_spatial
 - **Task.** Spatial subset of GQA questions.
@@ -85,7 +85,7 @@ concatenates any subset under a common `data_root`.
   Practically: GQA images are in GQA's own folder, but the underlying photos
   overlap with `vg_grounding`, `vg_spatial`, and the VG portion of
   `cambrian_spatial`.
-- **Default in mix.** Yes.
+- **Default in mix.** **No**.
 
 ### clevr_spatial
 - **Task.** Synthetic spatial VQA on CLEVR-style scenes.
@@ -126,6 +126,17 @@ concatenates any subset under a common `data_root`.
   copied from those local pools.
 - **Default in mix.** **No** (HF stream reliability).
 
+### visual_cot
+- **Task.** Visual-CoT / VisCoT VQA supervision with region-focused examples.
+- **Source.** Native extracted Visual-CoT layout under `visual_cot/`: the
+  loader reads `metadata/*_cot_train.jsonl` directly instead of requiring a
+  converted `train.json`.
+- **Images.** `visual_cot/cot_image_data/`, with support for both
+  `<dataset>/<image>` and raw `cot/<dataset>/<image>` extraction layouts.
+  Samples whose images have not finished extracting are skipped at dataset
+  construction time.
+- **Default in mix.** Yes when present on disk.
+
 ---
 
 ## Image-source sharing matrix
@@ -139,6 +150,7 @@ split by image rather than by sample, you must do it across the whole group.
 | COCO `train2017`           | `refcoco`, `refcoco+`, `refcocog`, `grefcoco`, `vsr`                                 |
 | Visual Genome (`VG_100K*`) | `vg_grounding`, `vg_spatial`, `cambrian_spatial` (VG branch)                         |
 | GQA (subset of VG photos)  | `gqa_spatial`, `cambrian_spatial` (GQA branch); overlaps the VG pool at the photo level |
+| Mixed Visual-CoT pools     | `visual_cot` (Flickr30k, GQA, VSR, OCR/document VQA, OpenImages, CUB, etc.)          |
 | Unique per-dataset         | `grit` (web), `clevr_spatial` (synthetic), `rel3d`                                   |
 
 Notes:
@@ -165,8 +177,8 @@ python -m src.data.prepare_training_data \
 
 Pass any subset of `{grit, rel3d, cambrian_spatial, clevr_spatial, vg_spatial,
 vg_grounding, grefcoco}` to `--datasets`. The three RefCOCO variants, `vsr`,
-and `gqa_spatial` are expected to already be on disk in the registry-specified
-folders.
+`gqa_spatial`, and `visual_cot` are expected to already be on disk in the
+registry-specified folders.
 
 ## Selecting datasets at train time
 
@@ -190,9 +202,9 @@ Available presets:
 - `stage2_datasets/`: `default`, `all`, `clevr_only`, `vg_only`,
   `benchmarks_only`
 
-Leaving the list as `null` (the `default` preset) falls back to
-`registry.stage{1,2}_defaults()`, which is every entry with `default=True`
-in `src/data/registry.py`.
+The Stage-2 `default` preset is currently explicit Visual-CoT only. Leaving a
+raw list as `null` falls back to `registry.stage{1,2}_defaults()`, which is
+every entry with `default=True` in `src/data/registry.py`.
 
 ---
 

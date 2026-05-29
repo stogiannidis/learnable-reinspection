@@ -1,0 +1,982 @@
+{
+  "root": "/data/datasets/visual_cot",
+  "generated_at": "2026-05-25 11:27:57 UTC",
+  "elapsed_sec": 207.18,
+  "metadata_files": 12,
+  "total_records": 434265,
+  "total_loadable": 3614,
+  "total_missing_images": 430651,
+  "loadable_pct": 0.83,
+  "invalid_json": 0,
+  "missing_required": 0,
+  "split_counts": {
+    "train": 434265
+  },
+  "field_counts": {
+    "question": 434265,
+    "answer": 434265,
+    "image": 434265,
+    "width": 434265,
+    "height": 434265,
+    "bboxs": 434265,
+    "dataset": 434265,
+    "split": 434265,
+    "full_answer": 98149,
+    "reasoning": 98149,
+    "thought": 98149,
+    "possible_answers": 48508,
+    "multiple_choices": 30491
+  },
+  "bbox_count_distribution": {
+    "1": 388641,
+    "2": 27905,
+    "3": 7265,
+    "4": 4248,
+    "5": 1623,
+    "6": 1280,
+    "7": 602,
+    "8": 624,
+    "9": 326,
+    "10": 352,
+    "11": 182,
+    "12": 198,
+    "13": 139,
+    "14": 121,
+    "15": 78,
+    "16": 75,
+    "17": 60,
+    "18": 61,
+    "19": 44,
+    "20": 59,
+    "21": 34,
+    "22": 59,
+    "23": 27,
+    "24": 29,
+    "25": 19,
+    "26": 25,
+    "27": 15,
+    "28": 21,
+    "29": 12,
+    "30": 12,
+    "31": 17,
+    "32": 6,
+    "33": 8,
+    "34": 5,
+    "35": 1,
+    "36": 12,
+    "37": 2,
+    "38": 9,
+    "39": 2,
+    "40": 1,
+    "41": 6,
+    "42": 7,
+    "43": 5,
+    "44": 8,
+    "45": 3,
+    "46": 2,
+    "48": 3,
+    "50": 1,
+    "51": 3,
+    "53": 3,
+    "54": 2,
+    "55": 2,
+    "56": 2,
+    "57": 2,
+    "58": 1,
+    "59": 3,
+    "68": 1,
+    "73": 1,
+    "74": 1,
+    "75": 1,
+    "76": 1,
+    "77": 1,
+    "88": 2,
+    "99": 1,
+    "107": 2,
+    "108": 1,
+    "132": 1
+  },
+  "question_words_overall": {
+    "count": 434265,
+    "mean": 9.493,
+    "p50": 9,
+    "p90": 15.0,
+    "p99": 20.0,
+    "min": 2,
+    "max": 33
+  },
+  "answer_words_overall": {
+    "count": 434265,
+    "mean": 4.865,
+    "p50": 1,
+    "p90": 14.0,
+    "p99": 25.0,
+    "min": 1,
+    "max": 432
+  },
+  "bbox_area_ratio_overall": {
+    "count": 541070,
+    "mean": 0.11,
+    "p50": 0.019,
+    "p90": 0.359,
+    "p99": 0.883,
+    "min": 0.0,
+    "max": 18.508
+  },
+  "top_answers": [
+    [
+      "man",
+      10562
+    ],
+    [
+      "yes",
+      6281
+    ],
+    [
+      "no",
+      6207
+    ],
+    [
+      "woman",
+      5636
+    ],
+    [
+      "glasses",
+      4647
+    ],
+    [
+      "table",
+      4144
+    ],
+    [
+      "standing",
+      3657
+    ],
+    [
+      "chair",
+      3612
+    ],
+    [
+      "boy",
+      2390
+    ],
+    [
+      "car",
+      2076
+    ],
+    [
+      "girl",
+      1997
+    ],
+    [
+      "wood",
+      1842
+    ],
+    [
+      "dog",
+      1653
+    ],
+    [
+      "sunglasses",
+      1618
+    ],
+    [
+      "horse",
+      1462
+    ],
+    [
+      "bus",
+      1344
+    ],
+    [
+      "sitting",
+      1308
+    ],
+    [
+      "smiling",
+      1292
+    ],
+    [
+      "people",
+      1257
+    ],
+    [
+      "cat",
+      1191
+    ],
+    [
+      "houseplant",
+      1133
+    ],
+    [
+      "flowerpot",
+      1125
+    ],
+    [
+      "bed",
+      1084
+    ],
+    [
+      "elephant",
+      1046
+    ],
+    [
+      "giraffe",
+      988
+    ]
+  ],
+  "top_question_prefixes": [
+    [
+      "what",
+      238292
+    ],
+    [
+      "who",
+      38526
+    ],
+    [
+      "can",
+      27035
+    ],
+    [
+      "is",
+      21392
+    ],
+    [
+      "where",
+      19633
+    ],
+    [
+      "does",
+      17222
+    ],
+    [
+      "which",
+      16815
+    ],
+    [
+      "how",
+      15101
+    ],
+    [
+      "are",
+      8253
+    ],
+    [
+      "what's",
+      5488
+    ],
+    [
+      "the",
+      4438
+    ],
+    [
+      "in",
+      4273
+    ],
+    [
+      "when",
+      2303
+    ],
+    [
+      "why",
+      1650
+    ],
+    [
+      "do",
+      1550
+    ],
+    [
+      "besides",
+      1529
+    ],
+    [
+      "could",
+      1095
+    ],
+    [
+      "to",
+      826
+    ],
+    [
+      "on",
+      658
+    ],
+    [
+      "from",
+      642
+    ]
+  ],
+  "metadata_file_rows": [
+    {
+      "file": "cub_cot_train.jsonl",
+      "records": 10056,
+      "loadable": 3614,
+      "missing_images": 6442
+    },
+    {
+      "file": "docvqa_cot_train.jsonl",
+      "records": 33453,
+      "loadable": 0,
+      "missing_images": 33453
+    },
+    {
+      "file": "dude_cot_train.jsonl",
+      "records": 11735,
+      "loadable": 0,
+      "missing_images": 11735
+    },
+    {
+      "file": "flickr30k_cot_train.jsonl",
+      "records": 135735,
+      "loadable": 0,
+      "missing_images": 135735
+    },
+    {
+      "file": "gqa_cot_train.jsonl",
+      "records": 98149,
+      "loadable": 0,
+      "missing_images": 98149
+    },
+    {
+      "file": "infographicsvqa_cot_train.jsonl",
+      "records": 15055,
+      "loadable": 0,
+      "missing_images": 15055
+    },
+    {
+      "file": "openimages_cot_train.jsonl",
+      "records": 43053,
+      "loadable": 0,
+      "missing_images": 43053
+    },
+    {
+      "file": "sroie_cot_train.jsonl",
+      "records": 2486,
+      "loadable": 0,
+      "missing_images": 2486
+    },
+    {
+      "file": "textcap_cot_train.jsonl",
+      "records": 32152,
+      "loadable": 0,
+      "missing_images": 32152
+    },
+    {
+      "file": "textvqa_cot_train.jsonl",
+      "records": 18524,
+      "loadable": 0,
+      "missing_images": 18524
+    },
+    {
+      "file": "visual7w_cot_train.jsonl",
+      "records": 30491,
+      "loadable": 0,
+      "missing_images": 30491
+    },
+    {
+      "file": "vsr_cot_train.jsonl",
+      "records": 3376,
+      "loadable": 0,
+      "missing_images": 3376
+    }
+  ],
+  "datasets": [
+    {
+      "dataset": "flickr30k",
+      "records": 135735,
+      "loadable": 0,
+      "loadable_pct": 0.0,
+      "missing_images": 135735,
+      "unique_images": 28262,
+      "loadable_unique_images": 0,
+      "bbox_records": 135735,
+      "bbox_total": 139928,
+      "bbox_invalid": 0,
+      "bbox_area_ratio": {
+        "count": 139928,
+        "mean": 0.139,
+        "p50": 0.09,
+        "p90": 0.358,
+        "p99": 0.485,
+        "min": 0.0,
+        "max": 0.989
+      },
+      "question_words": {
+        "count": 135735,
+        "mean": 12.88,
+        "p50": 13,
+        "p90": 17.0,
+        "p99": 21.0,
+        "min": 4,
+        "max": 31
+      },
+      "answer_words": {
+        "count": 135735,
+        "mean": 12.135,
+        "p50": 11,
+        "p90": 20.0,
+        "p99": 29.0,
+        "min": 2,
+        "max": 58
+      },
+      "has_full_answer_pct": 0.0,
+      "has_possible_answers_pct": 0.0,
+      "has_reasoning_pct": 0.0,
+      "has_thought_pct": 0.0,
+      "yes_no_pct": 0.0
+    },
+    {
+      "dataset": "gqa",
+      "records": 98149,
+      "loadable": 0,
+      "loadable_pct": 0.0,
+      "missing_images": 98149,
+      "unique_images": 53924,
+      "loadable_unique_images": 0,
+      "bbox_records": 98149,
+      "bbox_total": 98149,
+      "bbox_invalid": 1,
+      "bbox_area_ratio": {
+        "count": 98148,
+        "mean": 0.18,
+        "p50": 0.075,
+        "p90": 0.528,
+        "p99": 0.994,
+        "min": 0.0,
+        "max": 1.007
+      },
+      "question_words": {
+        "count": 98149,
+        "mean": 7.553,
+        "p50": 6,
+        "p90": 12.0,
+        "p99": 19.0,
+        "min": 3,
+        "max": 28
+      },
+      "answer_words": {
+        "count": 98149,
+        "mean": 1.054,
+        "p50": 1,
+        "p90": 1.0,
+        "p99": 2.0,
+        "min": 1,
+        "max": 2
+      },
+      "has_full_answer_pct": 100.0,
+      "has_possible_answers_pct": 0.0,
+      "has_reasoning_pct": 100.0,
+      "has_thought_pct": 100.0,
+      "yes_no_pct": 0.0
+    },
+    {
+      "dataset": "openimages",
+      "records": 43053,
+      "loadable": 0,
+      "loadable_pct": 0.0,
+      "missing_images": 43053,
+      "unique_images": 29355,
+      "loadable_unique_images": 0,
+      "bbox_records": 43053,
+      "bbox_total": 43053,
+      "bbox_invalid": 0,
+      "bbox_area_ratio": {
+        "count": 43053,
+        "mean": 0.219,
+        "p50": 0.11,
+        "p90": 0.621,
+        "p99": 0.989,
+        "min": 0.0,
+        "max": 1.0
+      },
+      "question_words": {
+        "count": 43053,
+        "mean": 6.0,
+        "p50": 5,
+        "p90": 10.0,
+        "p99": 13.0,
+        "min": 4,
+        "max": 14
+      },
+      "answer_words": {
+        "count": 43053,
+        "mean": 1.074,
+        "p50": 1,
+        "p90": 1.0,
+        "p99": 2.0,
+        "min": 1,
+        "max": 5
+      },
+      "has_full_answer_pct": 0.0,
+      "has_possible_answers_pct": 0.0,
+      "has_reasoning_pct": 0.0,
+      "has_thought_pct": 0.0,
+      "yes_no_pct": 0.0
+    },
+    {
+      "dataset": "docvqa",
+      "records": 33453,
+      "loadable": 0,
+      "loadable_pct": 0.0,
+      "missing_images": 33453,
+      "unique_images": 9836,
+      "loadable_unique_images": 0,
+      "bbox_records": 33453,
+      "bbox_total": 77032,
+      "bbox_invalid": 0,
+      "bbox_area_ratio": {
+        "count": 77032,
+        "mean": 0.004,
+        "p50": 0.003,
+        "p90": 0.011,
+        "p99": 0.025,
+        "min": 0.0,
+        "max": 0.307
+      },
+      "question_words": {
+        "count": 33453,
+        "mean": 8.275,
+        "p50": 8,
+        "p90": 12.0,
+        "p99": 17.0,
+        "min": 2,
+        "max": 30
+      },
+      "answer_words": {
+        "count": 33453,
+        "mean": 2.249,
+        "p50": 2,
+        "p90": 4.0,
+        "p99": 9.0,
+        "min": 1,
+        "max": 30
+      },
+      "has_full_answer_pct": 0.0,
+      "has_possible_answers_pct": 100.0,
+      "has_reasoning_pct": 0.0,
+      "has_thought_pct": 0.0,
+      "yes_no_pct": 0.2
+    },
+    {
+      "dataset": "textcap",
+      "records": 32152,
+      "loadable": 0,
+      "loadable_pct": 0.0,
+      "missing_images": 32152,
+      "unique_images": 16425,
+      "loadable_unique_images": 0,
+      "bbox_records": 32152,
+      "bbox_total": 56090,
+      "bbox_invalid": 0,
+      "bbox_area_ratio": {
+        "count": 56090,
+        "mean": 0.011,
+        "p50": 0.004,
+        "p90": 0.027,
+        "p99": 0.117,
+        "min": 0.0,
+        "max": 0.579
+      },
+      "question_words": {
+        "count": 32152,
+        "mean": 11.071,
+        "p50": 11.0,
+        "p90": 14.0,
+        "p99": 18.0,
+        "min": 4,
+        "max": 23
+      },
+      "answer_words": {
+        "count": 32152,
+        "mean": 1.585,
+        "p50": 1.0,
+        "p90": 3.0,
+        "p99": 4.0,
+        "min": 1,
+        "max": 18
+      },
+      "has_full_answer_pct": 0.0,
+      "has_possible_answers_pct": 0.0,
+      "has_reasoning_pct": 0.0,
+      "has_thought_pct": 0.0,
+      "yes_no_pct": 0.07
+    },
+    {
+      "dataset": "v7w",
+      "records": 30491,
+      "loadable": 0,
+      "loadable_pct": 0.0,
+      "missing_images": 30491,
+      "unique_images": 12627,
+      "loadable_unique_images": 0,
+      "bbox_records": 30491,
+      "bbox_total": 30491,
+      "bbox_invalid": 1,
+      "bbox_area_ratio": {
+        "count": 30490,
+        "mean": 0.197,
+        "p50": 0.069,
+        "p90": 0.609,
+        "p99": 0.997,
+        "min": 0.0,
+        "max": 1.008
+      },
+      "question_words": {
+        "count": 30491,
+        "mean": 5.578,
+        "p50": 5,
+        "p90": 8,
+        "p99": 11.0,
+        "min": 3,
+        "max": 24
+      },
+      "answer_words": {
+        "count": 30491,
+        "mean": 2.328,
+        "p50": 2,
+        "p90": 4,
+        "p99": 8.0,
+        "min": 1,
+        "max": 20
+      },
+      "has_full_answer_pct": 0.0,
+      "has_possible_answers_pct": 0.0,
+      "has_reasoning_pct": 0.0,
+      "has_thought_pct": 0.0,
+      "yes_no_pct": 0.0
+    },
+    {
+      "dataset": "textvqa",
+      "records": 18524,
+      "loadable": 0,
+      "loadable_pct": 0.0,
+      "missing_images": 18524,
+      "unique_images": 14159,
+      "loadable_unique_images": 0,
+      "bbox_records": 18524,
+      "bbox_total": 32750,
+      "bbox_invalid": 0,
+      "bbox_area_ratio": {
+        "count": 32750,
+        "mean": 0.012,
+        "p50": 0.004,
+        "p90": 0.028,
+        "p99": 0.117,
+        "min": 0.0,
+        "max": 0.579
+      },
+      "question_words": {
+        "count": 18524,
+        "mean": 6.969,
+        "p50": 7.0,
+        "p90": 10.0,
+        "p99": 14.0,
+        "min": 3,
+        "max": 23
+      },
+      "answer_words": {
+        "count": 18524,
+        "mean": 1.709,
+        "p50": 1.0,
+        "p90": 3.0,
+        "p99": 7.0,
+        "min": 1,
+        "max": 19
+      },
+      "has_full_answer_pct": 0.0,
+      "has_possible_answers_pct": 0.0,
+      "has_reasoning_pct": 0.0,
+      "has_thought_pct": 0.0,
+      "yes_no_pct": 0.13
+    },
+    {
+      "dataset": "infographicsvqa",
+      "records": 15055,
+      "loadable": 0,
+      "loadable_pct": 0.0,
+      "missing_images": 15055,
+      "unique_images": 3805,
+      "loadable_unique_images": 0,
+      "bbox_records": 15055,
+      "bbox_total": 35930,
+      "bbox_invalid": 0,
+      "bbox_area_ratio": {
+        "count": 35930,
+        "mean": 0.002,
+        "p50": 0.001,
+        "p90": 0.006,
+        "p99": 0.021,
+        "min": 0.0,
+        "max": 0.119
+      },
+      "question_words": {
+        "count": 15055,
+        "mean": 11.539,
+        "p50": 11,
+        "p90": 16.0,
+        "p99": 23.0,
+        "min": 3,
+        "max": 30
+      },
+      "answer_words": {
+        "count": 15055,
+        "mean": 1.445,
+        "p50": 1,
+        "p90": 3.0,
+        "p99": 6.0,
+        "min": 1,
+        "max": 17
+      },
+      "has_full_answer_pct": 0.0,
+      "has_possible_answers_pct": 100.0,
+      "has_reasoning_pct": 0.0,
+      "has_thought_pct": 0.0,
+      "yes_no_pct": 0.02
+    },
+    {
+      "dataset": "dude",
+      "records": 11735,
+      "loadable": 0,
+      "loadable_pct": 0.0,
+      "missing_images": 11735,
+      "unique_images": 5773,
+      "loadable_unique_images": 0,
+      "bbox_records": 11735,
+      "bbox_total": 11735,
+      "bbox_invalid": 4,
+      "bbox_area_ratio": {
+        "count": 11731,
+        "mean": 0.027,
+        "p50": 0.004,
+        "p90": 0.031,
+        "p99": 0.353,
+        "min": 0.0,
+        "max": 18.508
+      },
+      "question_words": {
+        "count": 11735,
+        "mean": 8.333,
+        "p50": 8,
+        "p90": 13.0,
+        "p99": 19.0,
+        "min": 2,
+        "max": 33
+      },
+      "answer_words": {
+        "count": 11735,
+        "mean": 3.457,
+        "p50": 2,
+        "p90": 7.0,
+        "p99": 24.0,
+        "min": 1,
+        "max": 432
+      },
+      "has_full_answer_pct": 0.0,
+      "has_possible_answers_pct": 0.0,
+      "has_reasoning_pct": 0.0,
+      "has_thought_pct": 0.0,
+      "yes_no_pct": 0.77
+    },
+    {
+      "dataset": "cub",
+      "records": 10056,
+      "loadable": 3614,
+      "loadable_pct": 35.94,
+      "missing_images": 6442,
+      "unique_images": 5028,
+      "loadable_unique_images": 1807,
+      "bbox_records": 10056,
+      "bbox_total": 10056,
+      "bbox_invalid": 0,
+      "bbox_area_ratio": {
+        "count": 10056,
+        "mean": 0.35,
+        "p50": 0.323,
+        "p90": 0.597,
+        "p99": 0.838,
+        "min": 0.05,
+        "max": 1.0
+      },
+      "question_words": {
+        "count": 10056,
+        "mean": 12.0,
+        "p50": 12.0,
+        "p90": 12.0,
+        "p99": 12.0,
+        "min": 12,
+        "max": 12
+      },
+      "answer_words": {
+        "count": 10056,
+        "mean": 1.0,
+        "p50": 1.0,
+        "p90": 1.0,
+        "p99": 1.0,
+        "min": 1,
+        "max": 1
+      },
+      "has_full_answer_pct": 0.0,
+      "has_possible_answers_pct": 0.0,
+      "has_reasoning_pct": 0.0,
+      "has_thought_pct": 0.0,
+      "yes_no_pct": 100.0
+    },
+    {
+      "dataset": "vsr",
+      "records": 3376,
+      "loadable": 0,
+      "loadable_pct": 0.0,
+      "missing_images": 3376,
+      "unique_images": 1765,
+      "loadable_unique_images": 0,
+      "bbox_records": 3376,
+      "bbox_total": 3376,
+      "bbox_invalid": 0,
+      "bbox_area_ratio": {
+        "count": 3376,
+        "mean": 0.368,
+        "p50": 0.311,
+        "p90": 0.829,
+        "p99": 0.996,
+        "min": 0.0,
+        "max": 1.0
+      },
+      "question_words": {
+        "count": 3376,
+        "mean": 6.674,
+        "p50": 6.0,
+        "p90": 9.0,
+        "p99": 11.0,
+        "min": 5,
+        "max": 12
+      },
+      "answer_words": {
+        "count": 3376,
+        "mean": 1.06,
+        "p50": 1.0,
+        "p90": 1.0,
+        "p99": 2.0,
+        "min": 1,
+        "max": 2
+      },
+      "has_full_answer_pct": 0.0,
+      "has_possible_answers_pct": 0.0,
+      "has_reasoning_pct": 0.0,
+      "has_thought_pct": 0.0,
+      "yes_no_pct": 65.88
+    },
+    {
+      "dataset": "sroie",
+      "records": 2486,
+      "loadable": 0,
+      "loadable_pct": 0.0,
+      "missing_images": 2486,
+      "unique_images": 626,
+      "loadable_unique_images": 0,
+      "bbox_records": 2486,
+      "bbox_total": 2486,
+      "bbox_invalid": 0,
+      "bbox_area_ratio": {
+        "count": 2486,
+        "mean": 0.093,
+        "p50": 0.011,
+        "p90": 0.407,
+        "p99": 0.739,
+        "min": 0.0,
+        "max": 0.754
+      },
+      "question_words": {
+        "count": 2486,
+        "mean": 11.251,
+        "p50": 11.0,
+        "p90": 12.0,
+        "p99": 12.0,
+        "min": 11,
+        "max": 12
+      },
+      "answer_words": {
+        "count": 2486,
+        "mean": 4.431,
+        "p50": 3.0,
+        "p90": 12.0,
+        "p99": 16.0,
+        "min": 1,
+        "max": 21
+      },
+      "has_full_answer_pct": 0.0,
+      "has_possible_answers_pct": 0.0,
+      "has_reasoning_pct": 0.0,
+      "has_thought_pct": 0.0,
+      "yes_no_pct": 0.0
+    }
+  ],
+  "extracted_images_total": 4764,
+  "extracted_images_by_root": {
+    "cub": 4764
+  },
+  "loadable_examples": [
+    {
+      "dataset": "cub",
+      "image": "001.Black_footed_Albatross/Black_Footed_Albatross_0009_34.jpg",
+      "path": "/data/datasets/visual_cot/cot_image_data/cub/001.Black_footed_Albatross/Black_Footed_Albatross_0009_34.jpg",
+      "question": "Does the bird in the picture have grey forehead and grey throat?",
+      "answer": "Yes"
+    },
+    {
+      "dataset": "cub",
+      "image": "001.Black_footed_Albatross/Black_Footed_Albatross_0009_34.jpg",
+      "path": "/data/datasets/visual_cot/cot_image_data/cub/001.Black_footed_Albatross/Black_Footed_Albatross_0009_34.jpg",
+      "question": "Does the bird in the picture have blue forehead and olive upper?",
+      "answer": "No"
+    },
+    {
+      "dataset": "cub",
+      "image": "001.Black_footed_Albatross/Black_Footed_Albatross_0074_59.jpg",
+      "path": "/data/datasets/visual_cot/cot_image_data/cub/001.Black_footed_Albatross/Black_Footed_Albatross_0074_59.jpg",
+      "question": "Does the bird in the picture have solid wing and brown wing?",
+      "answer": "Yes"
+    },
+    {
+      "dataset": "cub",
+      "image": "001.Black_footed_Albatross/Black_Footed_Albatross_0074_59.jpg",
+      "path": "/data/datasets/visual_cot/cot_image_data/cub/001.Black_footed_Albatross/Black_Footed_Albatross_0074_59.jpg",
+      "question": "Does the bird in the picture have pink eye and red forehead?",
+      "answer": "No"
+    },
+    {
+      "dataset": "cub",
+      "image": "001.Black_footed_Albatross/Black_Footed_Albatross_0014_89.jpg",
+      "path": "/data/datasets/visual_cot/cot_image_data/cub/001.Black_footed_Albatross/Black_Footed_Albatross_0014_89.jpg",
+      "question": "Does the bird in the picture have large_(16_-_32_in) size and brown under?",
+      "answer": "Yes"
+    }
+  ],
+  "missing_image_examples": [
+    {
+      "dataset": "cub",
+      "image": "074.Florida_Jay/Florida_Jay_0054_65046.jpg",
+      "metadata_file": "cub_cot_train.jsonl"
+    },
+    {
+      "dataset": "cub",
+      "image": "074.Florida_Jay/Florida_Jay_0054_65046.jpg",
+      "metadata_file": "cub_cot_train.jsonl"
+    },
+    {
+      "dataset": "cub",
+      "image": "074.Florida_Jay/Florida_Jay_0109_64558.jpg",
+      "metadata_file": "cub_cot_train.jsonl"
+    },
+    {
+      "dataset": "cub",
+      "image": "074.Florida_Jay/Florida_Jay_0109_64558.jpg",
+      "metadata_file": "cub_cot_train.jsonl"
+    },
+    {
+      "dataset": "cub",
+      "image": "074.Florida_Jay/Florida_Jay_0075_65093.jpg",
+      "metadata_file": "cub_cot_train.jsonl"
+    }
+  ]
+}

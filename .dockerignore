@@ -1,0 +1,23 @@
+
+# The Dockerfile only COPYs requirements.txt and src/. Everything below is
+# excluded from the build context to keep it tiny (otherwise ~1.3GB of
+# checkpoints/outputs/logs get shipped to the daemon for nothing).
+.git
+.gitignore
+models/
+outputs/
+logs/
+analysis/
+docs/
+tests/
+k8s/
+scripts/
+wandb/
+*.pt
+*.pth
+*.log
+*.ipynb
+**/__pycache__/
+*.pyc
+.env
+CLAUDE.md

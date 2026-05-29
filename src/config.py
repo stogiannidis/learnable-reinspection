@@ -67,6 +67,12 @@ class ReInspectionConfig:
     eval_compare: bool = False
     frozen_cache_file: Optional[str] = None
     max_samples: int = -1
+    eval_cot_enabled: bool = True
+    eval_cot_prompt: str = (
+        "Think step by step. Then provide the final answer on a separate line "
+        "starting with 'Final answer:'."
+    )
+    eval_max_new_tokens: int = 128
 
     # ------------------------------------------------------------------ #
     # Re-Inspection Module                                                 #
@@ -189,6 +195,11 @@ class ReInspectionConfig:
     seed: int = 42
     bf16: bool = True
     gradient_checkpointing: bool = True
+    # use_reentrant=True preserves the historical InternVL3 behavior. False is the
+    # PyTorch-recommended mode and is often faster with a frozen base + small
+    # trainable surface; flip via Hydra (gradient_checkpointing_use_reentrant=false)
+    # and smoke-test before committing to a long run.
+    gradient_checkpointing_use_reentrant: bool = True
     max_grad_norm: float = 1.0
 
     def __post_init__(self) -> None:

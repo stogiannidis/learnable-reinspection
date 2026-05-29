@@ -1,0 +1,76 @@
+# Full Stage-2 run (Visual-CoT), InternVL3, 6x H100, Stage-2 ONLY from the
+# existing epoch_4 Stage-1 checkpoint (no Stage-1 rerun).
+#
+# Config chosen from the smoke sweep:
+#   - bs=8, gradient checkpointing ON  (bs=16 was throughput-neutral; GC-off OOMs)
+#   - stage2_grad_accum=11 -> effective batch 8 x 11 x 6 = 528 (~= the 512 baseline)
+#   - z2 (frozen base + tiny trainable surface; ZeRO-3 adds no value)
+#   - tiling ON (crop_to_patches_stage2 default) to match eval
+#   - attn_implementation=flash_attention_2  (config default; the rebuilt image
+#     stogian/l_reinspection:latest, sha256:4dcad05f..., ships flash-attn 2.8.3).
+#     Rollback handle for the old sdpa-only image: sha256:3ce6371d373af9d49c574cf0bce61740c6fb53b805556b0062ae502ff140c507
+#   - Memory: 384Gi (was 144Gi/192Gi). The 144Gi run OOM-killed at step 3232/7959
+#     (~41% of epoch 1, 3h in, ~144GB). Worker reduction to 4 + prefetch=2 was
+#     tried under the 192Gi limit, and the growth rate was unchanged -- so the
+#     leak is in the main per-rank process (W&B history, HF processor caches,
+#     pin_memory pages), not in dataloader workers. num_workers/prefetch reverted
+#     to defaults (8 / 4). Linear extrapolation says peak ~360GB at end of
+#     epoch 1, so 384Gi clears one epoch comfortably. Going further requires
+#     either a code-level leak fix or bigger nodes (most H100-80GB hosts have
+#     1-2TB RAM).
+#
+# Projected cost: ~382k train samples/epoch / (6 GPU x ~2.1 samples/s) ~= 8.4h/epoch;
+# 4 epochs ~= 30-34h. Watch W&B train/throughput/samples_per_sec and
+# system/gpu_mem_reserved_gb.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-s2-fullrun-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-s2-fullrun
+    spec:
+      containers:
+      - name: reinspection-s2-fullrun
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            # Avoid stale NFS bytecode masking freshly-added symbols.
+            find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+            mkdir -p logs models
+            REINSPECTION_EXPERIMENT_STAGE2=s2_internvl \
+            STAGE1_CHECKPOINT=models/internvl3/stage1/epoch_4/reinspection_module.pt \
+              bash src/scripts/run_train_stage2.sh \
+                deepspeed_config=src/configs/deepspeed_z2.json \
+                stage2_grad_accum=11
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+        resources:
+          requests: { cpu: 72, memory: "384Gi", nvidia.com/gpu: 6 }
+          limits:   { cpu: 72, memory: "384Gi", nvidia.com/gpu: 6 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "72Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3

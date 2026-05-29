@@ -39,13 +39,28 @@ from omegaconf import DictConfig, OmegaConf
 
 from src.backends.hf_hub_utils import resolve_pretrained_local_path
 from src.config import ReInspectionConfig
+from src.eval_checkpoints import (
+    find_lora_weights_path,
+    find_reinspection_module_path,
+    log_eval_checkpoint_plan,
+    lora_only_checkpoint_root,
+    print_eval_model_paths,
+    resolve_eval_model_paths,
+)
+from src.eval_prompting import (
+    build_eval_question,
+    extract_final_answer,
+    load_frozen_cache as _load_frozen_cache,
+    save_frozen_cache as _save_frozen_cache,
+)
 from src.data.chat_template import build_chat_messages as intern_build_chat
 from src.data.gemma4_chat import build_chat_messages as gemma4_build_chat
 from src.data.llava_next_chat import build_chat_messages as llava_next_build_chat
 from src.data.spatial_dataset import SpatialVQADataset
 from src.data.utils import build_chat_messages as qwen_build_chat
+from src.utils.attn import resolve_attn_implementation
 from src.utils.hydra_util import strip_deepspeed_local_rank_argv
-from src.utils.progress import maybe_track_tqdm
+from src.utils.progress import make_eval_tqdm
 from src.training.trainer import _env_info, _git_info
 
 strip_deepspeed_local_rank_argv()
@@ -541,8 +556,10 @@ def load_condition_model(
         checkpoint_dir: Directory containing ``reinspection_module.pt`` and/or
             ``lora_weights`` for the re-inspection or LoRA-only conditions.
         lora_checkpoint_dir: Optional separate LoRA directory when not colocated.
-        attn_implementation: Pass ``"eager"`` for InternVL3 to allow attention
-            maps at generation time; ignored elsewhere.
+        attn_implementation: Optional override for the HF attention backend.
+            Pass ``"eager"`` for decoder attention-map experiments; otherwise
+            falls back to ``config.attn_implementation`` (FlashAttention 2 by
+            default in this repo).
 
     Returns:
         Tuple ``(model, is_reinspection)`` where the boolean flags whether the
@@ -559,28 +576,18 @@ def load_condition_model(
         (Stage-2 retrains the module jointly with LoRA; pairing Stage-1's module
         with Stage-2's LoRA produces catastrophic collapse to grounding outputs).
         """
-        ri_path = None
-        for cand_dir in (lora_checkpoint_dir, checkpoint_dir):
-            if not cand_dir:
-                continue
-            cand = os.path.join(cand_dir, "reinspection_module.pt")
-            if os.path.exists(cand):
-                ri_path = cand
-                break
+        ri_path = find_reinspection_module_path(checkpoint_dir, lora_checkpoint_dir)
         if ri_path is not None:
             state_dict = torch.load(ri_path, map_location="cpu", weights_only=True)
             model.reinspection.load_state_dict(state_dict)
         model.reinspection.to(model.device)
         print(f"[reinspection] loaded module from: {ri_path}", flush=True)
 
-        lora_path = None
-        for cand_dir in (checkpoint_dir, lora_checkpoint_dir):
-            if not cand_dir:
-                continue
-            cand = os.path.join(cand_dir, "lora_weights")
-            if os.path.exists(cand):
-                lora_path = cand
-                break
+        lora_path = find_lora_weights_path(
+            checkpoint_dir,
+            lora_checkpoint_dir,
+            search_order=(checkpoint_dir, lora_checkpoint_dir),
+        )
         if lora_path is not None:
             model.base_model.model.language_model = PeftModel.from_pretrained(
                 model.base_model.model.language_model, lora_path
@@ -588,7 +595,7 @@ def load_condition_model(
         print(f"[reinspection] loaded LoRA from: {lora_path}", flush=True)
 
     def _load_lora_only(base_model, checkpoint_dir, lora_checkpoint_dir):
-        ckpt = lora_checkpoint_dir or checkpoint_dir
+        ckpt = lora_only_checkpoint_root(checkpoint_dir, lora_checkpoint_dir)
         if ckpt is None:
             raise ValueError("lora_only requires --checkpoint_dir or --lora_checkpoint_dir")
         lora_path = os.path.join(ckpt, "lora_weights")
@@ -597,19 +604,38 @@ def load_condition_model(
         base_model.model.language_model = PeftModel.from_pretrained(
             base_model.model.language_model, lora_path
         )
+        print(f"[lora_only] loaded LoRA from: {lora_path}", flush=True)
+
+    effective_attn_impl = resolve_attn_implementation(
+        attn_implementation
+        if attn_implementation is not None
+        else config.attn_implementation
+    )
+
+    def _hf_load_kwargs() -> dict:
+        load_kw = {
+            "torch_dtype": torch.bfloat16 if config.bf16 else torch.float32,
+            "device_map": "auto",
+        }
+        if effective_attn_impl is not None:
+            load_kw["attn_implementation"] = effective_attn_impl
+        return load_kw
 
     if backend == "qwen25vl":
         from src.backends.qwen25vl import load_model as load_qwen25_ri
 
         if condition == "reinspection":
-            model = load_qwen25_ri(config, device_map="auto")
+            model = load_qwen25_ri(
+                config,
+                device_map="auto",
+                attn_implementation=effective_attn_impl,
+            )
             _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir)
             return model, True
         resolved = resolve_pretrained_local_path(config.model_name_or_path)
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             resolved,
-            torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
-            device_map="auto",
+            **_hf_load_kwargs(),
         )
         if condition == "lora_only":
             _load_lora_only(model, checkpoint_dir, lora_checkpoint_dir)
@@ -619,14 +645,18 @@ def load_condition_model(
         from src.backends.gemma4 import load_model as load_gemma4_ri
 
         if condition == "reinspection":
-            model = load_gemma4_ri(config, device_map="auto", processor=processor)
+            model = load_gemma4_ri(
+                config,
+                device_map="auto",
+                processor=processor,
+                attn_implementation=effective_attn_impl,
+            )
             _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir)
             return model, True
         resolved = resolve_pretrained_local_path(config.model_name_or_path)
         model = Gemma4ForConditionalGeneration.from_pretrained(
             resolved,
-            torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
-            device_map="auto",
+            **_hf_load_kwargs(),
         )
         if condition == "lora_only":
             _load_lora_only(model, checkpoint_dir, lora_checkpoint_dir)
@@ -637,14 +667,18 @@ def load_condition_model(
         from transformers import LlavaNextForConditionalGeneration
 
         if condition == "reinspection":
-            model = load_llava_ri(config, device_map="auto", processor=processor)
+            model = load_llava_ri(
+                config,
+                device_map="auto",
+                processor=processor,
+                attn_implementation=effective_attn_impl,
+            )
             _load_ri_checkpoint(model, checkpoint_dir, lora_checkpoint_dir)
             return model, True
         resolved = resolve_pretrained_local_path(config.model_name_or_path)
         model = LlavaNextForConditionalGeneration.from_pretrained(
             resolved,
-            torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
-            device_map="auto",
+            **_hf_load_kwargs(),
         )
         if condition == "lora_only":
             _load_lora_only(model, checkpoint_dir, lora_checkpoint_dir)
@@ -653,8 +687,8 @@ def load_condition_model(
     from src.backends.internvl3 import load_model as load_intern_ri
 
     intern_attn_kw = {}
-    if attn_implementation is not None:
-        intern_attn_kw["attn_implementation"] = attn_implementation
+    if effective_attn_impl is not None:
+        intern_attn_kw["attn_implementation"] = effective_attn_impl
 
     if condition == "reinspection":
         model = load_intern_ri(
@@ -666,9 +700,7 @@ def load_condition_model(
     resolved = resolve_pretrained_local_path(config.model_name_or_path)
     model = InternVLForConditionalGeneration.from_pretrained(
         resolved,
-        torch_dtype=torch.bfloat16 if config.bf16 else torch.float32,
-        device_map="auto",
-        **intern_attn_kw,
+        **_hf_load_kwargs(),
     )
     if condition == "lora_only":
         _load_lora_only(model, checkpoint_dir, lora_checkpoint_dir)
@@ -686,6 +718,7 @@ def evaluate_benchmark(
     config: ReInspectionConfig,
     is_reinspection: bool,
     max_samples: int = -1,
+    condition: str = "",
 ) -> dict:
     """Evaluate one benchmark split with greedy decoding and per-sample outputs.
 
@@ -700,6 +733,7 @@ def evaluate_benchmark(
         is_reinspection: Whether to slice generated tokens after inserted queries
             and optionally collect attention entropy.
         max_samples: Cap on evaluated items; ``<= 0`` means full split.
+        condition: Eval condition label for progress-bar titles (e.g. ``frozen``).
 
     Returns:
         Dict with keys ``benchmark``, ``accuracy``, ``correct``, ``total``,
@@ -736,19 +770,21 @@ def evaluate_benchmark(
     _QWEN_BACKENDS = ("qwen25vl",)
     _PROMPT_LEN_BACKENDS = ("internvl3", "gemma4", "llava_next")
 
-    pbar = tqdm_stdlib(
+    progress_desc = f"{condition}/{benchmark_name}" if condition else benchmark_name
+    pbar = make_eval_tqdm(
+        config,
         range(n),
-        desc=benchmark_name,
+        desc=progress_desc,
         miniters=EVAL_PROGRESS_LOG_INTERVAL,
         mininterval=1.0,
         disable=_eval_tqdm_disable(),
     )
-    maybe_track_tqdm(config, pbar)
 
     for i in pbar:
         sample = ds.samples[i]
         gt_answer = sample["answer"]
-        question = sample["question"]
+        raw_question = sample["question"]
+        question = build_eval_question(raw_question, config)
         image_path = os.path.join(image_root, sample["image"])
 
         if not os.path.isfile(image_path):
@@ -813,7 +849,7 @@ def evaluate_benchmark(
         inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         generated_ids = model.generate(
             **inputs,
-            max_new_tokens=64,
+            max_new_tokens=config.eval_max_new_tokens,
             do_sample=False,
             **_generate_extra_kw(processor),
         )
@@ -834,16 +870,20 @@ def evaluate_benchmark(
             clean_up_tokenization_spaces=False,
         )[0].strip().lower()
 
-        is_ok = match_answer(generated_text, gt_answer)
+        scored_answer = extract_final_answer(generated_text, cot_enabled=config.eval_cot_enabled)
+        is_ok = match_answer(scored_answer, gt_answer)
         if is_ok:
             correct += 1
         total += 1
         sample_outputs.append({
             "idx": i,
             "image": sample["image"],
-            "question": question,
+            "question": raw_question,
+            "prompted_question": question,
+            "eval_cot_prompt": config.eval_cot_prompt if config.eval_cot_enabled else "",
             "ground_truth": gt_answer,
             "model_output": generated_text,
+            "scored_answer": scored_answer,
             "correct": is_ok,
         })
 
@@ -851,6 +891,9 @@ def evaluate_benchmark(
             _, attn_vis = model.get_attention_maps()
             if attn_vis is not None:
                 entropies.append(compute_attention_entropy(attn_vis))
+
+        if total > 0:
+            pbar.set_postfix(acc=f"{correct / total:.4f}", score=f"{correct}/{total}")
 
         if (i + 1) % EVAL_PROGRESS_LOG_INTERVAL == 0:
             print(f"  [{benchmark_name}] {i + 1}/{n}  acc={correct / total:.4f} ({correct}/{total})", flush=True)
@@ -920,6 +963,8 @@ def main(cfg: DictConfig) -> None:
     if config.eval_compare:
         conditions = ["frozen", "lora_only", "reinspection"]
 
+    log_eval_checkpoint_plan(config, conditions)
+
     prefix = f"{backend}_eval"
     all_results = []
     wandb_step = 0
@@ -956,22 +1001,47 @@ def main(cfg: DictConfig) -> None:
 
         # Load frozen baseline from cache if available (skips GPU inference).
         if condition == "frozen" and config.frozen_cache_file and os.path.exists(config.frozen_cache_file):
-            print(f"\n{'=' * 60}\nCondition: frozen  [loaded from cache: {config.frozen_cache_file}]\n{'=' * 60}")
-            with open(config.frozen_cache_file, "r", encoding="utf-8") as _f:
-                cached = json.load(_f)
-            for r in cached:
-                r["condition"] = "frozen"
-                all_results.append(r)
-                m = {
-                    f"{prefix}/frozen/{r['benchmark']}/accuracy": r["accuracy"],
-                    f"{prefix}/frozen/{r['benchmark']}/correct": r["correct"],
-                    f"{prefix}/frozen/{r['benchmark']}/total": r["total"],
-                }
-                _log_wandb(m, wandb_step)
-                wandb_step += 1
-            continue
+            cached = _load_frozen_cache(config.frozen_cache_file, config)
+            if cached is not None:
+                print(
+                    f"\n{'=' * 60}\nCondition: frozen  "
+                    f"[loaded from cache: {config.frozen_cache_file}]\n{'=' * 60}"
+                )
+                print_eval_model_paths(
+                    "frozen",
+                    resolve_eval_model_paths(
+                        "frozen",
+                        checkpoint_dir=config.checkpoint_dir,
+                        lora_checkpoint_dir=config.lora_checkpoint_dir,
+                        model_name_or_path=config.model_name_or_path,
+                        frozen_cache_file=config.frozen_cache_file,
+                    ),
+                )
+                print("", flush=True)
+                for r in cached:
+                    r["condition"] = "frozen"
+                    all_results.append(r)
+                    m = {
+                        f"{prefix}/frozen/{r['benchmark']}/accuracy": r["accuracy"],
+                        f"{prefix}/frozen/{r['benchmark']}/correct": r["correct"],
+                        f"{prefix}/frozen/{r['benchmark']}/total": r["total"],
+                    }
+                    _log_wandb(m, wandb_step)
+                    wandb_step += 1
+                continue
 
         print(f"\n{'=' * 60}\nCondition: {condition}\n{'=' * 60}")
+        print_eval_model_paths(
+            condition,
+            resolve_eval_model_paths(
+                condition,
+                checkpoint_dir=config.checkpoint_dir,
+                lora_checkpoint_dir=config.lora_checkpoint_dir,
+                model_name_or_path=config.model_name_or_path,
+                frozen_cache_file=config.frozen_cache_file,
+            ),
+        )
+        print("", flush=True)
         model, is_ri = load_condition_model(
             backend, condition, config, processor,
             checkpoint_dir=config.checkpoint_dir,
@@ -997,6 +1067,7 @@ def main(cfg: DictConfig) -> None:
                 config=config,
                 is_reinspection=is_ri,
                 max_samples=config.max_samples,
+                condition=condition,
             )
             result["condition"] = condition
             condition_results.append(result)
@@ -1013,10 +1084,7 @@ def main(cfg: DictConfig) -> None:
 
         # Persist frozen results so future runs can skip this pass.
         if condition == "frozen" and config.frozen_cache_file:
-            os.makedirs(os.path.dirname(config.frozen_cache_file) or ".", exist_ok=True)
-            cache_records = [{k: v for k, v in r.items() if k != "samples"} for r in condition_results]
-            with open(config.frozen_cache_file, "w", encoding="utf-8") as _f:
-                json.dump(cache_records, _f, indent=2)
+            _save_frozen_cache(config.frozen_cache_file, condition_results, config)
             print(f"  Frozen baseline saved to {config.frozen_cache_file}")
 
         del model

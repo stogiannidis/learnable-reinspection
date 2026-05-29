@@ -33,17 +33,18 @@ REGISTRY: List[DatasetSpec] = [
     DatasetSpec("grit",         1, "grit",         default=False),
     # ------------------------------------------------------------------ #
     # Stage 2 — spatial VQA                                               #
-    # Default mix is gqa_spatial only (per-image scene-graph supervision  #
-    # for the aux grounding stream lives in the same dataset directory).   #
-    # vsr / clevr_spatial / vg_spatial / rel3d / cambrian_spatial remain   #
-    # registered for opt-in via ``+stage2_extra_datasets=[...]``.          #
+    # Default mix is Visual-CoT only when present on disk.                 #
+    # Per-image scene-graph supervision for the aux grounding stream lives #
+    # in the gqa_spatial dataset directory. vsr / clevr_spatial /          #
+    # vg_spatial / rel3d / cambrian_spatial remain registered for opt-in.  #
     # ------------------------------------------------------------------ #
     DatasetSpec("vsr",              2, "vsr",              default=False),
-    DatasetSpec("gqa_spatial",      2, "gqa_spatial",      default=True),
+    DatasetSpec("gqa_spatial",      2, "gqa_spatial",      default=False),
     DatasetSpec("clevr_spatial",    2, "clevr_spatial",    default=False),
     DatasetSpec("vg_spatial",       2, "vg_spatial",       default=False),
     DatasetSpec("rel3d",            2, "rel3d",            default=False),
     DatasetSpec("cambrian_spatial", 2, "cambrian_spatial", default=False),
+    DatasetSpec("visual_cot",       2, "visual_cot",       default=True),
 ]
 
 

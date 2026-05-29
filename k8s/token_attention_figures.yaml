@@ -1,0 +1,80 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-token-attn-figs-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 172800
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-token-attn-figs
+    spec:
+      containers:
+      - name: reinspection-token-attn-figs
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -uo pipefail
+            mkdir -p logs outputs/token_attn
+            export OMP_NUM_THREADS=4
+            export HYDRA_FULL_ERROR=1
+            export HF_HOME=/data/Huggingface
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+            export WANDB_MODE=offline
+            export PYTHONDONTWRITEBYTECODE=1
+
+            find src scripts -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+            python -c "import torch, transformers; print('torch', torch.__version__, 'transformers', transformers.__version__, 'cuda', torch.cuda.is_available())"
+
+            CKPT=models/internvl3/stage1/epoch_5
+            LORA=models/internvl3/gqa_sg/stage2/epoch_1
+            IMGDIR=/data/datasets/vsr/images
+            run() {  # $1=image file, $2=sample name, $3=statement question
+              echo "================ $2 ================"
+              python scripts/analysis/visualize_token_attention.py \
+                --backend internvl3 \
+                --image "$IMGDIR/$1" \
+                --question "$3" \
+                --conditions frozen,reinspection \
+                --checkpoint_dir "$CKPT" --lora_checkpoint_dir "$LORA" \
+                --output_dir outputs/token_attn --sample_name "$2" \
+                --max_new_tokens 8 --max_input_tokens -1 \
+                2>&1 | tee "logs/token_attn_$2.log" || echo "!! $2 FAILED"
+            }
+
+            run 000000407386.jpg laptop_tv 'Is the following statement true or false about the image? "The laptop is left of the tv." Answer with just True or False.'
+            run 000000452072.jpg cat_laptop 'Is the following statement true or false about the image? "The cat is on top of the laptop." Answer with just True or False.'
+            run 000000169660.jpg oven_cake 'Is the following statement true or false about the image? "The oven is above the cake." Answer with just True or False.'
+
+            echo "==== produced output dirs ===="
+            ls -d outputs/token_attn/internvl3_* 2>/dev/null
+            for d in laptop_tv cat_laptop oven_cake; do
+              ls "outputs/token_attn/internvl3_$d/summary.png" 2>/dev/null && echo "OK $d" || echo "MISSING $d"
+            done
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+        resources:
+          requests: { cpu: 16, memory: "48Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 16, memory: "48Gi", nvidia.com/gpu: 1 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "16Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3

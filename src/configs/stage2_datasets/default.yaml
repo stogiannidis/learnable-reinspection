@@ -1,3 +1,4 @@
 # @package _global_
-# Registry defaults (all stage-2 entries with default=True).
-stage2_dataset_names: null
+# Stage-2 default training mix: Visual-CoT only.
+stage2_dataset_names:
+  - visual_cot

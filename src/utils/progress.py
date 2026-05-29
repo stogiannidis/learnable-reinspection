@@ -49,19 +49,43 @@ def get_tqdm(config: ReInspectionConfig, *, cloud: bool) -> Type[Any]:
     return std_tqdm
 
 
-def maybe_track_tqdm(config: ReInspectionConfig, pbar: Any) -> Any:
-    """Attach pbar.io to an existing stdlib tqdm (needed when ``disable=True`` breaks cloud hook).
+_devnull = None
 
-    pbar_io's tqdm subclass skips remote sync when ``disable`` is True; ``track_tqdm`` patches
-    updates regardless of local display, which suits eval under ``tee``.
+
+def _devnull_file():
+    """Lazily open a process-lifetime ``os.devnull`` sink for suppressed bar output."""
+    global _devnull
+    if _devnull is None:
+        _devnull = open(os.devnull, "w")
+    return _devnull
+
+
+def make_eval_tqdm(
+    config: ReInspectionConfig,
+    iterable,
+    *,
+    desc: str,
+    disable: bool,
+    **kwargs,
+) -> Any:
+    """Create an eval progress bar with optional pbar.io cloud sync.
+
+    pbar_io's tqdm subclass only syncs to the cloud while the bar is *enabled* — a
+    ``disable=True`` bar silently drops every remote update, and tqdm's disabled
+    ``__iter__`` never calls ``update()`` anyway. So when cloud sync is on we keep the
+    bar enabled even when local display is suppressed (e.g. under ``tee``): the local
+    rendering is routed to ``os.devnull`` (no per-refresh log spam) while the remote
+    bar still advances. We also override the caller's coarse ``miniters`` for the cloud
+    path so the remote bar updates on the time-based ``mininterval`` instead of jumping
+    in large steps; pbar_io batches the actual network pushes via ``update_interval``.
     """
-    if not getattr(config, "pbar_enabled", False):
-        return pbar
-    configure_pbar_io(config)
-    try:
-        from pbar_io import track_tqdm
+    if getattr(config, "pbar_enabled", False):
+        tqdm_cls = get_tqdm(config, cloud=True)
+        if disable:
+            kwargs.setdefault("file", _devnull_file())
+            kwargs["miniters"] = 1
+        return tqdm_cls(iterable, desc=desc, disable=False, **kwargs)
 
-        track_tqdm(pbar)
-    except Exception:
-        pass
-    return pbar
+    from tqdm import tqdm as std_tqdm
+
+    return std_tqdm(iterable, desc=desc, disable=disable, **kwargs)

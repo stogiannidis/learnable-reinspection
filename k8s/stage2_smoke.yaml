@@ -1,0 +1,71 @@
+# One-off Stage-2 smoke: 1x H100, ~40 steps, tiling ON (crop_to_patches_stage2),
+# to answer: (a) does bs=8 + InternVL tiling OOM on 80GB, (b) per-GPU samples/sec,
+# (c) is the GPU compute- or data-bound. Reads everything from `kubectl logs`:
+# the tqdm postfix carries `sps=`, and the background nvidia-smi prints util/mem.
+# Disposable — delete after reading (ttlSecondsAfterFinished cleans it up anyway).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-s2-smoke-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 7200
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-s2-smoke
+    spec:
+      containers:
+      - name: reinspection-s2-smoke
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -uo pipefail
+            # Stale .pyc on NFS can mask freshly-added symbols (e.g. the new
+            # _supervised_prompt_len). Clear bytecode before launch.
+            find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+            mkdir -p logs models
+            echo "### GPU monitor: util%, mem.used, mem.total (every 10s) ###"
+            nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total \
+              --format=csv,noheader -l 10 &
+            MON=$!
+            REINSPECTION_EXPERIMENT_STAGE2=s2_internvl \
+            STAGE1_CHECKPOINT=models/internvl3/stage1/epoch_4/reinspection_module.pt \
+              bash src/scripts/run_train_stage2.sh \
+                deepspeed_config=src/configs/deepspeed_z2.json \
+                +attn_implementation=sdpa \
+                stage2_max_steps=40 \
+                num_workers=8 \
+                wandb_run_name=s2_internvl_smoke \
+                wandb_log_interval=5 \
+                wandb_gradient_log_interval=0
+            RC=$?
+            kill $MON 2>/dev/null || true
+            echo "### SMOKE EXIT CODE: $RC ###"
+            exit $RC
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+        resources:
+          requests: { cpu: 16, memory: "64Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 16, memory: "64Gi", nvidia.com/gpu: 1 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "16Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3

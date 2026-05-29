@@ -11,6 +11,7 @@ from transformers import AutoProcessor, InternVLForConditionalGeneration
 
 from src.backends.hf_hub_utils import resolve_pretrained_local_path
 from src.config import ReInspectionConfig
+from src.utils.attn import resolve_attn_implementation
 from src.model.lm_loss import masked_answer_cross_entropy
 from src.model.outputs import ReInspectionOutput
 from src.model.reinspection_module import ReInspectionModule
@@ -512,6 +513,7 @@ def load_model(
     dtype = torch.bfloat16 if config.bf16 else torch.float32
     resolved = resolve_pretrained_local_path(config.model_name_or_path)
     attn_impl = attn_implementation if attn_implementation is not None else config.attn_implementation
+    attn_impl = resolve_attn_implementation(attn_impl)
     load_kw = dict(torch_dtype=dtype, device_map=device_map)
     if attn_impl is not None:
         load_kw["attn_implementation"] = attn_impl

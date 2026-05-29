@@ -10,3 +10,7 @@ eval_compare: true
 # Omit path to always run frozen (vanilla) on GPU; set to a JSON path to load/save cached frozen results.
 frozen_cache_file: null
 max_samples: -1
+eval_cot_enabled: true
+eval_cot_prompt: "Think step by step. Then provide the final answer on a separate line starting with 'Final answer:'."
+eval_max_new_tokens: 128
+pbar_enabled: true

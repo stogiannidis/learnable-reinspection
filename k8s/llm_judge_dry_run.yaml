@@ -1,0 +1,49 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-llm-judge-dry-run-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-llm-judge-dry-run
+    spec:
+      containers:
+      - name: reinspection-llm-judge-dry-run
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            mkdir -p logs
+            export PYTHONDONTWRITEBYTECODE=1
+
+            python scripts/llm_judge.py \
+              --dry-run \
+              --limit 10 \
+              2>&1 | tee logs/llm_judge_dry_run.log
+        imagePullPolicy: Always
+        env:
+          - name: OPENROUTER_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: reinspection-secrets
+                key: OPENROUTER_API_KEY
+        resources:
+          requests: { cpu: 4, memory: "8Gi" }
+          limits:   { cpu: 8, memory: "16Gi" }
+        volumeMounts:
+          - { mountPath: /data, name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }

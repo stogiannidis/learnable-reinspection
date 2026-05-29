@@ -1,4 +1,4 @@
-# Standard 4x H100 training job. Non-secret env (experiments, OMP, HF_HOME, …)
+# Standard 8x H100 training job. Non-secret env (experiments, OMP, HF_HOME, …)
 # lives in src/scripts/run_train.sh; this manifest only injects secrets.
 apiVersion: batch/v1
 kind: Job
@@ -22,14 +22,18 @@ spec:
           - |
             set -euo pipefail
             mkdir -p logs models
+            # 8 GPUs: to hold the effective batch constant vs the 4-GPU default,
+            # halve the chosen backend's grad_accum by appending overrides, e.g.
+            #   stage1_grad_accum=8 stage2_grad_accum=8   (internvl: keeps 512)
+            #   stage1_grad_accum=4 stage2_grad_accum=4   (qwen:     keeps 256)
             bash src/scripts/run_train.sh
         env:
           - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
           - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
         imagePullPolicy: Always
         resources:
-          requests: { cpu: 64, memory: "128Gi", nvidia.com/gpu: 4 }
-          limits:   { cpu: 64, memory: "128Gi", nvidia.com/gpu: 4 }
+          requests: { cpu: 96, memory: "192Gi", nvidia.com/gpu: 8 }
+          limits:   { cpu: 96, memory: "192Gi", nvidia.com/gpu: 8 }
         volumeMounts:
           - { mountPath: /dev/shm, name: dshm }
           - { mountPath: /data,    name: nfs }
@@ -37,7 +41,7 @@ spec:
       securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
       volumes:
       - name: dshm
-        emptyDir: { medium: Memory, sizeLimit: "64Gi" }
+        emptyDir: { medium: Memory, sizeLimit: "96Gi" }
       - name: nfs
         nfs: { server: 10.24.6.66, path: / }
       nodeSelector:

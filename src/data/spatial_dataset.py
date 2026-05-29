@@ -3,7 +3,8 @@
 ``SpatialVQADataset`` loads JSON/JSONL files, applies backend-specific chat
 templates and processors, and constructs causal LM labels by masking prompt
 tokens.  ``build_spatial_dataset`` concatenates available corpora under a data
-root into a single :class:`torch.utils.data.ConcatDataset`.
+root into a single :class:`torch.utils.data.ConcatDataset`.  VisCoT/Visual-CoT
+uses its native ``metadata/*_cot_train.jsonl`` + ``cot_image_data`` layout.
 """
 
 import json
@@ -111,9 +112,44 @@ class SpatialVQADataset(Dataset):
         """Number of samples after split filtering."""
         return len(self.samples)
 
+    def _resolve_image_path(self, sample: Dict) -> str:
+        """Resolve the image path for a standard stage-2 sample."""
+        image = sample["image"]
+        if isinstance(image, list):
+            image = image[0]
+        image = str(image).split("###", 1)[0]
+        return os.path.join(self.image_root, image)
+
     def _intern_proc_kwargs(self) -> Dict:
-        """Keyword arguments shared by InternVL-style processor calls."""
-        return {"return_tensors": "pt"}
+        """Keyword arguments shared by InternVL-style processor calls.
+
+        Mirrors the eval path (``src/evaluate.py``): dynamic patch cropping and
+        the pixel budget are forwarded to the image processor so Stage-2 training
+        tiling matches inference instead of falling back to processor defaults.
+        """
+        return {
+            "return_tensors": "pt",
+            "max_pixels": self.max_pixels,
+            "min_pixels": self.min_pixels,
+            "crop_to_patches": self.crop_to_patches,
+        }
+
+    def _supervised_prompt_len(
+        self, prompt_text: str, full_text: str, full_len: int
+    ) -> int:
+        """Leading ``full_inputs`` token count to mask out (the prompt span).
+
+        ``full_text`` is ``prompt_text`` with the answer continuation appended, so
+        the answer's token count is invariant to image-placeholder expansion and
+        equals the text-only tokenization difference. Recovering the boundary this
+        way lets ``__getitem__`` run the (expensive) image processor only once per
+        sample instead of once for the prompt and once for the full sequence.
+        """
+        tokenizer = self.processor.tokenizer
+        n_full = len(tokenizer(full_text, add_special_tokens=False).input_ids)
+        n_prompt = len(tokenizer(prompt_text, add_special_tokens=False).input_ids)
+        answer_len = max(0, n_full - n_prompt)
+        return max(0, int(full_len) - answer_len)
 
     def __getitem__(self, idx) -> Dict:
         """Return a model input dict with ``labels`` for the sample at ``idx``.
@@ -150,7 +186,7 @@ class SpatialVQADataset(Dataset):
         sample = self.samples[idx]
         question = sample["question"]
         answer = sample["answer"]
-        image_path = os.path.join(self.image_root, sample["image"])
+        image_path = self._resolve_image_path(sample)
 
         prompt_messages = qwen_build_chat(question, image_path=image_path)
         prompt_text = self.processor.apply_chat_template(
@@ -166,9 +202,10 @@ class SpatialVQADataset(Dataset):
             max_pixels=self.max_pixels,
             min_pixels=self.min_pixels,
         )
-        prompt_inputs = self.processor(text=[prompt_text], **proc_kwargs)
         full_inputs = self.processor(text=[full_text], **proc_kwargs)
-        prompt_len = prompt_inputs["input_ids"].shape[-1]
+        prompt_len = self._supervised_prompt_len(
+            prompt_text, full_text, full_inputs["input_ids"].shape[-1]
+        )
         labels = full_inputs["input_ids"].clone()
         labels[:, :prompt_len] = -100
         full_inputs["labels"] = labels
@@ -181,7 +218,7 @@ class SpatialVQADataset(Dataset):
     def _getitem_intern(self, idx: int) -> Dict:
         """Tokenize an InternVL sample from an on-disk RGB image."""
         sample = self.samples[idx]
-        image_path = os.path.join(self.image_root, sample["image"])
+        image_path = self._resolve_image_path(sample)
         image = Image.open(image_path).convert("RGB")
 
         prompt_messages = intern_build_chat(
@@ -202,9 +239,10 @@ class SpatialVQADataset(Dataset):
             full_messages, tokenize=False, add_generation_prompt=False,
         )
         pk = self._intern_proc_kwargs()
-        prompt_inputs = self.processor(text=[prompt_text], images=[image], **pk)
         full_inputs = self.processor(text=[full_text], images=[image], **pk)
-        prompt_len = prompt_inputs["input_ids"].shape[-1]
+        prompt_len = self._supervised_prompt_len(
+            prompt_text, full_text, full_inputs["input_ids"].shape[-1]
+        )
         labels = full_inputs["input_ids"].clone()
         labels[:, :prompt_len] = self.answer_ignore_index
         full_inputs["labels"] = labels
@@ -215,7 +253,7 @@ class SpatialVQADataset(Dataset):
     def _getitem_gemma4(self, idx: int) -> Dict:
         """Tokenize a Gemma 4 multimodal sample (same masking contract as InternVL)."""
         sample = self.samples[idx]
-        image_path = os.path.join(self.image_root, sample["image"])
+        image_path = self._resolve_image_path(sample)
         image = Image.open(image_path).convert("RGB")
 
         prompt_messages = gemma4_build_chat(
@@ -236,9 +274,10 @@ class SpatialVQADataset(Dataset):
             full_messages, tokenize=False, add_generation_prompt=False,
         )
         pk = {"return_tensors": "pt", "images": [image]}
-        prompt_inputs = self.processor(text=[prompt_text], **pk)
         full_inputs = self.processor(text=[full_text], **pk)
-        prompt_len = prompt_inputs["input_ids"].shape[-1]
+        prompt_len = self._supervised_prompt_len(
+            prompt_text, full_text, full_inputs["input_ids"].shape[-1]
+        )
         labels = full_inputs["input_ids"].clone()
         labels[:, :prompt_len] = self.answer_ignore_index
         full_inputs["labels"] = labels
@@ -251,7 +290,7 @@ class SpatialVQADataset(Dataset):
         as InternVL/Gemma; ``image_sizes`` is preserved alongside ``pixel_values``
         because the AnyRes patch unpacking needs it at forward time."""
         sample = self.samples[idx]
-        image_path = os.path.join(self.image_root, sample["image"])
+        image_path = self._resolve_image_path(sample)
         image = Image.open(image_path).convert("RGB")
 
         prompt_messages = llava_next_build_chat(
@@ -272,9 +311,10 @@ class SpatialVQADataset(Dataset):
             full_messages, tokenize=False, add_generation_prompt=False,
         )
         pk = {"return_tensors": "pt", "images": [image]}
-        prompt_inputs = self.processor(text=[prompt_text], **pk)
         full_inputs = self.processor(text=[full_text], **pk)
-        prompt_len = prompt_inputs["input_ids"].shape[-1]
+        prompt_len = self._supervised_prompt_len(
+            prompt_text, full_text, full_inputs["input_ids"].shape[-1]
+        )
         labels = full_inputs["input_ids"].clone()
         labels[:, :prompt_len] = self.answer_ignore_index
         full_inputs["labels"] = labels
@@ -288,6 +328,125 @@ class SpatialVQADataset(Dataset):
         }
         result["image_path"] = image_path
         return result
+
+
+class VisualCoTDataset(SpatialVQADataset):
+    """Visual-CoT stage-2 samples in the native extracted dataset layout."""
+
+    def __init__(
+        self,
+        data_root: str,
+        processor,
+        backend: str,
+        split: str = "train",
+        max_pixels: int = 1280 * 28 * 28,
+        min_pixels: int = 4 * 28 * 28,
+        crop_to_patches: bool = True,
+        system_prompt: str = "You are a helpful assistant.",
+        answer_ignore_index: int = -100,
+    ):
+        if backend not in _VALID_BACKENDS:
+            raise ValueError(f"backend must be one of {_VALID_BACKENDS}, got {backend}")
+        self.processor = processor
+        self.backend = backend
+        self.data_root = data_root
+        self.image_root = os.path.join(data_root, "cot_image_data")
+        self.max_pixels = max_pixels
+        self.min_pixels = min_pixels
+        self.crop_to_patches = crop_to_patches
+        self.system_prompt = system_prompt
+        self.answer_ignore_index = answer_ignore_index
+        self._image_path_cache: Dict[tuple, Optional[str]] = {}
+        self.samples = []
+
+        metadata_dir = os.path.join(data_root, "metadata")
+        if not os.path.isdir(metadata_dir):
+            logger.warning("Visual-CoT metadata directory not found: %s", metadata_dir)
+            return
+
+        suffix = f"_cot_{split}.jsonl"
+        metadata_files = [
+            os.path.join(metadata_dir, name)
+            for name in sorted(os.listdir(metadata_dir))
+            if name.endswith(suffix)
+        ]
+        if not metadata_files:
+            logger.warning("No Visual-CoT metadata files matching *%s in %s", suffix, metadata_dir)
+            return
+
+        missing_images = 0
+        for data_file in metadata_files:
+            with open(data_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    item = json.loads(line)
+                    if item.get("split", split) != split:
+                        continue
+                    question = item.get("question")
+                    image = item.get("image")
+                    answer = item.get("answer")
+                    if not question or image is None or answer is None:
+                        continue
+                    image_path = self._existing_image_path(item)
+                    if image_path is None:
+                        missing_images += 1
+                        continue
+                    sample = dict(item)
+                    sample["answer"] = str(answer)
+                    sample["_visual_cot_image_path"] = image_path
+                    self.samples.append(sample)
+
+        if missing_images:
+            logger.warning(
+                "Skipped %d Visual-CoT samples whose images are not extracted under %s",
+                missing_images,
+                self.image_root,
+            )
+
+    def _existing_image_path(self, sample: Dict) -> Optional[str]:
+        dataset = str(sample.get("dataset", "")).strip()
+        image = sample["image"]
+        if isinstance(image, list):
+            image = image[0]
+        image = str(image).split("###", 1)[0].lstrip("/")
+        cache_key = (dataset, image)
+        if cache_key in self._image_path_cache:
+            return self._image_path_cache[cache_key]
+
+        candidates = []
+        if os.path.isabs(image):
+            candidates.append(image)
+        else:
+            candidates.extend(
+                [
+                    os.path.join(self.image_root, image),
+                    os.path.join(self.image_root, dataset, image),
+                    os.path.join(self.image_root, "cot", dataset, image),
+                    os.path.join(self.data_root, image),
+                    os.path.join(self.data_root, dataset, image),
+                    os.path.join(self.data_root, "cot", dataset, image),
+                ]
+            )
+
+        seen = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if os.path.exists(candidate):
+                self._image_path_cache[cache_key] = candidate
+                return candidate
+
+        self._image_path_cache[cache_key] = None
+        return None
+
+    def _resolve_image_path(self, sample: Dict) -> str:
+        image_path = sample.get("_visual_cot_image_path") or self._existing_image_path(sample)
+        if image_path is None:
+            raise FileNotFoundError(f"Visual-CoT image not found for sample: {sample.get('image')}")
+        return image_path
 
 
 def build_spatial_dataset(
@@ -325,19 +484,18 @@ def build_spatial_dataset(
 
     path_configs = dataset_path_configs(data_root, split)
 
-    # VSR uses .jsonl; override extension for that dataset only
+    # VSR uses .jsonl; override extension for that dataset only.
     if "vsr" in path_configs:
         path_configs["vsr"]["data_file"] = os.path.join(data_root, "vsr", f"{split}.jsonl")
 
     all_datasets = []
     for name in datasets:
-        cfg = path_configs.get(name)
-        if cfg is None or not os.path.exists(cfg["data_file"]):
-            continue
-        all_datasets.append(
-            SpatialVQADataset(
-                data_file=cfg["data_file"],
-                image_root=cfg["image_root"],
+        if name == "visual_cot":
+            visual_cot_root = os.path.join(data_root, "visual_cot")
+            if not os.path.isdir(visual_cot_root):
+                continue
+            dataset = VisualCoTDataset(
+                data_root=visual_cot_root,
                 processor=processor,
                 backend=backend,
                 split=split,
@@ -347,7 +505,27 @@ def build_spatial_dataset(
                 system_prompt=system_prompt,
                 answer_ignore_index=answer_ignore_index,
             )
+            if len(dataset) > 0:
+                all_datasets.append(dataset)
+            continue
+
+        cfg = path_configs.get(name)
+        if cfg is None or not os.path.exists(cfg["data_file"]):
+            continue
+        dataset = SpatialVQADataset(
+            data_file=cfg["data_file"],
+            image_root=cfg["image_root"],
+            processor=processor,
+            backend=backend,
+            split=split,
+            max_pixels=max_pixels,
+            min_pixels=min_pixels,
+            crop_to_patches=crop_to_patches,
+            system_prompt=system_prompt,
+            answer_ignore_index=answer_ignore_index,
         )
+        if len(dataset) > 0:
+            all_datasets.append(dataset)
 
     if not all_datasets:
         return _EmptyDataset()

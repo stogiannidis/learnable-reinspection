@@ -23,7 +23,7 @@ spec:
           - -c
           - |
             set -euo pipefail
-            mkdir -p logs outputs/internvl3/gqa_sg outputs/internvl3
+            mkdir -p logs outputs/internvl3/s2_internvl outputs/internvl3
             export OMP_NUM_THREADS=4
             export HYDRA_FULL_ERROR=1
             export HF_HOME=/data/Huggingface
@@ -34,14 +34,14 @@ spec:
             find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
             bash src/scripts/run_eval.sh \
-              checkpoint_dir=models/internvl3/stage1/epoch_5 \
-              lora_checkpoint_dir=models/internvl3/gqa_sg/stage2/epoch_1 \
-              output_file=outputs/internvl3/gqa_sg/eval_stage2_epoch1_compare.json \
+              checkpoint_dir=models/internvl3/s2_internvl/stage2/epoch_2 \
+              lora_checkpoint_dir=models/internvl3/s2_internvl/stage2/epoch_2 \
+              output_file=outputs/internvl3/s2_internvl/eval_stage2_epoch2_compare.json \
               eval_condition=reinspection \
               eval_compare=true \
               pbar_enabled=true \
               frozen_cache_file=outputs/internvl3/frozen_baseline.json \
-              2>&1 | tee logs/eval_gqa_sg_stage2_epoch1.log
+              2>&1 | tee logs/eval_s2_internvl_stage2_epoch2.log
         imagePullPolicy: Always
         env:
           - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
