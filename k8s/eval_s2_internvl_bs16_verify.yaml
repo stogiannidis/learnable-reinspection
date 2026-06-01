@@ -1,0 +1,108 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-eval-bs16-verify-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-eval-bs16-verify
+    spec:
+      containers:
+      - name: reinspection-eval-bs16-verify
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            mkdir -p logs outputs/internvl3/s2_internvl_bs16 outputs/internvl3/bs_timing
+            export OMP_NUM_THREADS=4
+            export HYDRA_FULL_ERROR=1
+            export HF_HOME=/data/Huggingface
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+            export WANDB_MODE=offline
+            export PYTHONDONTWRITEBYTECODE=1
+
+            find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+            CKPT=models/internvl3/s2_internvl/stage2/epoch_2
+
+            # --- Throughput micro-bench: whatsup (410) reinspection, bs=1 vs bs=16 ---
+            for BS in 1 16; do
+              t0=$(date +%s)
+              bash src/scripts/run_eval.sh \
+                checkpoint_dir=${CKPT} lora_checkpoint_dir=${CKPT} \
+                eval_condition=reinspection eval_compare=false \
+                benchmarks='[whatsup]' eval_batch_size=${BS} pbar_enabled=true \
+                output_file=outputs/internvl3/bs_timing/whatsup_bs${BS}.json \
+                2>&1 | tee logs/timing_whatsup_bs${BS}.log
+              echo "TIMING whatsup(410) reinspection bs=${BS}: $(( $(date +%s) - t0 ))s (incl. ~one model load)"
+            done
+
+            # --- Full reproduction at bs=16 (all benchmarks; frozen cached) ---
+            t0=$(date +%s)
+            bash src/scripts/run_eval.sh \
+              checkpoint_dir=${CKPT} lora_checkpoint_dir=${CKPT} \
+              eval_condition=reinspection eval_compare=true \
+              frozen_cache_file=outputs/internvl3/frozen_baseline.json \
+              eval_batch_size=16 pbar_enabled=true \
+              output_file=outputs/internvl3/s2_internvl_bs16/eval_stage2_epoch2_compare.json \
+              2>&1 | tee logs/eval_s2_internvl_bs16.log
+            echo "TIMING full eval_compare bs=16: $(( $(date +%s) - t0 ))s"
+
+            # --- Compare bs=16 numbers vs the bs=1 baseline ---
+            echo "================ bs16 vs bs1 reproduction ================"
+            python3 - <<'PY'
+            import json
+            base = "outputs/internvl3/s2_internvl/eval_stage2_epoch2_compare.json"
+            new = "outputs/internvl3/s2_internvl_bs16/eval_stage2_epoch2_compare.json"
+            o = {(r["condition"], r["benchmark"]): r for r in json.load(open(base))}
+            n = {(r["condition"], r["benchmark"]): r for r in json.load(open(new))}
+            print(f"{'condition / benchmark':34s} {'bs1':>7s} {'bs16':>7s} {'delta':>7s}")
+            worst = 0.0
+            for cond in ("reinspection", "lora_only"):
+                accs = []
+                for k in sorted(n):
+                    if k[0] != cond or k not in o:
+                        continue
+                    if o[k]["total"] == 0:
+                        continue
+                    a, b = o[k]["accuracy"] * 100, n[k]["accuracy"] * 100
+                    worst = max(worst, abs(b - a))
+                    accs.append((a, b))
+                    print(f"{cond + ' / ' + k[1]:34s} {a:7.2f} {b:7.2f} {b - a:+7.2f}")
+                if accs:
+                    ma = sum(x for x, _ in accs) / len(accs)
+                    mb = sum(y for _, y in accs) / len(accs)
+                    print(f"{cond + ' / MEAN':34s} {ma:7.2f} {mb:7.2f} {mb - ma:+7.2f}\n")
+            print(f"max abs per-benchmark delta = {worst:.2f}pp "
+                  f"({'PASS (<=1.5pp = FP/tie noise)' if worst <= 1.5 else 'CHECK'})")
+            PY
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+          - { name: PBAR_API_KEY,  valueFrom: { secretKeyRef: { name: reinspection-secrets, key: PBAR_API_KEY, optional: true } } }
+        resources:
+          requests: { cpu: 32, memory: "64Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 32, memory: "64Gi", nvidia.com/gpu: 1 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "32Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3

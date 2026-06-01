@@ -136,12 +136,25 @@ class InternVL3WithReInspection(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
     ) -> torch.LongTensor:
-        """Find where re-inspection tokens should be inserted."""
-        lengths = self._sequence_lengths(input_ids, attention_mask)
-        positions = lengths.clone()
+        """Find where re-inspection tokens should be inserted.
+
+        The default insert position is the END of the attended span per row
+        (``mask.nonzero()[-1]+1``), NOT the attended-token *count*. These differ
+        under LEFT-padding (count < end index), which is exactly the batched-
+        generation case: using the count mislocated the insert inside the vision
+        block and corrupted text extraction for non-longest rows. Works for
+        left-pad, right-pad, and unpadded (B=1) alike.
+        """
+        B, L = input_ids.shape[0], input_ids.shape[1]
+        positions = torch.full((B,), L, dtype=torch.long, device=input_ids.device)
+        if attention_mask is not None:
+            for b in range(B):
+                nz = attention_mask[b].nonzero(as_tuple=False).squeeze(-1)
+                if nz.numel() > 0:
+                    positions[b] = int(nz[-1].item()) + 1
 
         if labels is not None:
-            for b in range(input_ids.shape[0]):
+            for b in range(B):
                 supervised = (labels[b] != self.config.answer_ignore_index).nonzero(as_tuple=False).squeeze(-1)
                 if supervised.numel() > 0:
                     positions[b] = supervised[0]
@@ -150,14 +163,13 @@ class InternVL3WithReInspection(nn.Module):
         if self._assistant_generation_suffix is None:
             return positions
 
+        # Insert before the generation suffix when it is present at the attended end.
         suffix = self._assistant_generation_suffix.to(input_ids.device)
         suffix_len = suffix.shape[0]
-        for b in range(input_ids.shape[0]):
-            seq_len = lengths[b].item()
-            if seq_len >= suffix_len:
-                tail = input_ids[b, seq_len - suffix_len : seq_len]
-                if torch.equal(tail, suffix):
-                    positions[b] = seq_len - suffix_len
+        for b in range(B):
+            end = int(positions[b].item())
+            if end >= suffix_len and torch.equal(input_ids[b, end - suffix_len : end], suffix):
+                positions[b] = end - suffix_len
 
         return positions
 

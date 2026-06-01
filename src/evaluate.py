@@ -59,6 +59,7 @@ from src.data.llava_next_chat import build_chat_messages as llava_next_build_cha
 from src.data.spatial_dataset import SpatialVQADataset
 from src.data.utils import build_chat_messages as qwen_build_chat
 from src.utils.attn import resolve_attn_implementation
+from src.utils.batch_collate import left_pad_collate
 from src.utils.hydra_util import strip_deepspeed_local_rank_argv
 from src.utils.progress import make_eval_tqdm
 from src.training.trainer import _env_info, _git_info
@@ -771,81 +772,81 @@ def evaluate_benchmark(
     _PROMPT_LEN_BACKENDS = ("internvl3", "gemma4", "llava_next")
 
     progress_desc = f"{condition}/{benchmark_name}" if condition else benchmark_name
-    pbar = make_eval_tqdm(
-        config,
-        range(n),
-        desc=progress_desc,
-        miniters=EVAL_PROGRESS_LOG_INTERVAL,
-        mininterval=1.0,
-        disable=_eval_tqdm_disable(),
-    )
 
-    for i in pbar:
+    # Batched generation tokenizes each sample SEPARATELY (bs=1-identical) and
+    # manually LEFT-pads into one batch: this decouples from each backend's batched
+    # multi-image collation and keeps every prompt flush-right so decoding starts in
+    # lockstep. Correctness of the spliced R tokens hinges on the insert position
+    # being the mask-derived attended-span END (see _find_insert_positions) rather
+    # than the attended-token count — the two differ under left-padding, which was
+    # the batched-reinspection bug. See k8s/eval_batched_smoke.yaml +
+    # project-batched-eval-breaks-reinspection memory.
+    tok = getattr(processor, "tokenizer", None)
+    _pad_id = None
+    if tok is not None:
+        _pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    batch_size = max(1, int(config.eval_batch_size))
+
+    def _build_one(i):
+        """Build ``(text, image_path, meta)`` for sample ``i`` or ``None`` to skip."""
         sample = ds.samples[i]
-        gt_answer = sample["answer"]
         raw_question = sample["question"]
         question = build_eval_question(raw_question, config)
         image_path = os.path.join(image_root, sample["image"])
-
         if not os.path.isfile(image_path):
-            skipped += 1
-            continue
+            return None
+        if backend in _QWEN_BACKENDS:
+            messages = qwen_build_chat(question, image_path=image_path)
+        elif backend == "gemma4":
+            messages = gemma4_build_chat(
+                question=question, image_path=image_path, system_prompt=config.system_prompt
+            )
+        elif backend == "llava_next":
+            messages = llava_next_build_chat(
+                question=question, image_path=image_path, system_prompt=config.system_prompt
+            )
+        else:
+            messages = intern_build_chat(
+                question=question, image_path=image_path, system_prompt=config.system_prompt
+            )
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        meta = {
+            "idx": i,
+            "image": sample["image"],
+            "question": raw_question,
+            "prompted_question": question,
+            "ground_truth": sample["answer"],
+        }
+        return text, image_path, meta
 
-        try:
-            if backend in _QWEN_BACKENDS:
-                messages = qwen_build_chat(question, image_path=image_path)
-                text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                inputs = processor(
-                    text=[text],
-                    images=[image_path],
-                    return_tensors="pt",
-                    max_pixels=config.max_pixels,
-                    min_pixels=config.min_pixels,
-                )
-            elif backend == "gemma4":
-                messages = gemma4_build_chat(
-                    question=question,
-                    image_path=image_path,
-                    system_prompt=config.system_prompt,
-                )
-                text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                inputs = processor(
-                    text=[text],
-                    images=[image_path],
-                    return_tensors="pt",
-                )
-            elif backend == "llava_next":
-                messages = llava_next_build_chat(
-                    question=question,
-                    image_path=image_path,
-                    system_prompt=config.system_prompt,
-                )
-                text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                inputs = processor(
-                    text=[text],
-                    images=[image_path],
-                    return_tensors="pt",
-                )
-            else:
-                messages = intern_build_chat(
-                    question=question,
-                    image_path=image_path,
-                    system_prompt=config.system_prompt,
-                )
-                text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                inputs = processor(
-                    text=[text],
-                    images=[image_path],
-                    return_tensors="pt",
-                    max_pixels=config.max_pixels,
-                    min_pixels=config.min_pixels,
-                    crop_to_patches=config.crop_to_patches_stage2,
-                )
-        except Exception as e:
-            skipped += 1
-            tqdm_stdlib.write(f"  skip {i}: {e}")
-            continue
+    def _processor_one(text, image_path):
+        """Tokenize a single (text, image) pair — bs=1, no padding (the correct path)."""
+        if backend in _QWEN_BACKENDS:
+            return processor(
+                text=[text], images=[image_path], return_tensors="pt",
+                max_pixels=config.max_pixels, min_pixels=config.min_pixels,
+            )
+        if backend == "internvl3":
+            return processor(
+                text=[text], images=[image_path], return_tensors="pt",
+                max_pixels=config.max_pixels, min_pixels=config.min_pixels,
+                crop_to_patches=config.crop_to_patches_stage2,
+            )
+        return processor(text=[text], images=[image_path], return_tensors="pt")
 
+    def _run_batch(idx_list):
+        """Run one batch end-to-end; return ``(n_correct, n_total, n_skipped)``. May raise."""
+        built = [_build_one(i) for i in idx_list]
+        valid = [b for b in built if b is not None]
+        n_skipped = len(built) - len(valid)
+        if not valid:
+            return 0, 0, n_skipped
+        texts = [b[0] for b in valid]
+        image_paths = [b[1] for b in valid]
+        metas = [b[2] for b in valid]
+
+        # Tokenize each sample alone (correct), then manually left-pad-collate.
+        inputs = left_pad_collate([_processor_one(t, ip) for t, ip in zip(texts, image_paths)], _pad_id)
         inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         generated_ids = model.generate(
             **inputs,
@@ -854,49 +855,97 @@ def evaluate_benchmark(
             **_generate_extra_kw(processor),
         )
 
+        # Prompt length to strip — uniform across rows under left-padding.
         if backend in _QWEN_BACKENDS:
-            if is_reinspection:
-                input_len = inputs["input_ids"].shape[1] + config.n_queries
-            else:
-                input_len = inputs["input_ids"].shape[1]
-        elif hasattr(model, "last_generation_prompt_lengths") and model.last_generation_prompt_lengths is not None:
+            input_len = inputs["input_ids"].shape[1] + (config.n_queries if is_reinspection else 0)
+        elif getattr(model, "last_generation_prompt_lengths", None) is not None:
             input_len = int(model.last_generation_prompt_lengths[0].item())
         else:
             input_len = int(inputs["input_ids"].shape[1])
 
-        generated_text = processor.batch_decode(
+        gen_texts = processor.batch_decode(
             generated_ids[:, input_len:],
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
-        )[0].strip().lower()
+        )
 
-        scored_answer = extract_final_answer(generated_text, cot_enabled=config.eval_cot_enabled)
-        is_ok = match_answer(scored_answer, gt_answer)
-        if is_ok:
-            correct += 1
-        total += 1
-        sample_outputs.append({
-            "idx": i,
-            "image": sample["image"],
-            "question": raw_question,
-            "prompted_question": question,
-            "eval_cot_prompt": config.eval_cot_prompt if config.eval_cot_enabled else "",
-            "ground_truth": gt_answer,
-            "model_output": generated_text,
-            "scored_answer": scored_answer,
-            "correct": is_ok,
-        })
-
+        attn_vis = None
         if is_reinspection and hasattr(model, "get_attention_maps"):
             _, attn_vis = model.get_attention_maps()
-            if attn_vis is not None:
-                entropies.append(compute_attention_entropy(attn_vis))
 
-        if total > 0:
-            pbar.set_postfix(acc=f"{correct / total:.4f}", score=f"{correct}/{total}")
+        n_correct = 0
+        for row, meta in enumerate(metas):
+            generated_text = gen_texts[row].strip().lower()
+            scored_answer = extract_final_answer(generated_text, cot_enabled=config.eval_cot_enabled)
+            is_ok = match_answer(scored_answer, meta["ground_truth"])
+            n_correct += int(is_ok)
+            sample_outputs.append({
+                "idx": meta["idx"],
+                "image": meta["image"],
+                "question": meta["question"],
+                "prompted_question": meta["prompted_question"],
+                "eval_cot_prompt": config.eval_cot_prompt if config.eval_cot_enabled else "",
+                "ground_truth": meta["ground_truth"],
+                "model_output": generated_text,
+                "scored_answer": scored_answer,
+                "correct": is_ok,
+            })
+            if attn_vis is not None and row < attn_vis.shape[0]:
+                entropies.append(compute_attention_entropy(attn_vis[row : row + 1]))
+        return n_correct, len(metas), n_skipped
 
-        if (i + 1) % EVAL_PROGRESS_LOG_INTERVAL == 0:
-            print(f"  [{benchmark_name}] {i + 1}/{n}  acc={correct / total:.4f} ({correct}/{total})", flush=True)
+    def _run_with_fallback(idx_list):
+        """Run a batch; on OOM/bad-sample error, split to singles so one item
+        (or a too-large batch) never aborts the whole benchmark."""
+        try:
+            return _run_batch(idx_list)
+        except Exception as e:  # noqa: BLE001 - eval must survive bad samples / OOM
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if len(idx_list) == 1:
+                tqdm_stdlib.write(f"  skip {idx_list[0]}: {e}")
+                return 0, 0, 1
+            tqdm_stdlib.write(
+                f"  batch[{idx_list[0]}..{idx_list[-1]}] failed ({e}); retrying per-sample"
+            )
+            nc = nt = ns = 0
+            for i in idx_list:
+                a, b, c = _run_with_fallback([i])
+                nc += a
+                nt += b
+                ns += c
+            return nc, nt, ns
+
+    pbar = make_eval_tqdm(
+        config,
+        range(n),
+        desc=progress_desc,
+        miniters=EVAL_PROGRESS_LOG_INTERVAL,
+        mininterval=1.0,
+        disable=_eval_tqdm_disable(),
+    )
+    try:
+        processed = 0
+        next_log = EVAL_PROGRESS_LOG_INTERVAL
+        for start in range(0, n, batch_size):
+            idx_list = list(range(start, min(start + batch_size, n)))
+            nc, nt, ns = _run_with_fallback(idx_list)
+            correct += nc
+            total += nt
+            skipped += ns
+            processed += len(idx_list)
+            pbar.update(len(idx_list))
+            if total > 0:
+                pbar.set_postfix(acc=f"{correct / total:.4f}", score=f"{correct}/{total}")
+            if processed >= next_log:
+                acc_so_far = correct / total if total else 0.0
+                print(
+                    f"  [{benchmark_name}] {processed}/{n}  acc={acc_so_far:.4f} ({correct}/{total})",
+                    flush=True,
+                )
+                next_log += EVAL_PROGRESS_LOG_INTERVAL
+    finally:
+        pbar.close()
 
     acc = correct / total if total else 0.0
     mean_ent = float(np.mean(entropies)) if entropies else None

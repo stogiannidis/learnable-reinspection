@@ -130,31 +130,24 @@ class LlavaNextWithReInspection(nn.Module):
         Train: first supervised label index (right after the assistant marker).
         Eval:  end of attended sequence (right after ``[/INST]``).
         """
-        lengths = self._sequence_lengths(input_ids, attention_mask)
-        positions = lengths.clone()
+        # Insert at the END of the attended span per row (mask-derived), NOT the
+        # attended-token count: they differ under LEFT-padding (batched generation).
+        # LLaVA inserts AFTER the generation suffix, i.e. at the attended end.
+        B, L = input_ids.shape[0], input_ids.shape[1]
+        positions = torch.full((B,), L, dtype=torch.long, device=input_ids.device)
+        if attention_mask is not None:
+            for b in range(B):
+                nz = attention_mask[b].nonzero(as_tuple=False).squeeze(-1)
+                if nz.numel() > 0:
+                    positions[b] = int(nz[-1].item()) + 1
 
         if labels is not None:
-            for b in range(input_ids.shape[0]):
+            for b in range(B):
                 supervised = (labels[b] != self.config.answer_ignore_index).nonzero(as_tuple=False).squeeze(-1)
                 if supervised.numel() > 0:
                     positions[b] = supervised[0]
             return positions
 
-        # Suffix-matched insertion if the chat template's generation suffix can
-        # be found at the tail; otherwise fall back to end-of-sequence.
-        if self._assistant_generation_suffix is None:
-            return positions
-
-        suffix = self._assistant_generation_suffix.to(input_ids.device)
-        suffix_len = suffix.shape[0]
-        for b in range(input_ids.shape[0]):
-            seq_len = lengths[b].item()
-            if seq_len >= suffix_len:
-                tail = input_ids[b, seq_len - suffix_len:seq_len]
-                if torch.equal(tail, suffix):
-                    # Insert AFTER the generation suffix, matching training
-                    # (training inserts at supervised[0] = right after suffix).
-                    positions[b] = seq_len
         return positions
 
     def _extract_vision_and_text(

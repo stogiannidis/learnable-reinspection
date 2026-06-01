@@ -73,7 +73,10 @@ class ReInspectionConfig:
         "starting with 'Final answer:'."
     )
     eval_max_new_tokens: int = 128
-
+    # Batched generation verified correct after the mask-derived insert-position fix
+    # in _find_insert_positions; reinspection bs=16 matches bs=1 up to greedy FP/tie
+    # noise (whatsup 0 flips, cv_bench 1/64). Set to 1 for bit-exact reproduction.
+    eval_batch_size: int = 16
     # ------------------------------------------------------------------ #
     # Re-Inspection Module                                                 #
     # ------------------------------------------------------------------ #
