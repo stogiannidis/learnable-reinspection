@@ -41,7 +41,7 @@ from src.data.refcoco import RefCOCODataset
 from src.data.spatial_dataset import build_spatial_dataset
 from src.data.registry import REGISTRY, stage1_defaults
 
-_CONCAT_KEYS = {"pixel_values", "image_grid_thw", "video_grid_thw"}
+_CONCAT_KEYS = {"pixel_values", "image_grid_thw", "video_grid_thw", "image_sizes"}
 _VARLEN_FLOAT_PAD_KEYS = {"attn_target_mask", "bbox_norm"}
 _VARLEN_PAD_KEYS = _VARLEN_FLOAT_PAD_KEYS
 
@@ -70,7 +70,24 @@ def collate_fn(batch):
             collated[key] = values
             continue
         if key in _CONCAT_KEYS:
-            collated[key] = torch.cat(values, dim=0)
+            if key == "pixel_values" and values[0].dim() == 5:
+                # LLaVA-Next AnyRes emits per-sample (1, num_patches_i, C, H, W)
+                # with a variable patch count. Pad the patch dim to the batch
+                # max, then concat along the batch dim -> (B, max_patches, C,
+                # H, W). The model re-derives the true patch count from
+                # ``image_sizes`` and slices the zero padding back off.
+                max_patches = max(v.shape[1] for v in values)
+                padded = []
+                for v in values:
+                    if v.shape[1] < max_patches:
+                        pad = v.new_zeros(
+                            (v.shape[0], max_patches - v.shape[1], *v.shape[2:])
+                        )
+                        v = torch.cat([v, pad], dim=1)
+                    padded.append(v)
+                collated[key] = torch.cat(padded, dim=0)
+            else:
+                collated[key] = torch.cat(values, dim=0)
         elif key in _VARLEN_FLOAT_PAD_KEYS:
             collated[key] = pad_sequence(values, batch_first=True, padding_value=0.0)
         elif values[0].ndim == 0:

@@ -26,8 +26,7 @@ spec:
             mkdir -p logs models
             find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
             REINSPECTION_EXPERIMENT=s1_llava \
-            REINSPECTION_EXPERIMENT_STAGE2= \
-              bash src/scripts/run_train.sh \
+              bash src/scripts/run_train_stage1.sh \
                 deepspeed_config=src/configs/deepspeed_z2.json
         imagePullPolicy: Always
         env:

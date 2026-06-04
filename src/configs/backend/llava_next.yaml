@@ -3,7 +3,7 @@ backend: llava_next
 # HF mirror of liuhaotian/llava-v1.6-mistral-7b — same weights, HF-loadable
 # `LlavaNextForConditionalGeneration` format.
 model_name_or_path: llava-hf/llava-v1.6-mistral-7b-hf
-processor_path: llava-hf/llava-v1.6-mistral-7b-hf
+processor_name_or_path: llava-hf/llava-v1.6-mistral-7b-hf
 deepspeed_config: src/configs/deepspeed_z3.json
 wandb_project: reinspection-llava_next
 
