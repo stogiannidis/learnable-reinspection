@@ -57,6 +57,28 @@ def left_pad_collate(samples: List[Dict[str, object]], pad_id: int | None) -> Di
                 for v in vals
             ]
             out[key] = torch.cat(rows, dim=0)
-        else:
-            out[key] = torch.cat(vals, dim=0)
+            continue
+        # LLaVA-Next AnyRes emits per-sample (1, num_patches_i, C, H, W) with a
+        # variable patch count, which breaks plain dim-0 concat. Zero-pad the
+        # patch dim to the batch max (mirrors the trainer collate_fn); the model
+        # re-derives true counts from ``image_sizes`` and slices the padding off.
+        # InternVL-style (num_tiles_i, C, H, W) keeps flat dim-0 concat: its
+        # leading dim is the variable one, so the all-dim0==1 guard excludes it.
+        anyres = (
+            vals[0].dim() >= 3
+            and all(v.shape[0] == 1 for v in vals)
+            and all(v.shape[2:] == vals[0].shape[2:] for v in vals)
+            and len({v.shape[1] for v in vals}) > 1
+        )
+        if anyres:
+            p_max = max(v.shape[1] for v in vals)
+            vals = [
+                torch.cat(
+                    [v, v.new_zeros((v.shape[0], p_max - v.shape[1], *v.shape[2:]))],
+                    dim=1,
+                )
+                if v.shape[1] < p_max else v
+                for v in vals
+            ]
+        out[key] = torch.cat(vals, dim=0)
     return out

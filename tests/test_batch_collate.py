@@ -59,3 +59,37 @@ def test_custom_pad_id_only_fills_input_ids():
     out = left_pad_collate([a, b], pad_id=99)
     assert out["input_ids"][1].tolist() == [99, 99, 9]   # input_ids padded with 99
     assert out["attention_mask"][1].tolist() == [0, 0, 1]  # mask still padded with 0
+
+
+def _llava_sample(ids, n_patches):
+    """LLaVA-Next AnyRes: pixel_values (1, num_patches_i, C, H, W) + image_sizes."""
+    L = len(ids)
+    return {
+        "input_ids": torch.tensor([ids]),
+        "attention_mask": torch.ones(1, L, dtype=torch.long),
+        "pixel_values": torch.arange(n_patches * 4, dtype=torch.float).reshape(1, n_patches, 1, 2, 2),
+        "image_sizes": torch.tensor([[336, 336]]),
+    }
+
+
+def test_llava_anyres_variable_patches_padded_to_max():
+    a = _llava_sample([5, 6, 7, 8], n_patches=5)
+    b = _llava_sample([9, 10], n_patches=3)
+    out = left_pad_collate([a, b], pad_id=PAD)
+    # Patch dim zero-padded to the batch max, then batched along dim 0 —
+    # the model slices padding back off via image_sizes.
+    assert out["pixel_values"].shape == (2, 5, 1, 2, 2)
+    assert torch.equal(out["pixel_values"][0], a["pixel_values"][0])
+    assert torch.equal(out["pixel_values"][1, :3], b["pixel_values"][0])
+    assert torch.all(out["pixel_values"][1, 3:] == 0)
+    # image_sizes still plain dim-0 concat.
+    assert out["image_sizes"].shape == (2, 2)
+
+
+def test_llava_anyres_equal_patches_plain_concat():
+    a = _llava_sample([5, 6, 7], n_patches=5)
+    b = _llava_sample([9, 10], n_patches=5)
+    out = left_pad_collate([a, b], pad_id=PAD)
+    assert out["pixel_values"].shape == (2, 5, 1, 2, 2)
+    assert torch.equal(out["pixel_values"][0], a["pixel_values"][0])
+    assert torch.equal(out["pixel_values"][1], b["pixel_values"][0])
