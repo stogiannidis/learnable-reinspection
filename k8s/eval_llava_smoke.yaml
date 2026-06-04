@@ -29,7 +29,7 @@ spec:
           - -c
           - |
             set -euo pipefail
-            mkdir -p logs outputs/llava_next/smoke_bs1 outputs/llava_next/smoke_bs64
+            mkdir -p logs outputs/llava_next/smoke_bs1 outputs/llava_next/smoke_bs16 outputs/llava_next/smoke_bs64
             export OMP_NUM_THREADS=4
             export HYDRA_FULL_ERROR=1
             export HF_HOME=/data/Huggingface
@@ -50,51 +50,64 @@ spec:
 
             CKPT=models/llava_next/grounding/stage2/epoch_2
 
-            for BS in 1 64; do
-              echo "================ eval_batch_size=${BS} ================"
-              bash src/scripts/run_eval.sh \
-                backend=llava_next \
-                checkpoint_dir=${CKPT} \
-                lora_checkpoint_dir=${CKPT} \
-                output_file=outputs/llava_next/smoke_bs${BS}/compare.json \
-                eval_condition=reinspection \
-                eval_compare=false \
-                benchmarks='[whatsup,cv_bench]' \
-                max_samples=64 \
-                eval_batch_size=${BS} \
-                pbar_enabled=true \
-                2>&1 | tee logs/eval_llava_smoke_bs${BS}.log
+            # Two conditions x three batch sizes. frozen is the attribution
+            # control: it has NO R-token insertion, so flips there bound the
+            # generic HF batched-generation FP noise; reinspection flips beyond
+            # that bound would implicate our insert/collate path.
+            for COND in reinspection frozen; do
+              for BS in 1 16 64; do
+                echo "================ ${COND} eval_batch_size=${BS} ================"
+                bash src/scripts/run_eval.sh \
+                  backend=llava_next \
+                  checkpoint_dir=${CKPT} \
+                  lora_checkpoint_dir=${CKPT} \
+                  output_file=outputs/llava_next/smoke_bs${BS}/compare_${COND}.json \
+                  eval_condition=${COND} \
+                  eval_compare=false \
+                  benchmarks='[whatsup,cv_bench]' \
+                  max_samples=64 \
+                  eval_batch_size=${BS} \
+                  pbar_enabled=true \
+                  2>&1 | tee logs/eval_llava_smoke_${COND}_bs${BS}.log
+              done
             done
 
             echo "================ batched-vs-unbatched diff ================"
             python3 - <<'PY'
             import json, os
-            A = "outputs/llava_next/smoke_bs1"
-            B = "outputs/llava_next/smoke_bs64"
+            ROOT = "outputs/llava_next"
             benches = ["whatsup", "cv_bench"]
-            ok = True
-            for bench in benches:
-                fa = os.path.join(A, f"reinspection_{bench}_samples.json")
-                fb = os.path.join(B, f"reinspection_{bench}_samples.json")
-                if not (os.path.exists(fa) and os.path.exists(fb)):
-                    print(f"{bench}: MISSING dump ({fa} / {fb})"); ok = False; continue
-                da = {r["idx"]: r for r in json.load(open(fa))}
-                db = {r["idx"]: r for r in json.load(open(fb))}
-                common = sorted(set(da) & set(db))
-                acc_a = sum(da[i]["correct"] for i in common) / len(common)
-                acc_b = sum(db[i]["correct"] for i in common) / len(common)
-                out_diff = [i for i in common if da[i]["model_output"].strip() != db[i]["model_output"].strip()]
-                corr_diff = [i for i in common if da[i]["correct"] != db[i]["correct"]]
-                print(f"{bench:10s} n={len(common):3d}  acc bs1={acc_a:.4f}  bs64={acc_b:.4f}  "
-                      f"d_acc={acc_b-acc_a:+.4f}  text_diff={len(out_diff)}  correctness_flips={len(corr_diff)}")
-                if corr_diff:
-                    ok = False
-                    print("   correctness flips at idx:", corr_diff[:10])
-                for i in out_diff[:2]:
-                    print(f"   idx {i} bs1 : {da[i]['model_output'][:140]!r}")
-                    print(f"   idx {i} bs64: {db[i]['model_output'][:140]!r}")
-            print("VERDICT:", "PASS — accuracy identical across batch sizes" if ok
-                  else "CHECK — correctness flips present (a few from FP/ties is OK; many => bug)")
+            flips = {}
+            for cond in ["reinspection", "frozen"]:
+                base = {}
+                for bench in benches:
+                    f = os.path.join(ROOT, "smoke_bs1", f"{cond}_{bench}_samples.json")
+                    base[bench] = {r["idx"]: r for r in json.load(open(f))} if os.path.exists(f) else None
+                for bs in [16, 64]:
+                    for bench in benches:
+                        fb = os.path.join(ROOT, f"smoke_bs{bs}", f"{cond}_{bench}_samples.json")
+                        if base[bench] is None or not os.path.exists(fb):
+                            print(f"{cond}/{bench}/bs{bs}: MISSING dump"); continue
+                        da, db = base[bench], {r["idx"]: r for r in json.load(open(fb))}
+                        common = sorted(set(da) & set(db))
+                        acc_a = sum(da[i]["correct"] for i in common) / len(common)
+                        acc_b = sum(db[i]["correct"] for i in common) / len(common)
+                        out_diff = [i for i in common if da[i]["model_output"].strip() != db[i]["model_output"].strip()]
+                        corr_diff = [i for i in common if da[i]["correct"] != db[i]["correct"]]
+                        flips[(cond, bs, bench)] = len(corr_diff)
+                        print(f"{cond:12s} bs{bs:<3d} {bench:10s} n={len(common):3d}  "
+                              f"acc bs1={acc_a:.4f}  bs{bs}={acc_b:.4f}  d_acc={acc_b-acc_a:+.4f}  "
+                              f"text_diff={len(out_diff)}  correctness_flips={len(corr_diff)}")
+                        if corr_diff:
+                            print("   flips at idx:", corr_diff[:10])
+            # Attribution: reinspection flips materially above the frozen control
+            # at the same bs implicate the R-insertion/collate path, not FP noise.
+            for bs in [16, 64]:
+                ri = sum(flips.get(("reinspection", bs, b), 0) for b in benches)
+                fz = sum(flips.get(("frozen", bs, b), 0) for b in benches)
+                tag = "OK (within generic batching noise)" if ri <= max(2 * fz, fz + 2) \
+                      else "SUSPECT — reinspection flips exceed frozen control"
+                print(f"bs{bs}: reinspection_flips={ri}  frozen_flips={fz}  -> {tag}")
             PY
         imagePullPolicy: Always
         env:

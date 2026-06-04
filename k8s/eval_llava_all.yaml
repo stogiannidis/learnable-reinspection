@@ -1,13 +1,14 @@
 # LLaVA-Next full eval: ALL conditions (frozen + lora_only + reinspection via
-# eval_compare=true) on the default 13-benchmark suite, bs=64 / 1024 tokens
-# (the post-truncation-fix defaults, passed explicitly for log provenance).
+# eval_compare=true) on the default 13-benchmark suite, 1024-token decode.
 # Checkpoint: models/llava_next/grounding/stage2/epoch_2 — module + LoRA from
 # the SAME dir (loader contract: never mix stages). Tiling flag is a no-op for
 # LLaVA (AnyRes intrinsic). Launch with `kubectl create -f` (generateName).
 #
-# NOTE: run k8s/eval_llava_smoke.yaml alongside — LLaVA's mask-derived insert
-# positions are unit-tested but the bs-vs-bs1 cluster smoke was only ever done
-# on InternVL3. If the smoke reports correctness flips, kill this job.
+# bs=16, not 64: the first LLaVA smoke (bs1-vs-bs64, after the AnyRes collate
+# fix) showed 5/128 greedy flips — both directions, consistent with FP tie
+# noise from large left-pad spans, but above the InternVL3 bs=16 precedent
+# (0-1/64). bs=16 trims pad spans and matches the validated setting; H100
+# instead of H200 (bs=16 fits 80GB; H200 queue was blocking admission).
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -52,7 +53,7 @@ spec:
               output_file=outputs/llava_next/grounding_s2e2_1024/eval_stage2_epoch2_compare.json \
               eval_condition=reinspection \
               eval_compare=true \
-              eval_batch_size=64 \
+              eval_batch_size=16 \
               eval_max_new_tokens=1024 \
               pbar_enabled=true \
               2>&1 | tee logs/eval_llava_all_stage2_epoch2_1024.log
@@ -75,4 +76,4 @@ spec:
       - name: nfs
         nfs: { server: 10.24.6.66, path: / }
       nodeSelector:
-        nvidia.com/gpu.product: NVIDIA-H200
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
