@@ -1,0 +1,109 @@
+# LLaVA-Next batched-vs-unbatched smoke (mirrors k8s/eval_batched_smoke.yaml,
+# which validated InternVL3 only). Reinspection condition, same fixed 64-sample
+# subset of whatsup + cv_bench at bs=1 then bs=64; diffs per-sample outputs and
+# flags correctness flips. LLaVA's _find_insert_positions is mask-derived and
+# unit-tested under left-pad, but this is the first end-to-end batched check.
+# Launch with `kubectl create -f` (generateName).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-eval-llava-smoke-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-eval-llava-smoke
+    spec:
+      containers:
+      - name: reinspection-eval-llava-smoke
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            mkdir -p logs outputs/llava_next/smoke_bs1 outputs/llava_next/smoke_bs64
+            export OMP_NUM_THREADS=4
+            export HYDRA_FULL_ERROR=1
+            export HF_HOME=/data/Huggingface
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+            export WANDB_MODE=offline
+            export PYTHONDONTWRITEBYTECODE=1
+
+            find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+            CKPT=models/llava_next/grounding/stage2/epoch_2
+
+            for BS in 1 64; do
+              echo "================ eval_batch_size=${BS} ================"
+              bash src/scripts/run_eval.sh \
+                backend=llava_next \
+                checkpoint_dir=${CKPT} \
+                lora_checkpoint_dir=${CKPT} \
+                output_file=outputs/llava_next/smoke_bs${BS}/compare.json \
+                eval_condition=reinspection \
+                eval_compare=false \
+                benchmarks='[whatsup,cv_bench]' \
+                max_samples=64 \
+                eval_batch_size=${BS} \
+                pbar_enabled=true \
+                2>&1 | tee logs/eval_llava_smoke_bs${BS}.log
+            done
+
+            echo "================ batched-vs-unbatched diff ================"
+            python3 - <<'PY'
+            import json, os
+            A = "outputs/llava_next/smoke_bs1"
+            B = "outputs/llava_next/smoke_bs64"
+            benches = ["whatsup", "cv_bench"]
+            ok = True
+            for bench in benches:
+                fa = os.path.join(A, f"reinspection_{bench}_samples.json")
+                fb = os.path.join(B, f"reinspection_{bench}_samples.json")
+                if not (os.path.exists(fa) and os.path.exists(fb)):
+                    print(f"{bench}: MISSING dump ({fa} / {fb})"); ok = False; continue
+                da = {r["idx"]: r for r in json.load(open(fa))}
+                db = {r["idx"]: r for r in json.load(open(fb))}
+                common = sorted(set(da) & set(db))
+                acc_a = sum(da[i]["correct"] for i in common) / len(common)
+                acc_b = sum(db[i]["correct"] for i in common) / len(common)
+                out_diff = [i for i in common if da[i]["model_output"].strip() != db[i]["model_output"].strip()]
+                corr_diff = [i for i in common if da[i]["correct"] != db[i]["correct"]]
+                print(f"{bench:10s} n={len(common):3d}  acc bs1={acc_a:.4f}  bs64={acc_b:.4f}  "
+                      f"d_acc={acc_b-acc_a:+.4f}  text_diff={len(out_diff)}  correctness_flips={len(corr_diff)}")
+                if corr_diff:
+                    ok = False
+                    print("   correctness flips at idx:", corr_diff[:10])
+                for i in out_diff[:2]:
+                    print(f"   idx {i} bs1 : {da[i]['model_output'][:140]!r}")
+                    print(f"   idx {i} bs64: {db[i]['model_output'][:140]!r}")
+            print("VERDICT:", "PASS — accuracy identical across batch sizes" if ok
+                  else "CHECK — correctness flips present (a few from FP/ties is OK; many => bug)")
+            PY
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+          - { name: PBAR_API_KEY,  valueFrom: { secretKeyRef: { name: reinspection-secrets, key: PBAR_API_KEY, optional: true } } }
+        resources:
+          requests: { cpu: 32, memory: "64Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 32, memory: "64Gi", nvidia.com/gpu: 1 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "32Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
