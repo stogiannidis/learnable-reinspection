@@ -188,7 +188,7 @@ class ReInspectionConfig:
     max_pixels: int = 1280 * 28 * 28
     min_pixels: int = 4 * 28 * 28
     crop_to_patches_stage1: bool = False
-    crop_to_patches_stage2: bool = True
+    crop_to_patches_stage2: bool = False
     system_prompt: str = "You are a helpful assistant."
     val_split_ratio: float = 0.05
     val_batch_size: Optional[int] = None
