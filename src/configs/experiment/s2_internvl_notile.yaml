@@ -1,0 +1,16 @@
+# @package _global_
+# Stage 2 — spatial VQA (Visual-CoT mix), InternVL3, TILING OFF.
+# Identical recipe to s2_internvl except it trains under the new project-wide
+# crop_to_patches_stage2=false default (visual tokens 1280 -> 256/sample).
+# Fresh experiment_name so checkpoints do NOT overwrite the tiling-ON run in
+# models/internvl3/s2_internvl/ — that run remains the comparison baseline.
+# Stage-1 was always tiling-off, so the epoch_4 warm-up matches this run's
+# input distribution exactly (no Stage-1 rerun needed).
+defaults:
+  - override /backend: internvl3
+  - override /stage: stage2
+  - override /stage2_datasets: default
+
+stage1_checkpoint: models/internvl3/stage1/epoch_4/reinspection_module.pt
+wandb_run_name: s2_internvl_notile
+experiment_name: s2_internvl_notile

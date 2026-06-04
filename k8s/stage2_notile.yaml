@@ -1,0 +1,67 @@
+# Stage-2 fullrun WITHOUT tiling (crop_to_patches_stage2=false, the project
+# default since the tiling-off flip). Same recipe as stage2_fullrun.yaml
+# otherwise: Visual-CoT, InternVL3, 6x H100, Stage-2 only from the existing
+# stage1/epoch_4 checkpoint, z2, grad_accum=11 (effective batch 528).
+#
+# Purpose: (a) train/eval-matched checkpoint for the tiling-off regime,
+# (b) the RI-vs-tiling ablation row, (c) throughput — visual tokens drop
+# 1280 -> 256/sample, compute-bound regime, so expect ~2-3x faster than the
+# tiling-ON fullrun (~8.4h/epoch). Checkpoints land in
+# models/internvl3/s2_internvl_notile/stage2/ (fresh experiment_name; the
+# tiling-ON baseline in models/internvl3/s2_internvl/ is preserved).
+#
+# Memory: 384Gi kept from the tiling-ON fullrun (its leak extrapolated to
+# ~360GB/epoch; smaller samples should leak slower, but unverified — trim
+# only after watching one epoch). Launch with `kubectl create -f` (generateName).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-s2-notile-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-s2-notile
+    spec:
+      containers:
+      - name: reinspection-s2-notile
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            # Avoid stale NFS bytecode masking freshly-added symbols.
+            find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+            mkdir -p logs models
+            REINSPECTION_EXPERIMENT_STAGE2=s2_internvl_notile \
+            STAGE1_CHECKPOINT=models/internvl3/stage1/epoch_4/reinspection_module.pt \
+              bash src/scripts/run_train_stage2.sh \
+                deepspeed_config=src/configs/deepspeed_z2.json \
+                stage2_grad_accum=11
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+        resources:
+          requests: { cpu: 72, memory: "384Gi", nvidia.com/gpu: 6 }
+          limits:   { cpu: 72, memory: "384Gi", nvidia.com/gpu: 6 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "72Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
