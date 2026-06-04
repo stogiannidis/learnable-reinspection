@@ -320,9 +320,14 @@ class LlavaNextWithReInspection(nn.Module):
         if hasattr(image_outputs, "pooler_output") and image_outputs.pooler_output is not None:
             image_features = image_outputs.pooler_output
         else:
-            image_features = image_outputs  # tuple fallback
-            if isinstance(image_features, (tuple, list)):
-                image_features = image_features[0]
+            image_features = image_outputs
+
+        # transformers>=5 packs the AnyRes features as a list of per-image
+        # tensors (one ``(num_tokens_i, hidden)`` entry each). Concatenate them
+        # in batch order so they line up with the row-major image-placeholder
+        # positions that ``masked_scatter`` fills below.
+        if isinstance(image_features, (tuple, list)):
+            image_features = torch.cat(list(image_features), dim=0)
 
         image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
         image_mask = self.base_model.model.get_placeholder_mask(
