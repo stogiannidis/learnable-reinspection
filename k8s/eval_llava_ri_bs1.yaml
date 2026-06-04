@@ -1,0 +1,76 @@
+# LLaVA-Next REINSPECTION-ONLY suite at eval_batch_size=1 — the gold-standard
+# arm. Motivation: the attribution smoke showed reinspection flips above the
+# frozen control under batching (bs16: 3 vs 0, bs64: 5 vs 1; recurring indices
+# => marginal-sample FP tie-breaks in the extra module attention, but unproven).
+# frozen/lora_only have no R-insertion and batch like vanilla HF, so only this
+# condition needs bs=1. Cheap: the tuned model answers in ~3 words.
+# Checkpoint: grounding/stage2/epoch_2, module + LoRA from the SAME dir.
+# Launch with `kubectl create -f` (generateName).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-eval-llava-ri-bs1-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-eval-llava-ri-bs1
+    spec:
+      containers:
+      - name: reinspection-eval-llava-ri-bs1
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            mkdir -p logs outputs/llava_next/grounding_s2e2_1024_bs1
+            export OMP_NUM_THREADS=4
+            export HYDRA_FULL_ERROR=1
+            export HF_HOME=/data/Huggingface
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+            export WANDB_MODE=offline
+            export PYTHONDONTWRITEBYTECODE=1
+
+            find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+            CKPT=models/llava_next/grounding/stage2/epoch_2
+
+            bash src/scripts/run_eval.sh \
+              backend=llava_next \
+              checkpoint_dir=${CKPT} \
+              lora_checkpoint_dir=${CKPT} \
+              output_file=outputs/llava_next/grounding_s2e2_1024_bs1/eval_stage2_epoch2_compare.json \
+              eval_condition=reinspection \
+              eval_compare=false \
+              eval_batch_size=1 \
+              eval_max_new_tokens=1024 \
+              pbar_enabled=true \
+              2>&1 | tee logs/eval_llava_ri_bs1_stage2_epoch2_1024.log
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+          - { name: PBAR_API_KEY,  valueFrom: { secretKeyRef: { name: reinspection-secrets, key: PBAR_API_KEY, optional: true } } }
+        resources:
+          requests: { cpu: 32, memory: "96Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 32, memory: "96Gi", nvidia.com/gpu: 1 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "32Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
