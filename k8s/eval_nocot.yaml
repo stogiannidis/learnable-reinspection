@@ -1,21 +1,21 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  generateName: reinspection-eval-
+  generateName: reinspection-eval-nocot-
   namespace: eidf098ns
   labels:
     kueue.x-k8s.io/queue-name: eidf098ns-user-queue
 spec:
-  ttlSecondsAfterFinished: 36000
+  ttlSecondsAfterFinished: 86400
   parallelism: 1
   completions: 1
   backoffLimit: 0
   template:
     metadata:
-      name: reinspection-eval
+      name: reinspection-eval-nocot
     spec:
       containers:
-      - name: reinspection-eval
+      - name: reinspection-eval-nocot
         image: stogian/l_reinspection:latest
         workingDir: /data/users/stogian/learnable-reinspection
         command:
@@ -23,7 +23,7 @@ spec:
           - -c
           - |
             set -euo pipefail
-            mkdir -p logs outputs/internvl3/s2_internvl_1024 outputs/internvl3
+            mkdir -p logs outputs/internvl3/s2_internvl_nocot
             export OMP_NUM_THREADS=4
             export HYDRA_FULL_ERROR=1
             export HF_HOME=/data/Huggingface
@@ -33,29 +33,28 @@ spec:
 
             find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
-            # All methods combined (frozen + lora_only + reinspection) at bs=64 / 1024 tokens.
-            # NO frozen_cache_file => frozen (original base model) is REGENERATED and its
-            # per-sample responses saved (frozen_<bench>_samples.json), alongside lora_only_/
-            # reinspection_. Writes to a fresh dir so the bs=1/128 baseline in s2_internvl/ is
-            # preserved for before/after comparison.
+            # NO-CoT regime: removes the truncation confound entirely (short answers).
+            # All 3 conditions, frozen regenerated (no cache) => frozen-no-CoT is the terse
+            # baseline. Tests whether the module helps when there's no long-CoT to catch up on.
             bash src/scripts/run_eval.sh \
               checkpoint_dir=models/internvl3/s2_internvl/stage2/epoch_2 \
               lora_checkpoint_dir=models/internvl3/s2_internvl/stage2/epoch_2 \
-              output_file=outputs/internvl3/s2_internvl_1024/eval_stage2_epoch2_compare.json \
+              output_file=outputs/internvl3/s2_internvl_nocot/eval_compare.json \
               eval_condition=reinspection \
               eval_compare=true \
-              eval_batch_size=64 \
-              eval_max_new_tokens=1024 \
+              eval_cot_enabled=false \
+              eval_batch_size=32 \
+              eval_max_new_tokens=256 \
               pbar_enabled=true \
-              2>&1 | tee logs/eval_s2_internvl_stage2_epoch2_1024.log
+              2>&1 | tee logs/eval_nocot.log
         imagePullPolicy: Always
         env:
           - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
           - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
           - { name: PBAR_API_KEY,  valueFrom: { secretKeyRef: { name: reinspection-secrets, key: PBAR_API_KEY, optional: true } } }
         resources:
-          requests: { cpu: 64, memory: "64Gi", nvidia.com/gpu: 1 }
-          limits:   { cpu: 64, memory: "64Gi", nvidia.com/gpu: 1 }
+          requests: { cpu: 32, memory: "64Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 32, memory: "64Gi", nvidia.com/gpu: 1 }
         volumeMounts:
           - { mountPath: /dev/shm, name: dshm }
           - { mountPath: /data,    name: nfs }
@@ -67,4 +66,4 @@ spec:
       - name: nfs
         nfs: { server: 10.24.6.66, path: / }
       nodeSelector:
-        nvidia.com/gpu.product: NVIDIA-H200
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3

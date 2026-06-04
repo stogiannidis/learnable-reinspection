@@ -72,11 +72,16 @@ class ReInspectionConfig:
         "Think step by step. Then provide the final answer on a separate line "
         "starting with 'Final answer:'."
     )
-    eval_max_new_tokens: int = 128
+    # 1024: at 128, verbose CoT (frozen/lora_only) was truncated before emitting
+    # "Final answer:" (e.g. ~70% of srbench lora_only outputs), depressing their
+    # accuracy by truncation rather than reasoning. 1024 covers legitimate CoT;
+    # outputs that conclude early still stop at EOS, so the extra budget only costs
+    # on non-terminating (often degenerate-loop) outputs.
+    eval_max_new_tokens: int = 1024
     # Batched generation verified correct after the mask-derived insert-position fix
     # in _find_insert_positions; reinspection bs=16 matches bs=1 up to greedy FP/tie
     # noise (whatsup 0 flips, cv_bench 1/64). Set to 1 for bit-exact reproduction.
-    eval_batch_size: int = 16
+    eval_batch_size: int = 64
     # ------------------------------------------------------------------ #
     # Re-Inspection Module                                                 #
     # ------------------------------------------------------------------ #

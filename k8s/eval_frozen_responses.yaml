@@ -1,0 +1,84 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-eval-frozen-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-eval-frozen
+    spec:
+      containers:
+      - name: reinspection-eval-frozen
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            mkdir -p logs outputs/internvl3/s2_internvl
+            export OMP_NUM_THREADS=4
+            export HYDRA_FULL_ERROR=1
+            export HF_HOME=/data/Huggingface
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+            export WANDB_MODE=offline
+            export PYTHONDONTWRITEBYTECODE=1
+
+            find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+            # Frozen (original base InternVL3, no LoRA / no reinspection): GENERATE and
+            # SAVE per-sample responses (frozen_<bench>_samples.json) next to the existing
+            # lora_only_/reinspection_ dumps. frozen_cache_file defaults to null in
+            # stage/eval.yaml, so this runs on GPU instead of loading the text-less cache.
+            # bs=1 = canonical responses that reproduce the known frozen baseline and match
+            # the bs=1 lora/reinspection text already on disk.
+            bash src/scripts/run_eval.sh \
+              ~checkpoint_dir ~lora_checkpoint_dir \
+              eval_condition=frozen eval_compare=false \
+              eval_batch_size=64 \
+              eval_max_new_tokens=1024 \
+              pbar_enabled=true \
+              output_file=outputs/internvl3/s2_internvl/frozen_full_eval.json \
+              2>&1 | tee logs/eval_frozen_responses.log
+
+            echo "================ saved frozen per-sample dumps ================"
+            ls -la outputs/internvl3/s2_internvl/frozen_*_samples.json 2>&1 | sed 's#.*/##'
+
+            # Refresh the aggregate frozen-baseline cache (text stays in the sample dumps).
+            python3 - <<'PY'
+            import json
+            d = json.load(open("outputs/internvl3/s2_internvl/frozen_full_eval.json"))
+            results = [{k: v for k, v in r.items() if k != "samples"} for r in d]
+            meta = {"eval_cot_enabled": True,
+                    "eval_cot_prompt": "Think step by step. Then provide the final answer on a separate line starting with 'Final answer:'."}
+            json.dump({"metadata": meta, "results": results},
+                      open("outputs/internvl3/frozen_baseline_resaved.json", "w"), indent=2)
+            print("frozen aggregate ->", [(r["benchmark"], round(r["accuracy"], 4)) for r in results])
+            PY
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+          - { name: PBAR_API_KEY,  valueFrom: { secretKeyRef: { name: reinspection-secrets, key: PBAR_API_KEY, optional: true } } }
+        resources:
+          requests: { cpu: 32, memory: "64Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 32, memory: "64Gi", nvidia.com/gpu: 1 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "32Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H200

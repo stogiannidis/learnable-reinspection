@@ -1,0 +1,91 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-eval-gqa-bs1-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 86400
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-eval-gqa-bs1
+    spec:
+      containers:
+      - name: reinspection-eval-gqa-bs1
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            mkdir -p logs outputs/internvl3/s2_internvl_gqa_bs1
+            export OMP_NUM_THREADS=4
+            export HYDRA_FULL_ERROR=1
+            export HF_HOME=/data/Huggingface
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+            export WANDB_MODE=offline
+            export PYTHONDONTWRITEBYTECODE=1
+
+            find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+            # Confirm the one surviving accuracy effect (GQA-spatial +2.18pp) at bs=1 —
+            # zero decode noise, CoT/1024 (same regime as the combined run). All 3 conditions.
+            bash src/scripts/run_eval.sh \
+              checkpoint_dir=models/internvl3/s2_internvl/stage2/epoch_2 \
+              lora_checkpoint_dir=models/internvl3/s2_internvl/stage2/epoch_2 \
+              output_file=outputs/internvl3/s2_internvl_gqa_bs1/eval_compare.json \
+              eval_condition=reinspection \
+              eval_compare=true \
+              benchmarks='[gqa_spatial]' \
+              eval_batch_size=1 \
+              eval_max_new_tokens=1024 \
+              pbar_enabled=true \
+              2>&1 | tee logs/eval_gqa_bs1.log
+
+            echo "================ McNemar (bs=1, no decode noise) ================"
+            python3 - <<'PY'
+            import json, math
+            D = "outputs/internvl3/s2_internvl_gqa_bs1"
+            def load(c):
+                return {r["idx"]: bool(r["correct"]) for r in json.load(open(f"{D}/{c}_gqa_spatial_samples.json"))}
+            f, l, r = load("frozen"), load("lora_only"), load("reinspection")
+            idx = sorted(set(f) & set(l) & set(r))
+            def mcnemar(a, b):  # a,b: dict idx->bool ; tests a vs b
+                bb = sum(1 for i in idx if a[i] and not b[i])
+                cc = sum(1 for i in idx if b[i] and not a[i])
+                n = bb + cc
+                # exact two-sided binomial
+                p = min(1.0, 2 * sum(math.comb(n, k) for k in range(0, min(bb, cc) + 1)) / (2 ** n)) if n else 1.0
+                return bb, cc, p
+            print(f"n={len(idx)}  acc: frozen={sum(f[i] for i in idx)/len(idx):.4f}  "
+                  f"lora={sum(l[i] for i in idx)/len(idx):.4f}  reinsp={sum(r[i] for i in idx)/len(idx):.4f}")
+            for name, base in [("vs frozen", f), ("vs lora_only", l)]:
+                bb, cc, p = mcnemar(r, base)
+                print(f"  reinspection {name}: +{bb}/-{cc}  net={bb-cc:+d}  McNemar p={p:.4g}  "
+                      f"{'SIGNIFICANT' if p < 0.05 else 'n.s.'}")
+            PY
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+          - { name: PBAR_API_KEY,  valueFrom: { secretKeyRef: { name: reinspection-secrets, key: PBAR_API_KEY, optional: true } } }
+        resources:
+          requests: { cpu: 32, memory: "64Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 32, memory: "64Gi", nvidia.com/gpu: 1 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "32Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
