@@ -1,0 +1,70 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-token-attn-sel-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 172800
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-token-attn-sel
+    spec:
+      containers:
+      - name: reinspection-token-attn-sel
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            mkdir -p logs outputs/token_attn
+            export OMP_NUM_THREADS=4
+            export HYDRA_FULL_ERROR=1
+            export HF_HOME=/data/Huggingface
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+            export WANDB_MODE=offline
+            export PYTHONDONTWRITEBYTECODE=1
+
+            find src scripts -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+            python -c "import torch, transformers; print('torch', torch.__version__, 'transformers', transformers.__version__, 'cuda', torch.cuda.is_available())"
+
+            python scripts/analysis/select_and_visualize_vsr.py \
+              --backend internvl3 \
+              --checkpoint_dir models/internvl3/s2_internvl/stage2/epoch_2 \
+              --lora_checkpoint_dir models/internvl3/s2_internvl/stage2/epoch_2 \
+              --output_dir outputs/token_attn/selection_s2e2 \
+              --n_correct 5 --n_wrong 5 --max_scan 120 \
+              --max_new_tokens 8 --max_input_tokens 36 \
+              --conditions frozen,reinspection --seed 0 \
+              2>&1 | tee logs/token_attn_selection.log
+
+            echo "==== outputs ===="
+            ls -R outputs/token_attn/selection_s2e2 2>/dev/null | head -60
+            test -f outputs/token_attn/selection_s2e2/montage.png \
+              && test -f outputs/token_attn/selection_s2e2/selection.json \
+              && echo "SELECTION SUCCESS" || { echo "SELECTION FAILED"; exit 1; }
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+        resources:
+          requests: { cpu: 16, memory: "48Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 16, memory: "48Gi", nvidia.com/gpu: 1 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "16Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
