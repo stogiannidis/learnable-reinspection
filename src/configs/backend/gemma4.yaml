@@ -45,7 +45,7 @@ lora_target_modules: [q_proj, k_proj, v_proj, o_proj]
 max_pixels: 1003520
 min_pixels: 3136
 crop_to_patches_stage1: false
-crop_to_patches_stage2: true
+crop_to_patches_stage2: false
 
 # Misc
 seed: 42

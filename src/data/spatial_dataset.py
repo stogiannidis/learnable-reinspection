@@ -65,7 +65,7 @@ class SpatialVQADataset(Dataset):
         split: str = "train",
         max_pixels: int = 1280 * 28 * 28,
         min_pixels: int = 4 * 28 * 28,
-        crop_to_patches: bool = True,
+        crop_to_patches: bool = False,
         system_prompt: str = "You are a helpful assistant.",
         answer_ignore_index: int = -100,
     ):
@@ -341,7 +341,7 @@ class VisualCoTDataset(SpatialVQADataset):
         split: str = "train",
         max_pixels: int = 1280 * 28 * 28,
         min_pixels: int = 4 * 28 * 28,
-        crop_to_patches: bool = True,
+        crop_to_patches: bool = False,
         system_prompt: str = "You are a helpful assistant.",
         answer_ignore_index: int = -100,
     ):
@@ -457,7 +457,7 @@ def build_spatial_dataset(
     datasets: Optional[List[str]] = None,
     max_pixels: int = 1280 * 28 * 28,
     min_pixels: int = 4 * 28 * 28,
-    crop_to_patches: bool = True,
+    crop_to_patches: bool = False,
     system_prompt: str = "You are a helpful assistant.",
     answer_ignore_index: int = -100,
 ) -> Dataset:

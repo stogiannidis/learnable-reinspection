@@ -1,4 +1,5 @@
-# One-off Stage-2 smoke: 1x H100, ~40 steps, tiling ON (crop_to_patches_stage2),
+# One-off Stage-2 smoke: 1x H100, ~40 steps, tiling per crop_to_patches_stage2
+# (was ON when this smoke ran; the project default is now OFF),
 # to answer: (a) does bs=8 + InternVL tiling OOM on 80GB, (b) per-GPU samples/sec,
 # (c) is the GPU compute- or data-bound. Reads everything from `kubectl logs`:
 # the tqdm postfix carries `sps=`, and the background nvidia-smi prints util/mem.

@@ -5,7 +5,8 @@
 #   - bs=8, gradient checkpointing ON  (bs=16 was throughput-neutral; GC-off OOMs)
 #   - stage2_grad_accum=11 -> effective batch 8 x 11 x 6 = 528 (~= the 512 baseline)
 #   - z2 (frozen base + tiny trainable surface; ZeRO-3 adds no value)
-#   - tiling ON (crop_to_patches_stage2 default) to match eval
+#   - tiling per crop_to_patches_stage2 default — ON for the original run; the
+#     project default is now OFF (train/eval stay matched either way)
 #   - attn_implementation=flash_attention_2  (config default; the rebuilt image
 #     stogian/l_reinspection:latest, sha256:4dcad05f..., ships flash-attn 2.8.3).
 #     Rollback handle for the old sdpa-only image: sha256:3ce6371d373af9d49c574cf0bce61740c6fb53b805556b0062ae502ff140c507
