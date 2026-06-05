@@ -1,0 +1,58 @@
+# Interactive (Plotly) per-token attention HTMLs from existing maps.npz
+# artifacts — pure post-processing of visualize_token_attention.py output:
+# CPU-only, no GPU/model. Renders every maps.npz under outputs/token_attn*/
+# to a self-contained interactive.html next to it (slider + play/pause per
+# token group; frozen|reinspection side-by-side for input tokens).
+# plotly is not in the image -> installed to a tmp user site at job start.
+# Launch with `kubectl create -f` (generateName).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-token-attn-html-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-token-attn-html
+    spec:
+      containers:
+      - name: reinspection-token-attn-html
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+            export PYTHONDONTWRITEBYTECODE=1
+            export PYTHONUSERBASE=/tmp/pyuser
+            find src scripts -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+            python3 -m pip install --user -q plotly
+
+            found=0
+            while IFS= read -r npz; do
+              found=1
+              echo "== ${npz}"
+              python3 scripts/analysis/interactive_token_attention.py \
+                --run_dir "${npz}" || echo "  FAILED ${npz} (continuing)"
+            done < <(find outputs -name maps.npz | sort)
+            [ "$found" -eq 1 ] || { echo "no maps.npz found under outputs/"; exit 1; }
+        imagePullPolicy: Always
+        resources:
+          requests: { cpu: 8, memory: "16Gi" }
+          limits:   { cpu: 8, memory: "16Gi" }
+        volumeMounts:
+          - { mountPath: /data, name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
