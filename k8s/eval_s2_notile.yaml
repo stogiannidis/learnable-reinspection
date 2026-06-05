@@ -1,0 +1,76 @@
+# InternVL3 tiling-OFF eval: all conditions (frozen + lora_only + reinspection
+# via eval_compare=true) on the s2_internvl_notile/stage2/epoch_4 checkpoint
+# (best val 0.7826; trained tiling-off, evaluated tiling-off — matched).
+# Completes the RI-vs-tiling 2x2 against outputs/internvl3/s2_internvl_1024/
+# (tiling-ON, epoch_2): the frozen column here IS the frozen tiling-off arm.
+# bs=16 H100 (validated noise regime; H200 queue was blocking yesterday).
+# Reading caveats: whatsup is degenerate (gt always 'A' — ignore until the
+# shuffle fix lands); read cv_bench with the format-compliance lens.
+# Launch with `kubectl create -f` (generateName).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-eval-s2-notile-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-eval-s2-notile
+    spec:
+      containers:
+      - name: reinspection-eval-s2-notile
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            mkdir -p logs outputs/internvl3/s2_internvl_notile_1024
+            export OMP_NUM_THREADS=4
+            export HYDRA_FULL_ERROR=1
+            export HF_HOME=/data/Huggingface
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+            export WANDB_MODE=offline
+            export PYTHONDONTWRITEBYTECODE=1
+
+            find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+            CKPT=models/internvl3/s2_internvl_notile/stage2/epoch_4
+
+            bash src/scripts/run_eval.sh \
+              checkpoint_dir=${CKPT} \
+              lora_checkpoint_dir=${CKPT} \
+              output_file=outputs/internvl3/s2_internvl_notile_1024/eval_stage2_epoch4_compare.json \
+              eval_condition=reinspection \
+              eval_compare=true \
+              eval_batch_size=16 \
+              eval_max_new_tokens=1024 \
+              pbar_enabled=true \
+              2>&1 | tee logs/eval_s2_notile_stage2_epoch4_1024.log
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+          - { name: PBAR_API_KEY,  valueFrom: { secretKeyRef: { name: reinspection-secrets, key: PBAR_API_KEY, optional: true } } }
+        resources:
+          requests: { cpu: 64, memory: "64Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 64, memory: "64Gi", nvidia.com/gpu: 1 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "32Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
