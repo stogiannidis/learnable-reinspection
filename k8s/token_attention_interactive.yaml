@@ -30,12 +30,20 @@ spec:
           - -c
           - |
             set -euo pipefail
-            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+            export PYTHONPATH="${PWD}:/tmp/pyextra:${PYTHONPATH:-}"
             export PYTHONDONTWRITEBYTECODE=1
-            export PYTHONUSERBASE=/tmp/pyuser
             find src scripts -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
-            python3 -m pip install --user -q plotly
+            # Image is uv-built and ships no pip module — cascade installers.
+            if python3 -m pip --version >/dev/null 2>&1; then
+              python3 -m pip install -q --target /tmp/pyextra plotly
+            elif command -v uv >/dev/null 2>&1; then
+              uv pip install -q --python "$(command -v python3)" --target /tmp/pyextra plotly
+            else
+              python3 -m ensurepip --default-pip >/dev/null 2>&1 || true
+              python3 -m pip install -q --target /tmp/pyextra plotly
+            fi
+            python3 -c "import plotly; print('plotly', plotly.__version__)"
 
             found=0
             while IFS= read -r npz; do
