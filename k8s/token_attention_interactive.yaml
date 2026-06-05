@@ -34,15 +34,14 @@ spec:
             export PYTHONDONTWRITEBYTECODE=1
             find src scripts -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
-            # Image is uv-built and ships no pip module — cascade installers.
-            if python3 -m pip --version >/dev/null 2>&1; then
-              python3 -m pip install -q --target /tmp/pyextra plotly
-            elif command -v uv >/dev/null 2>&1; then
-              uv pip install -q --python "$(command -v python3)" --target /tmp/pyextra plotly
-            else
-              python3 -m ensurepip --default-pip >/dev/null 2>&1 || true
-              python3 -m pip install -q --target /tmp/pyextra plotly
+            # Runtime image ships NO pip, uv, or ensurepip (uv-built, stripped).
+            # Bootstrap pip itself into /tmp, then install plotly --target.
+            if ! python3 -m pip --version >/dev/null 2>&1; then
+              curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
+              python3 /tmp/get-pip.py -q --target /tmp/pip-boot
+              export PYTHONPATH="/tmp/pip-boot:${PYTHONPATH}"
             fi
+            python3 -m pip install -q --target /tmp/pyextra plotly
             python3 -c "import plotly; print('plotly', plotly.__version__)"
 
             found=0
