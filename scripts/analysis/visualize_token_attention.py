@@ -107,6 +107,23 @@ def _header(m: TokenMap) -> str:
     return f'Token {m.index} | "{m.label}"'
 
 
+def _context_header(maps: List[TokenMap], i: int, window: int = 4, width: int = 58) -> str:
+    """Panel title showing token i bracketed in its surrounding sequence.
+
+    e.g. ``Token 12 | …the [cat] sat on the…`` — same treatment as the
+    interactive explorer's live token strip.
+    """
+    import textwrap
+
+    labels = [m.label for m in maps]
+    lo, hi = max(0, i - window), min(len(labels), i + window + 1)
+    parts = (["…"] if lo > 0 else []) + [
+        f"[{labels[j]}]" if j == i else labels[j] for j in range(lo, hi)
+    ] + (["…"] if hi < len(labels) else [])
+    ctx = textwrap.fill(" ".join(parts), width=width, max_lines=2, placeholder=" …")
+    return f"Token {maps[i].index} | {ctx}"
+
+
 def _overlay(ax, image, m: Optional[TokenMap], h: int, w: int, title: str, cmap: str):
     if m is None or m.grid is None:
         ax.imshow(image)
@@ -147,8 +164,9 @@ def render_side_by_side(
     for r in range(nrows):
         for c, (name, maps, cmap) in enumerate(conds):
             m = maps[r] if r < len(maps) else None
-            # Token header lives on the left-most column to avoid repetition.
-            title = _header(m) if (m is not None and c == 0) else ""
+            # Token header lives on the left-most column to avoid repetition;
+            # it shows the token bracketed in its surrounding sequence.
+            title = _context_header(maps, r) if (m is not None and c == 0) else ""
             _overlay(axes[r, c], image, m, h, w, title, cmap)
 
     extra = "  (truncated)" if truncated else ""
@@ -183,7 +201,7 @@ def render_single_condition(
     fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), squeeze=False)
     flat = axes.flatten()
     for i, m in enumerate(maps):
-        _overlay(flat[i], image, m, h, w, _header(m), cmap)
+        _overlay(flat[i], image, m, h, w, _context_header(maps, i), cmap)
     for i in range(n, len(flat)):
         flat[i].axis("off")
     extra = "  (truncated)" if truncated else ""
@@ -196,6 +214,7 @@ def render_summary(
     image: Image.Image,
     results: Dict[str, dict],
     save_path: str,
+    question: str = "",
 ):
     """Original + per-condition aggregate input-text-mean and generated-mean maps."""
     import matplotlib
@@ -221,7 +240,8 @@ def render_summary(
             plot_attention_heatmap(image, grid, h, w, title=title, ax=ax, cmap=cmap, alpha=0.5)
 
     ans = "   ".join(f"[{c}] {r['answer']!r}" for c, r in results.items())
-    fig.suptitle(f"Aggregate attention over image patches\n{ans}", fontsize=13, y=1.04)
+    q = f"Q: {question}\n" if question else ""
+    fig.suptitle(f"Aggregate attention over image patches\n{q}{ans}", fontsize=13, y=1.06)
     plt.tight_layout()
     _savefig(fig, save_path)
 
@@ -233,6 +253,48 @@ def _savefig(fig, save_path: str):
     fig.savefig(save_path.replace(".png", ".pdf"), dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved {save_path}", flush=True)
+
+
+def _load_npz_results(npz_path: str):
+    """Rebuild the results dict (+meta) from a maps.npz for GPU-free re-rendering."""
+    import re
+
+    raw = np.load(npz_path, allow_pickle=False)
+    meta = {k[5:]: str(raw[k]) for k in raw.files if k.startswith("meta/")}
+    h, w = int(meta["h"]), int(meta["w"])
+    pat = re.compile(
+        r"^(?P<cond>[^/]+)/(?P<group>input_maps|generated_maps|r_maps)/(?P<idx>\d+)/(?P<field>grid|label)$"
+    )
+    results: Dict[str, dict] = {}
+    acc: Dict[str, Dict[str, Dict[int, dict]]] = {}
+    for key in raw.files:
+        if key.startswith("meta/"):
+            continue
+        cond = key.split("/", 1)[0]
+        res = results.setdefault(cond, dict(
+            input_maps=[], generated_maps=[], r_maps=[], answer="",
+            input_mean=None, generated_mean=None, h=h, w=w,
+        ))
+        if key.endswith("/answer"):
+            res["answer"] = str(raw[key])
+        elif key.endswith("/input_mean"):
+            res["input_mean"] = raw[key]
+        elif key.endswith("/generated_mean"):
+            res["generated_mean"] = raw[key]
+        else:
+            m = pat.match(key)
+            if m:
+                acc.setdefault(cond, {}).setdefault(m["group"], {}) \
+                   .setdefault(int(m["idx"]), {})[m["field"]] = raw[key]
+    kind_for = {"input_maps": KIND_TEXT, "generated_maps": "generated", "r_maps": KIND_R}
+    for cond, groups in acc.items():
+        for group, entries in groups.items():
+            results[cond][group] = [
+                TokenMap(index=i, token_id=-1, label=str(e.get("label", "?")),
+                         kind=kind_for[group], grid=np.asarray(e["grid"], dtype=np.float32))
+                for i, e in sorted(entries.items()) if "grid" in e
+            ]
+    return results, meta
 
 
 def _save_npz(results: Dict[str, dict], save_path: str, meta: dict):
@@ -260,8 +322,11 @@ def _save_npz(results: Dict[str, dict], save_path: str, meta: dict):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--backend", choices=["internvl3", "llava_next"], default="internvl3")
-    p.add_argument("--image", required=True)
-    p.add_argument("--question", required=True)
+    p.add_argument("--image", default=None, help="Required unless --from_npz (then meta default).")
+    p.add_argument("--question", default=None, help="Required unless --from_npz (then meta default).")
+    p.add_argument("--from_npz", default=None,
+                   help="Re-render figures from an existing maps.npz — no GPU/model needed; "
+                        "backend/question/image default from its meta, figures land next to it.")
     p.add_argument("--conditions", default="frozen,reinspection",
                    help="Comma list subset of {frozen,reinspection}.")
     p.add_argument("--checkpoint_dir", default=None, help="Re-Inspection module dir (stage1/2).")
@@ -277,6 +342,21 @@ def main():
     p.add_argument("--no_r_tokens", action="store_true", help="Skip R-token panels for reinspection.")
     p.add_argument("--system_prompt", default=None, help="Override the default system prompt.")
     args = p.parse_args()
+
+    if args.from_npz:
+        results, meta = _load_npz_results(args.from_npz)
+        backend = meta.get("backend", args.backend)
+        question = args.question or meta.get("question", "?")
+        image_path = args.image or meta.get("image", "")
+        if not os.path.isfile(image_path):
+            raise SystemExit(f"image not found: {image_path!r} (pass --image)")
+        image = Image.open(image_path).convert("RGB")
+        out_dir = os.path.dirname(os.path.abspath(args.from_npz))
+        _render_figures(results, image, out_dir, backend=backend, question=question)
+        print(f"\nDone (re-render) → {out_dir}", flush=True)
+        return
+    if not (args.image and args.question):
+        raise SystemExit("--image and --question are required unless --from_npz is given.")
 
     conditions = [c.strip() for c in args.conditions.split(",") if c.strip()]
     for c in conditions:
@@ -342,38 +422,48 @@ def main():
     if not results:
         raise SystemExit("No conditions produced results.")
 
-    # Figures.
+    _render_figures(results, image, out_dir, backend=args.backend, question=args.question)
+    _save_npz(results, os.path.join(out_dir, "maps.npz"),
+              meta=dict(backend=args.backend, question=args.question, image=args.image,
+                        layer_reduce=str(layer_reduce), h=results[next(iter(results))]["h"],
+                        w=results[next(iter(results))]["w"]))
+    print(f"\nDone → {out_dir}", flush=True)
+
+
+def _render_figures(results: Dict[str, dict], image: Image.Image, out_dir: str,
+                    backend: str, question: str):
+    """All static figures for a captured/reloaded results dict."""
     h = next(iter(results.values()))["h"]
     w = next(iter(results.values()))["w"]
-    grid_note = f"grid {h}×{w}" + (" (LLaVA base global view)" if args.backend == "llava_next" else "")
+    grid_note = f"grid {h}×{w}" + (" (LLaVA base global view)" if backend == "llava_next" else "")
 
+    answers_line = "   ".join(f"A ({c}): {r['answer']!r}" for c, r in results.items())
     render_side_by_side(
         image, h, w,
         results.get("frozen", {}).get("input_maps", []),
         results.get("reinspection", {}).get("input_maps", []),
         os.path.join(out_dir, "input_tokens.png"),
-        suptitle=f"Input token → image attention | {args.backend} | {grid_note}\nQ: {args.question}",
+        suptitle=(f"Input token → image attention | {backend} | {grid_note}\n"
+                  f"Q: {question}\n{answers_line}"),
     )
     for cond, res in results.items():
         cmap = FROZEN_CMAP if cond == "frozen" else RI_CMAP
         render_single_condition(
             image, h, w, res["generated_maps"],
             os.path.join(out_dir, f"generated_tokens_{cond}.png"),
-            suptitle=f"Generated token → image attention | {cond} | A: {res['answer']!r}",
+            suptitle=(f"Generated token → image attention | {cond}\n"
+                      f"Q: {question}\nA ({cond}): {res['answer']!r}"),
             cmap=cmap,
         )
         if res.get("r_maps"):
             render_single_condition(
                 image, h, w, res["r_maps"],
                 os.path.join(out_dir, f"r_tokens_{cond}.png"),
-                suptitle=f"Re-Inspection R token → image attention | {cond}",
+                suptitle=(f"Re-Inspection R token → image attention | {cond}\n"
+                          f"Q: {question}\nA ({cond}): {res['answer']!r}"),
                 cmap=RI_CMAP,
             )
-    render_summary(image, results, os.path.join(out_dir, "summary.png"))
-    _save_npz(results, os.path.join(out_dir, "maps.npz"),
-              meta=dict(backend=args.backend, question=args.question, image=args.image,
-                        layer_reduce=str(layer_reduce), h=h, w=w))
-    print(f"\nDone → {out_dir}", flush=True)
+    render_summary(image, results, os.path.join(out_dir, "summary.png"), question=question)
 
 
 if __name__ == "__main__":

@@ -49,7 +49,10 @@ spec:
               found=1
               echo "== ${npz}"
               python3 scripts/analysis/interactive_token_attention.py \
-                --run_dir "${npz}" || echo "  FAILED ${npz} (continuing)"
+                --run_dir "${npz}" || echo "  FAILED html ${npz} (continuing)"
+              # Static figures re-rendered from the same npz (no GPU/model).
+              python3 scripts/analysis/visualize_token_attention.py \
+                --from_npz "${npz}" || echo "  FAILED static ${npz} (continuing)"
             done < <(find outputs -name maps.npz | sort)
             [ "$found" -eq 1 ] || { echo "no maps.npz found under outputs/"; exit 1; }
         imagePullPolicy: Always
