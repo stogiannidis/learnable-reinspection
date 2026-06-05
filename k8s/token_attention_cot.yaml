@@ -1,0 +1,98 @@
+# Per-token attention captures under the EVAL CoT PROTOCOL: the dataset VSR
+# question + the eval CoT suffix (build_eval_question join: "\n\n"), 256-token
+# decode budget, frozen + reinspection from the tiling-off epoch_4 checkpoint
+# (s2_internvl_notile). The capture engine forces single-tile input, which
+# MATCHES this checkpoint's training for the first time (earlier captures used
+# tiling-ON checkpoints on single-tile input).
+# Outputs: outputs/token_attn/notile_e4_cot/internvl3_<name>/ with static
+# figures + maps.npz (from the capture CLI) and interactive.html (rendered
+# in the same job after a get-pip bootstrap — image ships no installer).
+# Static generated-token grids cap at 32 panels; the interactive HTML carries
+# every CoT token. Launch with `kubectl create -f` (generateName).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-token-attn-cot-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-token-attn-cot
+    spec:
+      containers:
+      - name: reinspection-token-attn-cot
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            mkdir -p logs outputs/token_attn/notile_e4_cot
+            export OMP_NUM_THREADS=4
+            export HYDRA_FULL_ERROR=1
+            export HF_HOME=/data/Huggingface
+            export PYTHONPATH="${PWD}:/tmp/pyextra:${PYTHONPATH:-}"
+            export WANDB_MODE=offline
+            export PYTHONDONTWRITEBYTECODE=1
+
+            find src scripts -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+            CKPT=models/internvl3/s2_internvl_notile/stage2/epoch_4
+            COT="Think step by step. Then provide the final answer on a separate line starting with 'Final answer:'."
+
+            while IFS='|' read -r name img q; do
+              [ -n "${name}" ] || continue
+              echo "=== capture: ${name} ==="
+              python scripts/analysis/visualize_token_attention.py \
+                --backend internvl3 \
+                --image "${img}" \
+                --question "${q}"$'\n\n'"${COT}" \
+                --conditions frozen,reinspection \
+                --checkpoint_dir "${CKPT}" \
+                --lora_checkpoint_dir "${CKPT}" \
+                --output_dir outputs/token_attn/notile_e4_cot \
+                --sample_name "${name}" \
+                --max_new_tokens 256 \
+                2>&1 | tee "logs/token_attn_cot_${name}.log"
+            done <<'SAMPLES'
+            cat_laptop|/data/datasets/vsr/images/000000452072.jpg|Is the following statement true or false about the image? "The cat is on top of the laptop." Answer with just True or False.
+            laptop_tv|/data/datasets/vsr/images/000000407386.jpg|Is the following statement true or false about the image? "The laptop is left of the tv." Answer with just True or False.
+            oven_cake|/data/datasets/vsr/images/000000169660.jpg|Is the following statement true or false about the image? "The oven is above the cake." Answer with just True or False.
+            SAMPLES
+
+            # Interactive HTMLs for the fresh captures (no pip in image).
+            if ! python3 -m pip --version >/dev/null 2>&1; then
+              curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
+              python3 /tmp/get-pip.py -q --target /tmp/pip-boot
+              export PYTHONPATH="/tmp/pip-boot:${PYTHONPATH}"
+            fi
+            python3 -m pip install -q --target /tmp/pyextra plotly
+            for npz in outputs/token_attn/notile_e4_cot/*/maps.npz; do
+              python3 scripts/analysis/interactive_token_attention.py --run_dir "${npz}"
+            done
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+        resources:
+          requests: { cpu: 16, memory: "64Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 16, memory: "64Gi", nvidia.com/gpu: 1 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "32Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
