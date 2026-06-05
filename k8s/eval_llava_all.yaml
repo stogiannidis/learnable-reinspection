@@ -1,6 +1,6 @@
 # LLaVA-Next full eval: ALL conditions (frozen + lora_only + reinspection via
 # eval_compare=true) on the default 13-benchmark suite, 1024-token decode.
-# Checkpoint: models/llava_next/grounding/stage2/epoch_2 — module + LoRA from
+# Checkpoint: models/llava_next/grounding/stage2/epoch_4 — module + LoRA from
 # the SAME dir (loader contract: never mix stages). Tiling flag is a no-op for
 # LLaVA (AnyRes intrinsic). Launch with `kubectl create -f` (generateName).
 #
@@ -34,7 +34,7 @@ spec:
           - -c
           - |
             set -euo pipefail
-            mkdir -p logs outputs/llava_next/grounding_s2e2_1024
+            mkdir -p logs outputs/llava_next/grounding_s2e4_1024
             export OMP_NUM_THREADS=4
             export HYDRA_FULL_ERROR=1
             export HF_HOME=/data/Huggingface
@@ -44,19 +44,19 @@ spec:
 
             find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 
-            CKPT=models/llava_next/grounding/stage2/epoch_2
+            CKPT=models/llava_next/grounding/stage2/epoch_4
 
             bash src/scripts/run_eval.sh \
               backend=llava_next \
               checkpoint_dir=${CKPT} \
               lora_checkpoint_dir=${CKPT} \
-              output_file=outputs/llava_next/grounding_s2e2_1024/eval_stage2_epoch2_compare.json \
+              output_file=outputs/llava_next/grounding_s2e4_1024/eval_stage2_epoch4_compare.json \
               eval_condition=reinspection \
               eval_compare=true \
               eval_batch_size=16 \
               eval_max_new_tokens=1024 \
               pbar_enabled=true \
-              2>&1 | tee logs/eval_llava_all_stage2_epoch2_1024.log
+              2>&1 | tee logs/eval_llava_all_stage2_epoch4_1024.log
         imagePullPolicy: Always
         env:
           - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
