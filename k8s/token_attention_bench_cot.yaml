@@ -1,0 +1,125 @@
+# Per-token attention captures under the eval CoT protocol — ONE SAMPLE PER
+# BENCHMARK (first sample with an existing image, exactly as evaluate.py
+# resolves paths via BENCHMARK_CONFIGS). frozen + reinspection from the
+# tiling-off epoch_4 checkpoint; 256-token decode carries the model's CoT.
+# Outputs: outputs/token_attn/notile_e4_bench_cot/internvl3_<bench>/ with
+# static figures + maps.npz + interactive.html. Each sample subprocess-reloads
+# both models (~4-5 min/benchmark; ~1-1.5h total on one H100) — simple and
+# memory-clean over fast. Launch with `kubectl create -f` (generateName).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-token-attn-bench-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-token-attn-bench
+    spec:
+      containers:
+      - name: reinspection-token-attn-bench
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            mkdir -p logs outputs/token_attn/notile_e4_bench_cot
+            export OMP_NUM_THREADS=4
+            export HYDRA_FULL_ERROR=1
+            export HF_HOME=/data/Huggingface
+            export PYTHONPATH="${PWD}:/tmp/pyextra:${PYTHONPATH:-}"
+            export WANDB_MODE=offline
+            export PYTHONDONTWRITEBYTECODE=1
+
+            find src scripts -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+            python - <<'PY'
+            import json, os, subprocess
+            from src.evaluate import BENCHMARK_CONFIGS
+
+            DATA = "/data/datasets"
+            CKPT = "models/internvl3/s2_internvl_notile/stage2/epoch_4"
+            COT = ("Think step by step. Then provide the final answer on a "
+                   "separate line starting with 'Final answer:'.")
+            BENCHES = ["vsr_zeroshot", "gqa_spatial", "whatsup", "3dsrbench",
+                       "mindcube", "blink", "srbench", "qspatial", "embspatial",
+                       "realworldqa", "cv_bench", "vstar_bench", "mmvp"]
+
+            failed = []
+            for b in BENCHES:
+                cfg = BENCHMARK_CONFIGS.get(b)
+                f = os.path.join(DATA, cfg["data_file"])
+                if not os.path.exists(f):
+                    print(f"skip {b}: missing {f}", flush=True); continue
+                if f.endswith(".jsonl"):
+                    data = [json.loads(l) for l in open(f)]
+                else:
+                    data = json.load(open(f))
+                pick = None
+                for s in data[:100]:
+                    img = s.get("image")
+                    img = img[0] if isinstance(img, list) else img
+                    img = str(img).split("###", 1)[0]
+                    p = os.path.join(DATA, cfg["image_root"], img)
+                    if os.path.isfile(p) and s.get("question"):
+                        pick = (p, str(s["question"])); break
+                if pick is None:
+                    print(f"skip {b}: no usable sample in first 100", flush=True); continue
+                img, q = pick
+                print(f"\n=== {b}: {img}", flush=True)
+                r = subprocess.run([
+                    "python", "scripts/analysis/visualize_token_attention.py",
+                    "--backend", "internvl3",
+                    "--image", img,
+                    "--question", q.strip() + "\n\n" + COT,
+                    "--conditions", "frozen,reinspection",
+                    "--checkpoint_dir", CKPT,
+                    "--lora_checkpoint_dir", CKPT,
+                    "--output_dir", "outputs/token_attn/notile_e4_bench_cot",
+                    "--sample_name", b,
+                    "--max_new_tokens", "256",
+                ])
+                if r.returncode:
+                    failed.append(b)
+                    print(f"FAILED {b} (continuing)", flush=True)
+            print(f"\ncaptures done; failed: {failed or 'none'}", flush=True)
+            PY
+
+            # Interactive HTMLs (no pip in image -> get-pip bootstrap).
+            if ! python3 -m pip --version >/dev/null 2>&1; then
+              curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
+              python3 /tmp/get-pip.py -q --target /tmp/pip-boot
+              export PYTHONPATH="/tmp/pip-boot:${PYTHONPATH}"
+            fi
+            python3 -m pip install -q --target /tmp/pyextra plotly
+            for npz in outputs/token_attn/notile_e4_bench_cot/*/maps.npz; do
+              python3 scripts/analysis/interactive_token_attention.py --run_dir "${npz}" \
+                || echo "FAILED html ${npz} (continuing)"
+            done
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+        resources:
+          requests: { cpu: 16, memory: "64Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 16, memory: "64Gi", nvidia.com/gpu: 1 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "32Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3
