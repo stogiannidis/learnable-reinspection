@@ -87,6 +87,23 @@ def _heatmap(grid: np.ndarray, w: int, h: int, zmax: float, colorscale: str, opa
     )
 
 
+def _esc(s: str) -> str:
+    """Escape for plotly's pseudo-HTML annotation text."""
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _token_strip(labels: List[str], k: int, window: int = 10) -> str:
+    """One-line token context with token k highlighted: `… a [CAT] sat …`."""
+    lo, hi = max(0, k - window), min(len(labels), k + window + 1)
+    parts = ["…"] if lo > 0 else []
+    for i in range(lo, hi):
+        t = _esc(labels[i])
+        parts.append(f"<b><span style='color:#d62728'>[{t}]</span></b>" if i == k else t)
+    if hi < len(labels):
+        parts.append("…")
+    return " ".join(parts)
+
+
 def build_group_figure(
     panels: List[Tuple[str, List[Tuple[str, np.ndarray]]]],
     image_uri: str,
@@ -101,19 +118,34 @@ def build_group_figure(
     """One animated figure: `panels` = [(condition, [(label, grid), ...]), ...].
 
     All panels must have the same number of steps; step k shows panel p's k-th
-    grid. Returns a plotly Figure with slider + play/pause.
+    grid. A live token strip above the heatmaps highlights the current token in
+    its surrounding sequence as the slider moves; the question / generated
+    answer are emitted as HTML right above the figure by ``build_html``.
     """
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
     n_steps = min(len(maps) for _, maps in panels)
     zmax_global = max(float(g.max()) for _, maps in panels for _, g in maps[:n_steps]) or 1.0
+    labels = [panels[0][1][k][0] for k in range(n_steps)]
 
     fig = make_subplots(
         rows=1, cols=len(panels),
         subplot_titles=[c for c, _ in panels],
         horizontal_spacing=0.04,
     )
+
+    def annotations(k: int):
+        # Subplot titles are layout annotations — frames replace the whole
+        # annotations list, so re-include them in every frame or they vanish.
+        base = [a.to_plotly_json() for a in fig.layout.annotations]
+        base.append(dict(
+            text="<span style='color:#666'>token:</span> " + _token_strip(labels, k),
+            xref="paper", yref="paper", x=0.0, y=1.14,
+            xanchor="left", yanchor="top", showarrow=False, align="left",
+            font=dict(size=13),
+        ))
+        return base
 
     def step_traces(k: int):
         traces = []
@@ -128,16 +160,15 @@ def build_group_figure(
 
     frames, steps = [], []
     for k in range(n_steps):
-        label = panels[0][1][k][0]
         name = f"{k}"
         frames.append(go.Frame(data=step_traces(k), name=name,
-                               layout=go.Layout(title_text=f"{title} — token [{k}] {label!r}")))
+                               layout=go.Layout(annotations=annotations(k))))
         steps.append(dict(
             method="animate",
             args=[[name], {"mode": "immediate",
                            "frame": {"duration": 0, "redraw": True},
                            "transition": {"duration": 0}}],
-            label=label[:14],
+            label=labels[k][:14],
         ))
     fig.frames = frames
 
@@ -152,15 +183,16 @@ def build_group_figure(
         fig.update_yaxes(range=[h, 0], visible=False, scaleanchor=f"x{ax}", row=1, col=col)
 
     fig.update_layout(
-        title_text=f"{title} — token [0] {panels[0][1][0][0]!r}",
-        height=520, margin=dict(l=10, r=10, t=90, b=10),
+        title_text=title, title_y=0.98,
+        annotations=annotations(0),
+        height=560, margin=dict(l=10, r=10, t=130, b=10),
         sliders=[dict(
             active=0, steps=steps, len=0.92, x=0.04, y=-0.04,
             currentvalue=dict(prefix="token: ", font=dict(size=13)),
             font=dict(size=9),
         )],
         updatemenus=[dict(
-            type="buttons", direction="left", x=0.0, y=1.18, showactive=False,
+            type="buttons", direction="left", x=1.0, xanchor="right", y=1.22, showactive=False,
             buttons=[
                 dict(label="▶ Play", method="animate",
                      args=[None, {"frame": {"duration": frame_ms, "redraw": True},
@@ -186,31 +218,46 @@ def build_html(npz_path: str, image_path: Optional[str], output: Optional[str],
     answers = meta.get("answers", {})
 
     conds = [c for c in COND_ORDER if c in maps] + sorted(set(maps) - set(COND_ORDER))
+    question = meta.get("question", "?")
     sections: List[str] = []
     first = True
 
-    def add(fig):
+    def ctx_div(lines: List[Tuple[str, str]]) -> str:
+        """Context block rendered directly above a figure: [(tag, text), ...]."""
+        rows = "".join(
+            f"<div><b>{html.escape(tag)}:</b> {html.escape(txt)}</div>" for tag, txt in lines
+        )
+        return ("<div style='background:#f6f6f6;border-left:4px solid #888;"
+                "padding:8px 12px;margin:18px 0 4px 0;font-size:14px'>" + rows + "</div>")
+
+    def add(fig, context: List[Tuple[str, str]]):
         nonlocal first
-        sections.append(fig.to_html(full_html=False, include_plotlyjs=("inline" if first else False)))
+        sections.append(
+            ctx_div(context)
+            + fig.to_html(full_html=False, include_plotlyjs=("inline" if first else False))
+        )
         first = False
 
     # Input tokens: side-by-side across conditions (same token sequence).
     input_panels = [(c, maps[c]["input_maps"]) for c in conds if maps[c].get("input_maps")]
     if input_panels:
         add(build_group_figure(input_panels, image_uri, w, h, "Input token → image attention",
-                               colorscale, opacity, per_token_scale))
+                               colorscale, opacity, per_token_scale),
+            [("Q", question)] + [(f"A ({c})", answers.get(c, "?")) for c, _ in input_panels])
     # Generated tokens: per condition (answers differ).
     for c in conds:
         if maps[c].get("generated_maps"):
             add(build_group_figure([(c, maps[c]["generated_maps"])], image_uri, w, h,
                                    f"Generated token → image attention ({c})",
-                                   colorscale, opacity, per_token_scale))
+                                   colorscale, opacity, per_token_scale),
+                [("Q", question), (f"A ({c})", answers.get(c, "?"))])
     # R tokens (reinspection only).
     for c in conds:
         if maps[c].get("r_maps"):
             add(build_group_figure([(c, maps[c]["r_maps"])], image_uri, w, h,
                                    f"R token → image attention ({c})",
-                                   "Viridis", opacity, per_token_scale))
+                                   "Viridis", opacity, per_token_scale),
+                [("Q", question), (f"A ({c})", answers.get(c, "?"))])
 
     head = (
         f"<h2>Per-token text→image attention — {html.escape(meta.get('backend', '?'))}</h2>"
