@@ -1,10 +1,11 @@
 # Per-token attention captures under the EVAL CoT PROTOCOL: the dataset VSR
 # question + the eval CoT suffix (build_eval_question join: "\n\n"), 256-token
-# decode budget, frozen + reinspection from the tiling-off epoch_4 checkpoint
+# decode budget (1024, same as eval_max_new_tokens), frozen + reinspection from the
+# tiling-off epoch_4 checkpoint
 # (s2_internvl_notile). The capture engine forces single-tile input, which
 # MATCHES this checkpoint's training for the first time (earlier captures used
 # tiling-ON checkpoints on single-tile input).
-# Outputs: outputs/token_attn/notile_e4_cot/internvl3_<name>/ with static
+# Outputs: outputs/token_attn/notile_e4_cot_1024/internvl3_<name>/ with static
 # figures + maps.npz (from the capture CLI) and interactive.html (rendered
 # in the same job after a get-pip bootstrap — image ships no installer).
 # Static generated-token grids cap at 32 panels; the interactive HTML carries
@@ -34,7 +35,7 @@ spec:
           - -c
           - |
             set -euo pipefail
-            mkdir -p logs outputs/token_attn/notile_e4_cot
+            mkdir -p logs outputs/token_attn/notile_e4_cot_1024
             export OMP_NUM_THREADS=4
             export HYDRA_FULL_ERROR=1
             export HF_HOME=/data/Huggingface
@@ -57,9 +58,10 @@ spec:
                 --conditions frozen,reinspection \
                 --checkpoint_dir "${CKPT}" \
                 --lora_checkpoint_dir "${CKPT}" \
-                --output_dir outputs/token_attn/notile_e4_cot \
+                --output_dir outputs/token_attn/notile_e4_cot_1024 \
                 --sample_name "${name}" \
-                --max_new_tokens 256 \
+                --max_new_tokens 1024 \
+                --max_panels 0 \
                 2>&1 | tee "logs/token_attn_cot_${name}.log"
             done <<'SAMPLES'
             cat_laptop|/data/datasets/vsr/images/000000452072.jpg|Is the following statement true or false about the image? "The cat is on top of the laptop." Answer with just True or False.
@@ -74,7 +76,7 @@ spec:
               export PYTHONPATH="/tmp/pip-boot:${PYTHONPATH}"
             fi
             python3 -m pip install -q --target /tmp/pyextra plotly
-            for npz in outputs/token_attn/notile_e4_cot/*/maps.npz; do
+            for npz in outputs/token_attn/notile_e4_cot_1024/*/maps.npz; do
               python3 scripts/analysis/interactive_token_attention.py --run_dir "${npz}"
             done
         imagePullPolicy: Always

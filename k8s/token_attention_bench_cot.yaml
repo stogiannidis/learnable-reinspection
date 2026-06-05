@@ -1,8 +1,8 @@
 # Per-token attention captures under the eval CoT protocol — ONE SAMPLE PER
 # BENCHMARK (first sample with an existing image, exactly as evaluate.py
 # resolves paths via BENCHMARK_CONFIGS). frozen + reinspection from the
-# tiling-off epoch_4 checkpoint; 256-token decode carries the model's CoT.
-# Outputs: outputs/token_attn/notile_e4_bench_cot/internvl3_<bench>/ with
+# tiling-off epoch_4 checkpoint; 1024-token decode (eval protocol).
+# Outputs: outputs/token_attn/notile_e4_bench_cot_1024/internvl3_<bench>/ with
 # static figures + maps.npz + interactive.html. Each sample subprocess-reloads
 # both models (~4-5 min/benchmark; ~1-1.5h total on one H100) — simple and
 # memory-clean over fast. Launch with `kubectl create -f` (generateName).
@@ -31,7 +31,7 @@ spec:
           - -c
           - |
             set -euo pipefail
-            mkdir -p logs outputs/token_attn/notile_e4_bench_cot
+            mkdir -p logs outputs/token_attn/notile_e4_bench_cot_1024
             export OMP_NUM_THREADS=4
             export HYDRA_FULL_ERROR=1
             export HF_HOME=/data/Huggingface
@@ -83,9 +83,10 @@ spec:
                     "--conditions", "frozen,reinspection",
                     "--checkpoint_dir", CKPT,
                     "--lora_checkpoint_dir", CKPT,
-                    "--output_dir", "outputs/token_attn/notile_e4_bench_cot",
+                    "--output_dir", "outputs/token_attn/notile_e4_bench_cot_1024",
                     "--sample_name", b,
-                    "--max_new_tokens", "256",
+                    "--max_new_tokens", "1024",
+                    "--max_panels", "0",
                 ])
                 if r.returncode:
                     failed.append(b)
@@ -100,7 +101,7 @@ spec:
               export PYTHONPATH="/tmp/pip-boot:${PYTHONPATH}"
             fi
             python3 -m pip install -q --target /tmp/pyextra plotly
-            for npz in outputs/token_attn/notile_e4_bench_cot/*/maps.npz; do
+            for npz in outputs/token_attn/notile_e4_bench_cot_1024/*/maps.npz; do
               python3 scripts/analysis/interactive_token_attention.py --run_dir "${npz}" \
                 || echo "FAILED html ${npz} (continuing)"
             done

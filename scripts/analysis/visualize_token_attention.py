@@ -186,15 +186,19 @@ def render_single_condition(
     ncols: int = 4,
     max_panels: int = 32,
 ):
-    """Grid of per-token overlays for a single set of maps (e.g. generated tokens)."""
+    """Grid of per-token overlays for a single set of maps (e.g. generated tokens).
+
+    ``max_panels <= 0`` renders every token (no cap).
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     if not maps:
         return
-    truncated = len(maps) > max_panels
-    maps = maps[:max_panels]
+    truncated = max_panels > 0 and len(maps) > max_panels
+    if max_panels > 0:
+        maps = maps[:max_panels]
     n = len(maps)
     cols = min(ncols, n)
     rows = (n + cols - 1) // cols
@@ -308,7 +312,7 @@ def _save_npz(results: Dict[str, dict], save_path: str, meta: dict):
             payload[f"{cond}/input_mean"] = res["input_mean"]
         if res.get("generated_mean") is not None:
             payload[f"{cond}/generated_mean"] = res["generated_mean"]
-        payload[f"{cond}/answer"] = np.asarray(res["answer"], dtype="<U256")
+        payload[f"{cond}/answer"] = np.asarray(res["answer"], dtype="<U8192")
     for k, v in meta.items():
         payload[f"meta/{k}"] = np.asarray(v)
     np.savez(save_path, **payload)
@@ -338,6 +342,8 @@ def main():
                    help="'mean' (all layers), 'last', an int layer index, or 'start:end' range.")
     p.add_argument("--max_input_tokens", type=int, default=-1,
                    help="Cap rendered input tokens (-1 = all).")
+    p.add_argument("--max_panels", type=int, default=32,
+                   help="Cap generated/R-token panels in static grids (0 = all tokens).")
     p.add_argument("--skip_special", action="store_true", help="Drop special tokens from input rows.")
     p.add_argument("--no_r_tokens", action="store_true", help="Skip R-token panels for reinspection.")
     p.add_argument("--system_prompt", default=None, help="Override the default system prompt.")
@@ -352,7 +358,8 @@ def main():
             raise SystemExit(f"image not found: {image_path!r} (pass --image)")
         image = Image.open(image_path).convert("RGB")
         out_dir = os.path.dirname(os.path.abspath(args.from_npz))
-        _render_figures(results, image, out_dir, backend=backend, question=question)
+        _render_figures(results, image, out_dir, backend=backend, question=question,
+                        max_panels=args.max_panels)
         print(f"\nDone (re-render) → {out_dir}", flush=True)
         return
     if not (args.image and args.question):
@@ -422,16 +429,18 @@ def main():
     if not results:
         raise SystemExit("No conditions produced results.")
 
-    _render_figures(results, image, out_dir, backend=args.backend, question=args.question)
+    _render_figures(results, image, out_dir, backend=args.backend, question=args.question,
+                    max_panels=args.max_panels)
     _save_npz(results, os.path.join(out_dir, "maps.npz"),
               meta=dict(backend=args.backend, question=args.question, image=args.image,
-                        layer_reduce=str(layer_reduce), h=results[next(iter(results))]["h"],
+                        layer_reduce=str(layer_reduce), max_new_tokens=args.max_new_tokens,
+                        h=results[next(iter(results))]["h"],
                         w=results[next(iter(results))]["w"]))
     print(f"\nDone → {out_dir}", flush=True)
 
 
 def _render_figures(results: Dict[str, dict], image: Image.Image, out_dir: str,
-                    backend: str, question: str):
+                    backend: str, question: str, max_panels: int = 32):
     """All static figures for a captured/reloaded results dict."""
     h = next(iter(results.values()))["h"]
     w = next(iter(results.values()))["w"]
@@ -454,6 +463,7 @@ def _render_figures(results: Dict[str, dict], image: Image.Image, out_dir: str,
             suptitle=(f"Generated token → image attention | {cond}\n"
                       f"Q: {question}\nA ({cond}): {res['answer']!r}"),
             cmap=cmap,
+            max_panels=max_panels,
         )
         if res.get("r_maps"):
             render_single_condition(
@@ -462,6 +472,7 @@ def _render_figures(results: Dict[str, dict], image: Image.Image, out_dir: str,
                 suptitle=(f"Re-Inspection R token → image attention | {cond}\n"
                           f"Q: {question}\nA ({cond}): {res['answer']!r}"),
                 cmap=RI_CMAP,
+                max_panels=max_panels,
             )
     render_summary(image, results, os.path.join(out_dir, "summary.png"), question=question)
 
