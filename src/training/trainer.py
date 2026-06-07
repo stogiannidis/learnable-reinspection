@@ -1771,6 +1771,13 @@ def run_training(config: ReInspectionConfig) -> None:
 
         val_loss = None
         if val_loader is not None:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if is_main_process():
+                log(
+                    f"Epoch {epoch + 1}/{n_epochs}: starting validation "
+                    f"({len(val_loader)} batches per rank)..."
+                )
             val_metrics = _run_validation(
                 ds_engine, val_loader, backend, is_stage1,
                 use_attn, use_grounding, use_qt_infonce, use_roi_feat, use_lm_ce,
@@ -1814,6 +1821,8 @@ def run_training(config: ReInspectionConfig) -> None:
             parts.append(config.experiment_name)
         parts.extend([f"stage{stage}", f"epoch_{epoch + 1}"])
         save_dir = os.path.join(*parts)
+        if is_main_process():
+            log(f"Epoch {epoch + 1}/{n_epochs}: saving checkpoint to {save_dir}...")
         _save_checkpoint(
             ds_engine,
             save_dir=save_dir,
