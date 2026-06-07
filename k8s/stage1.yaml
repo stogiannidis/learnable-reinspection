@@ -6,7 +6,7 @@ metadata:
   labels:
     kueue.x-k8s.io/queue-name: eidf098ns-user-queue
 spec:
-  ttlSecondsAfterFinished: 36000
+  ttlSecondsAfterFinished: 172800
   parallelism: 1
   completions: 1
   backoffLimit: 0
@@ -24,6 +24,11 @@ spec:
           - |
             set -euo pipefail
             mkdir -p logs models
+            export TRITON_CACHE_DIR=/tmp/triton_cache
+            LOG=logs/pipeline_s1_internvl__stage1_only.log
+            if [[ -f "$LOG" ]]; then
+              mv "$LOG" "logs/pipeline_s1_internvl__stage1_only_$(date -u +%Y%m%dT%H%M%SZ).log"
+            fi
             REINSPECTION_EXPERIMENT=s1_internvl REINSPECTION_EXPERIMENT_STAGE2= \
               bash src/scripts/run_train.sh
         imagePullPolicy: Always
@@ -31,8 +36,8 @@ spec:
           - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
           - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
         resources:
-          requests: { cpu: 64, memory: "128Gi", nvidia.com/gpu: 4 }
-          limits:   { cpu: 64, memory: "128Gi", nvidia.com/gpu: 4 }
+          requests: { cpu: 32, memory: "256Gi", nvidia.com/gpu: 4 }
+          limits:   { cpu: 32, memory: "256Gi", nvidia.com/gpu: 4 }
         volumeMounts:
           - { mountPath: /dev/shm, name: dshm }
           - { mountPath: /data,    name: nfs }
