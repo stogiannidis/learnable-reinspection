@@ -1,14 +1,11 @@
 """Per-query attention diversity diagnostic: distinct correspondences or collapse?
 
-The removed Stage-1 attention KL used to broadcast ONE bbox target to
-all n_selector_queries supervised queries — its optimum is all of them producing
-identical attention maps. This script measures, on real VSR samples, whether the
-trained module's per-query attention rows A_vis (N_q, N_vis) actually ended up
-distinct, before deciding whether the loss needs a diversity-aware redesign:
+Measures whether the trained module's per-query attention rows A_vis (Q, V)
+are near-duplicates (collapse) or distinct, using VSR samples:
 
-  Q1  Are the supervised selector queries (0..k-1) near-duplicates?
-        -> pairwise JSD + cosine within the selector block.
-  Q2  Are the free queries (k..Q-1) informative, or near-uniform mush?
+  Q1  Are the Q query rows near-duplicates?
+        -> pairwise JSD + cosine across all queries.
+  Q2  Are rows informative or near-uniform mush?
         -> per-query normalized entropy H/ln(V) (1.0 == uniform).
   Q3  How many effectively distinct patterns do the Q rows span?
         -> participation ratio (Σs²)²/Σs⁴ of the row matrix's singular values.
@@ -35,8 +32,8 @@ import numpy as np
 EPS = 1e-12
 
 # --- Verdict thresholds (named so the discrete conclusions are auditable) ---- #
-SEL_JSD_COLLAPSED = 0.10   # median within-selector normalized JSD below -> COLLAPSED
-SEL_JSD_DIVERSE = 0.30     # above -> DIVERSE; between -> PARTIAL
+JSD_COLLAPSED = 0.10       # median all-pairs normalized JSD below -> COLLAPSED
+JSD_DIVERSE = 0.30         # above -> DIVERSE; between -> PARTIAL
 NEAR_UNIFORM_H = 0.95      # H/ln(V) above this counts as "near-uniform mush"
 PR_COLLAPSED_FRAC = 0.15   # participation ratio / Q below -> rows span few patterns
 PR_DIVERSE_FRAC = 0.40
@@ -94,24 +91,19 @@ def _offdiag_block_mean(mat: np.ndarray, rows: slice, cols: slice, exclude_diag:
     return float(blk.mean())
 
 
-def metrics_for_sample(A: np.ndarray, k_sel: int) -> Dict[str, float]:
+def metrics_for_sample(A: np.ndarray) -> Dict[str, float]:
     """All scalar diversity metrics for one sample's (Q, V) attention stack."""
     P = row_normalize(A)
     Q = P.shape[0]
     jsd = pairwise_jsd(P)
     cos = pairwise_cosine(P)
     ent = normalized_entropy(P)
-    sel, free = slice(0, k_sel), slice(k_sel, Q)
+    all_q = slice(0, Q)
     return {
-        "jsd_sel_within": _offdiag_block_mean(jsd, sel, sel, True),
-        "jsd_free_within": _offdiag_block_mean(jsd, free, free, True),
-        "jsd_cross": _offdiag_block_mean(jsd, sel, free, False),
-        "jsd_all": _offdiag_block_mean(jsd, slice(0, Q), slice(0, Q), True),
-        "cos_sel_within": _offdiag_block_mean(cos, sel, sel, True),
-        "cos_free_within": _offdiag_block_mean(cos, free, free, True),
-        "ent_sel_mean": float(ent[sel].mean()),
-        "ent_free_mean": float(ent[free].mean()),
-        "frac_free_near_uniform": float((ent[free] > NEAR_UNIFORM_H).mean()),
+        "jsd_all": _offdiag_block_mean(jsd, all_q, all_q, True),
+        "cos_all": _offdiag_block_mean(cos, all_q, all_q, True),
+        "ent_mean": float(ent.mean()),
+        "frac_near_uniform": float((ent > NEAR_UNIFORM_H).mean()),
         "participation_ratio": participation_ratio(P),
     }
 
@@ -150,8 +142,8 @@ def selfcheck() -> None:
     assert normalized_entropy(P_uni).min() > 1 - 1e-9
     # one-hot rows -> entropy ~0
     assert normalized_entropy(P_hot).max() < 0.05
-    m = metrics_for_sample(np.tile(base, (Q, 1)), k_sel=4)
-    assert m["jsd_sel_within"] < 1e-6 and m["participation_ratio"] < 1.001
+    m = metrics_for_sample(np.tile(base, (Q, 1)))
+    assert m["jsd_all"] < 1e-6 and m["participation_ratio"] < 1.001
     print("selfcheck OK: identical->collapsed, one-hots->diverse, uniform->H=1", flush=True)
 
 
@@ -159,24 +151,24 @@ def selfcheck() -> None:
 # Verdict + figures                                                            #
 # --------------------------------------------------------------------------- #
 
-def build_verdict(agg: Dict[str, Dict[str, float]], n_samples: int, Q: int, k_sel: int,
+def build_verdict(agg: Dict[str, Dict[str, float]], n_samples: int, Q: int,
                   label: str) -> str:
-    sel_jsd = agg["jsd_sel_within"]["median"]
-    if sel_jsd < SEL_JSD_COLLAPSED:
-        q1 = f"COLLAPSED — the {k_sel} supervised queries are near-duplicates"
-    elif sel_jsd < SEL_JSD_DIVERSE:
-        q1 = f"PARTIAL — the {k_sel} supervised queries overlap heavily but are not identical"
+    all_jsd = agg["jsd_all"]["median"]
+    if all_jsd < JSD_COLLAPSED:
+        q1 = f"COLLAPSED — all {Q} query rows are near-duplicates"
+    elif all_jsd < JSD_DIVERSE:
+        q1 = f"PARTIAL — query rows overlap heavily but are not identical"
     else:
-        q1 = f"DIVERSE — the {k_sel} supervised queries attend to distinct patterns"
+        q1 = f"DIVERSE — query rows attend to distinct patterns"
 
-    mush = agg["frac_free_near_uniform"]["median"]
-    ent_free = agg["ent_free_mean"]["median"]
+    mush = agg["frac_near_uniform"]["median"]
+    ent_mean = agg["ent_mean"]["median"]
     if mush > 0.5:
-        q2 = f"MUSH — {mush:.0%} of free queries are near-uniform (H/lnV > {NEAR_UNIFORM_H})"
-    elif ent_free > 0.85:
-        q2 = "DIFFUSE — free queries are broad but not strictly uniform"
+        q2 = f"MUSH — {mush:.0%} of queries are near-uniform (H/lnV > {NEAR_UNIFORM_H})"
+    elif ent_mean > 0.85:
+        q2 = "DIFFUSE — queries are broad but not strictly uniform"
     else:
-        q2 = "INFORMATIVE — free queries carry sharp, non-uniform attention"
+        q2 = "INFORMATIVE — queries carry sharp, non-uniform attention"
 
     pr = agg["participation_ratio"]["median"]
     frac = pr / Q
@@ -194,33 +186,30 @@ def build_verdict(agg: Dict[str, Dict[str, float]], n_samples: int, Q: int, k_se
     lines = [
         f"# Query-diversity verdict — {label}",
         "",
-        f"{n_samples} VSR samples, Q={Q} queries, k_sel={k_sel} supervised. "
+        f"{n_samples} VSR samples, Q={Q} queries. "
         "All values: median [IQR] over samples. JSD normalized to [0,1].",
         "",
-        f"**Q1 (selector duplication): {q1}.**",
-        f"- within-selector JSD: {fmt('jsd_sel_within')}  (collapse < {SEL_JSD_COLLAPSED}, diverse > {SEL_JSD_DIVERSE})",
-        f"- within-selector cosine: {fmt('cos_sel_within')}",
+        f"**Q1 (query duplication): {q1}.**",
+        f"- all-pairs JSD: {fmt('jsd_all')}  (collapse < {JSD_COLLAPSED}, diverse > {JSD_DIVERSE})",
+        f"- all-pairs cosine: {fmt('cos_all')}",
         "",
-        f"**Q2 (free-query informativeness): {q2}.**",
-        f"- free-query normalized entropy: {fmt('ent_free_mean')}  (selector: {fmt('ent_sel_mean')})",
-        f"- fraction of free queries near-uniform: {fmt('frac_free_near_uniform')}",
+        f"**Q2 (query informativeness): {q2}.**",
+        f"- mean normalized entropy: {fmt('ent_mean')}",
+        f"- fraction near-uniform: {fmt('frac_near_uniform')}",
         "",
         f"**Q3 (effective distinct patterns): {q3}.**",
         f"- participation ratio: {fmt('participation_ratio')} of Q={Q}",
-        f"- all-pairs JSD: {fmt('jsd_all')}; selector-vs-free JSD: {fmt('jsd_cross')}",
         "",
         "## Interpretation",
-        "- Q1 COLLAPSED + Q3 LOW  -> the broadcast-target KL did its anti-diversity work;"
-        " a coverage+diversity (or matching/OT) redesign is justified.",
-        "- Q1 DIVERSE + Q3 HIGH   -> the loss is not the bottleneck; look elsewhere"
+        "- Q1 COLLAPSED + Q3 LOW  -> queries collapsed to one attention pattern.",
+        "- Q1 DIVERSE + Q3 HIGH   -> queries differ; look elsewhere if accuracy is flat"
         " (insertion position, W_up bottleneck, Stage-2 washout).",
-        "- Q2 MUSH on 56/64 free queries means most R tokens carry near-zero"
-        " image-specific signal regardless of what the supervised 8 do.",
+        "- Q2 MUSH means most R tokens carry near-uniform image attention.",
     ]
     return "\n".join(lines) + "\n"
 
 
-def render_figures(attn: np.ndarray, k_sel: int, h: int, w: int, out_dir: str,
+def render_figures(attn: np.ndarray, h: int, w: int, out_dir: str,
                    image_names: List[str], label: str) -> None:
     """JSD heatmap (mean over samples), entropy bars, per-query map grids."""
     import matplotlib
@@ -234,10 +223,7 @@ def render_figures(attn: np.ndarray, k_sel: int, h: int, w: int, out_dir: str,
 
     fig, ax = plt.subplots(figsize=(7.5, 6.5))
     im = ax.imshow(jsd_mean, cmap="viridis", vmin=0, vmax=max(0.5, jsd_mean.max()))
-    ax.axhline(k_sel - 0.5, color="w", lw=1.2, ls="--")
-    ax.axvline(k_sel - 0.5, color="w", lw=1.2, ls="--")
-    ax.set_title(f"Mean pairwise JSD between query rows — {label}\n"
-                 f"(dashes mark the {k_sel} supervised selector queries)")
+    ax.set_title(f"Mean pairwise JSD between query rows — {label}")
     ax.set_xlabel("query"); ax.set_ylabel("query")
     fig.colorbar(im, ax=ax, label="JSD (0 = identical, 1 = disjoint)")
     fig.tight_layout()
@@ -245,57 +231,51 @@ def render_figures(attn: np.ndarray, k_sel: int, h: int, w: int, out_dir: str,
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(12, 3.5))
-    colors = ["#dc2626" if q < k_sel else "#3b82f6" for q in range(Q)]
-    ax.bar(range(Q), ent_med, color=colors)
+    ax.bar(range(Q), ent_med, color="#3b82f6")
     ax.axhline(NEAR_UNIFORM_H, color="k", lw=1, ls=":", label=f"near-uniform ({NEAR_UNIFORM_H})")
     ax.set_xlabel("query index"); ax.set_ylabel("H / ln(V)")
     ax.set_ylim(0, 1.02)
-    ax.set_title(f"Per-query normalized attention entropy (median over {N} samples) — {label}\n"
-                 "red = supervised selector queries, blue = free queries")
+    ax.set_title(f"Per-query normalized attention entropy (median over {N} samples) — {label}")
     ax.legend(loc="lower right")
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "fig_entropy.png"), dpi=150)
     plt.close(fig)
 
-    # Per-query maps for the first samples: selector row + evenly-spaced free row.
     n_show = min(2, N)
-    free_idx = np.linspace(k_sel, Q - 1, num=min(8, Q - k_sel)).astype(int)
-    sel_idx = np.arange(min(8, k_sel))
+    query_idx = np.linspace(0, Q - 1, num=min(8, Q)).astype(int)
     for i in range(n_show):
         P = P_all[i]
         if V < h * w:
             continue
-        fig, axes = plt.subplots(2, max(len(sel_idx), len(free_idx)),
-                                 figsize=(2.1 * max(len(sel_idx), len(free_idx)), 4.6))
-        for row, (idxs, name) in enumerate([(sel_idx, "sel"), (free_idx, "free")]):
-            for col in range(axes.shape[1]):
-                ax = axes[row, col]
-                ax.axis("off")
-                if col >= len(idxs):
-                    continue
-                q = int(idxs[col])
-                ax.imshow(P[q, : h * w].reshape(h, w), cmap="inferno")
-                ax.set_title(f"{name} q{q}", fontsize=9)
+        n_cols = len(query_idx)
+        fig, axes = plt.subplots(1, n_cols, figsize=(2.1 * n_cols, 2.4))
+        if n_cols == 1:
+            axes = [axes]
+        for col, q in enumerate(query_idx):
+            ax = axes[col]
+            ax.axis("off")
+            ax.imshow(P[int(q), : h * w].reshape(h, w), cmap="inferno")
+            ax.set_title(f"q{q}", fontsize=9)
         fig.suptitle(f"Per-query attention maps — {label} — {image_names[i]}", fontsize=11)
         fig.tight_layout()
         fig.savefig(os.path.join(out_dir, f"fig_query_maps_{i}.png"), dpi=150)
         plt.close(fig)
 
 
-def analyze_and_write(attn: np.ndarray, k_sel: int, h: int, w: int, out_dir: str,
+def analyze_and_write(attn: np.ndarray, h: int, w: int, out_dir: str,
                       image_names: List[str], label: str) -> None:
     N, Q, V = attn.shape
-    per_sample = [metrics_for_sample(attn[i], k_sel) for i in range(N)]
+    per_sample = [metrics_for_sample(attn[i]) for i in range(N)]
     agg = aggregate(per_sample)
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "metrics.json"), "w", encoding="utf-8") as f:
-        json.dump({"label": label, "n_samples": N, "n_queries": Q, "n_selector": k_sel,
+        json.dump({"label": label, "n_samples": N, "n_queries": Q,
                    "n_vision_tokens": V, "aggregate": agg, "per_sample": per_sample},
                   f, indent=2)
-    verdict = build_verdict(agg, N, Q, k_sel, label)
+    verdict = build_verdict(agg, N, Q, label)
     with open(os.path.join(out_dir, "VERDICT.md"), "w", encoding="utf-8") as f:
         f.write(verdict)
-    render_figures(attn, k_sel, h, w, out_dir, image_names, label)
+    render_figures(attn, h, w, out_dir, image_names, label)
     print("\n" + verdict, flush=True)
     print(f"wrote {out_dir}/{{metrics.json, VERDICT.md, fig_*.png}}", flush=True)
 
@@ -314,7 +294,7 @@ def _load_cli():
     return mod
 
 
-def capture(args) -> Tuple[np.ndarray, List[str], int, int, int]:
+def capture(args) -> Tuple[np.ndarray, List[str], int, int]:
     """Load the RI model once and capture A_vis (Q, V) on n_samples VSR images."""
     import torch
     from src.utils.token_attention import _process_inputs, plan_vision_grid
@@ -339,7 +319,6 @@ def capture(args) -> Tuple[np.ndarray, List[str], int, int, int]:
     model.eval()
     device = next(model.parameters()).device
     h, w, _ = plan_vision_grid(args.backend, model)
-    k_sel = int(config.n_selector_queries)
 
     examples = []
     for line in open(args.vsr_file, encoding="utf-8"):
@@ -385,7 +364,7 @@ def capture(args) -> Tuple[np.ndarray, List[str], int, int, int]:
         raise SystemExit("No samples captured.")
     V_min = min(a.shape[-1] for a in stacks)
     attn = np.stack([a[:, :V_min] for a in stacks])          # (N, Q, V)
-    return attn, names, h, w, k_sel
+    return attn, names, h, w
 
 
 def main():
@@ -417,28 +396,27 @@ def main():
         attn = np.asarray(data["attn"])
         names = [str(x) for x in np.asarray(data["image_names"]).tolist()]
         h, w = int(data["h"]), int(data["w"])
-        k_sel = int(data["n_selector"])
         out_dir = args.output_dir if args.output_dir != "outputs/query_diversity" \
             else os.path.dirname(os.path.abspath(args.from_npz))
         label = args.label or os.path.basename(out_dir)
-        analyze_and_write(attn, k_sel, h, w, out_dir, names, label)
+        analyze_and_write(attn, h, w, out_dir, names, label)
         return
 
     if not args.checkpoint_dir:
         raise SystemExit("--checkpoint_dir is required (or use --from_npz / --selfcheck).")
 
-    attn, names, h, w, k_sel = capture(args)
+    attn, names, h, w = capture(args)
     out_dir = args.output_dir
     os.makedirs(out_dir, exist_ok=True)
     label = args.label or os.path.basename(os.path.normpath(out_dir))
     np.savez(os.path.join(out_dir, "attn_raw.npz"),
              attn=attn, image_names=np.asarray(names, dtype="<U128"),
-             h=h, w=w, n_selector=k_sel,
+             h=h, w=w,
              backend=args.backend,
              checkpoint_dir=str(args.checkpoint_dir),
              lora_checkpoint_dir=str(args.lora_checkpoint_dir))
     print(f"saved raw stacks: {os.path.join(out_dir, 'attn_raw.npz')}  attn={attn.shape}", flush=True)
-    analyze_and_write(attn, k_sel, h, w, out_dir, names, label)
+    analyze_and_write(attn, h, w, out_dir, names, label)
 
 
 if __name__ == "__main__":

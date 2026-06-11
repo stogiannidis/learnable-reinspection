@@ -207,15 +207,13 @@ def _feature_probe_report(x: torch.Tensor, y: torch.Tensor, train_frac: float, l
     }
 
 
-def _mean_pool_selectors(r_bottleneck: torch.Tensor, n_selector_queries: int) -> torch.Tensor:
-    selectors = r_bottleneck[:, :n_selector_queries].float()
-    return selectors.mean(dim=1)
+def _mean_pool_queries(r_bottleneck: torch.Tensor) -> torch.Tensor:
+    return r_bottleneck.float().mean(dim=1)
 
 
-def _up_project_selectors(model, r_bottleneck: torch.Tensor, n_selector_queries: int) -> torch.Tensor:
-    selectors = r_bottleneck[:, :n_selector_queries]
+def _up_project_queries(model, r_bottleneck: torch.Tensor) -> torch.Tensor:
     weight_dtype = model.reinspection.W_up.weight.dtype
-    return model.reinspection.W_up(selectors.to(weight_dtype)).float().mean(dim=1)
+    return model.reinspection.W_up(r_bottleneck.to(weight_dtype)).float().mean(dim=1)
 
 
 def _normal_text_mask(model, batch: dict) -> torch.BoolTensor:
@@ -310,13 +308,12 @@ def collect(args) -> dict:
                 raise RuntimeError("Model did not return R_bottleneck; return_attn_maps path is broken.")
 
             r_b = outputs.R_bottleneck.detach()
-            feats_bottleneck.append(_mean_pool_selectors(r_b, config.n_selector_queries).cpu())
-            feats_lmspace.append(_up_project_selectors(model, r_b, config.n_selector_queries).cpu())
+            feats_bottleneck.append(_mean_pool_queries(r_b).cpu())
+            feats_lmspace.append(_up_project_queries(model, r_b).cpu())
             targets.append(batch["bbox_norm"].detach().float().cpu())
 
             if bbox_head is not None:
-                selectors = r_b[:, : config.n_selector_queries].float()
-                trained_head_preds.append(bbox_head(selectors).detach().cpu())
+                trained_head_preds.append(bbox_head(r_b).detach().cpu())
 
             r_up_tokens = model.reinspection.W_up(r_b.to(model.reinspection.W_up.weight.dtype)).float()
             token_embed = model.base_model.get_input_embeddings()(batch["input_ids"]).float()
@@ -380,15 +377,14 @@ def collect(args) -> dict:
             "dataset_names": dataset_names,
             "n_samples": int(y.shape[0]),
             "n_queries": int(config.n_queries),
-            "n_selector_queries": int(config.n_selector_queries),
             "d_bottleneck": int(config.d_bottleneck),
             "d_model": int(config.d_model),
         },
         "bbox_linear_probe": {
-            "bottleneck_selector_mean": _feature_probe_report(
+            "bottleneck_query_mean": _feature_probe_report(
                 x_b, y, args.probe_train_frac, args.probe_l2, args.seed
             ),
-            "lmspace_selector_mean_after_W_up": _feature_probe_report(
+            "lmspace_query_mean_after_W_up": _feature_probe_report(
                 x_lm, y, args.probe_train_frac, args.probe_l2, args.seed
             ),
         },

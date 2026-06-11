@@ -65,10 +65,8 @@ class BboxHead(nn.Module):
         """Predict a single normalized box per batch item from query tokens.
 
         Args:
-            R_r: Tensor of shape ``(B, K, d_r)`` — bottleneck query states for
-                the supervised tokens. Stage 1 passes only the selector slice
-                ``R_bottleneck[:, :n_selector_queries]``; mean-pooling reduces
-                across the K selectors before the MLP.
+            R_r: Tensor of shape ``(B, Q, d_r)`` — full bottleneck R states.
+                Mean-pooled across all Q queries before the MLP.
 
         Returns:
             Tensor of shape ``(B, 4)`` with values in ``[0, 1]`` interpreted as

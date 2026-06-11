@@ -1050,8 +1050,7 @@ def _stage1_grounding_loss(config, model, outputs, batch, device, global_step):
     if outputs.R_bottleneck is None or "bbox_norm" not in batch:
         return torch.zeros((), device=device)
     bbox_gt = batch["bbox_norm"].to(device)
-    selectors = outputs.R_bottleneck[:, :config.n_selector_queries]
-    bbox_pred = unwrapped.bbox_head(selectors)
+    bbox_pred = unwrapped.bbox_head(outputs.R_bottleneck)
     warmup = min(1.0, global_step / max(1, config.stage1_grounding_warmup_steps))
     loss = compute_grounding_loss(
         bbox_pred, bbox_gt,

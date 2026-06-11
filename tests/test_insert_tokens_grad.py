@@ -45,7 +45,6 @@ def test_reinspection_w_up_grad_through_insert_pattern():
         d_model=128,
         d_bottleneck=32,
         n_queries=4,
-        n_selector_queries=2,
         n_heads=4,
         ffn_mult=2,
     )

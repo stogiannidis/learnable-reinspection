@@ -1,8 +1,7 @@
 # @package _global_
 # Stage 1 — grounding. InternVL3. RefCOCO family only (stage1_datasets/refcoco).
 # Same recipe as s1_internvl but with a SINGLE re-inspection query (vs 64).
-# The lone R token doubles as the selector query (n_selector_queries == n_queries
-# is allowed for this degenerate case): bbox grounding supervises it directly.
+# Single R token: bbox grounding supervises the lone query directly.
 # Probes whether one token matches the (collapsed) 64-query module.
 # Fresh experiment_name so checkpoints land under models/internvl3/nq1/stage1/.
 defaults:
@@ -11,7 +10,6 @@ defaults:
   - override /stage1_datasets: refcoco
 
 n_queries: 1
-n_selector_queries: 1
 
 wandb_run_name: internvl3-stage1-nq1
 experiment_name: nq1

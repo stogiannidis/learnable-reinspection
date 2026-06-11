@@ -85,7 +85,6 @@ class ReInspectionConfig:
     d_model: int = 4096
     d_bottleneck: int = 512
     n_queries: int = 64
-    n_selector_queries: int = 8
     n_heads: int = 8
     ffn_mult: int = 4
     dropout: float = 0.0
@@ -128,7 +127,7 @@ class ReInspectionConfig:
     # ---- Stage 1 auxiliary losses (each independently toggleable) ----
     # Stage 1 is a pure grounding stage; LM CE / NTP is disabled by default.
     stage1_use_lm_ce: bool = False
-    # Box regression head on selector tokens: L1 + GIoU (DETR weights).
+    # Box regression head on mean-pooled R tokens: L1 + GIoU (DETR weights).
     stage1_use_grounding_loss: bool = True
     stage1_grounding_loss_weight: float = 1.0
     stage1_grounding_l1_weight: float = 5.0
@@ -206,10 +205,6 @@ class ReInspectionConfig:
         if self.d_bottleneck % self.n_heads != 0:
             raise ValueError(
                 f"d_bottleneck ({self.d_bottleneck}) must be divisible by n_heads ({self.n_heads})"
-            )
-        if not 0 < self.n_selector_queries <= self.n_queries:
-            raise ValueError(
-                f"n_selector_queries ({self.n_selector_queries}) must be in (0, n_queries={self.n_queries}]"
             )
         self.d_head = self.d_bottleneck // self.n_heads
 
