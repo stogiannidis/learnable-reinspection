@@ -1,11 +1,9 @@
 """RefCOCO family loaders for stage-1 referring-expression grounding.
 
-Produces model inputs with masked labels, normalized bounding boxes, and
-backend-specific attention targets over vision tokens (patch grids).
+Produces model inputs with masked labels and normalized bounding boxes.
 """
 
 import json
-import math
 import os
 from typing import Dict, List, Optional
 
@@ -13,11 +11,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from .utils import (
-    _overlap_area_grid,
-    bbox_to_patch_mask as qwen_bbox_to_patch_mask,
-    build_chat_messages as qwen_build_chat,
-)
+from .utils import build_chat_messages as qwen_build_chat
 from .chat_template import build_chat_messages as intern_build_chat
 from .gemma4_chat import build_chat_messages as gemma4_build_chat
 from .llava_next_chat import build_chat_messages as llava_next_build_chat
@@ -72,42 +66,6 @@ def _squeeze_intern(batch: Dict) -> Dict:
         else:
             result[key] = value.squeeze(0)
     return result
-
-
-def intern_bbox_to_patch_mask(
-    bbox: List[float],
-    num_image_patches: int,
-    image_seq_length: int = 256,
-) -> torch.Tensor:
-    """Map a normalized box to a probability mask over InternVL patch tokens.
-
-    Args:
-        bbox: ``[x1, y1, x2, y2]`` in normalized image coordinates.
-        num_image_patches: Number of visual crops (mask is tiled when ``> 1``).
-        image_seq_length: Square grid length ``side**2`` for patch indexing.
-
-    Returns:
-        Float tensor of length ``num_image_patches * image_seq_length`` summing
-        to 1. Each entry is the fractional bbox-overlap area for that patch
-        (tiled uniformly across crops when ``num_image_patches > 1``); tiny
-        boxes that miss every patch boundary collapse to a single delta on the
-        patch containing the bbox center.
-
-    Raises:
-        ValueError: If ``image_seq_length`` is not a perfect square.
-    """
-    side = int(math.isqrt(image_seq_length))
-    if side * side != image_seq_length:
-        raise ValueError(f"image_seq_length={image_seq_length} is not a square grid")
-
-    base_mask = _overlap_area_grid(bbox, side, side).flatten()
-    if num_image_patches > 1:
-        # Replicate across crops; renormalize so the full vector sums to 1.
-        mask = base_mask.unsqueeze(0).expand(num_image_patches, -1).contiguous().flatten()
-        mask = mask / float(num_image_patches)
-    else:
-        mask = base_mask
-    return mask
 
 
 class RefCOCODataset(Dataset):
@@ -241,15 +199,6 @@ class RefCOCODataset(Dataset):
                 k: (v.squeeze(0) if isinstance(v, torch.Tensor) and k not in _no_squeeze else v)
                 for k, v in full_inputs.items()
             }
-            if "image_grid_thw" in result:
-                attn_target = qwen_bbox_to_patch_mask(
-                    bbox_norm,
-                    result["image_grid_thw"][0],
-                    spatial_merge_size=2,
-                )
-                result["attn_target_mask"] = attn_target
-            else:
-                result["attn_target_mask"] = torch.tensor([])
             result["bbox_norm"] = torch.tensor(bbox_norm, dtype=torch.float32)
             return result
 
@@ -276,7 +225,6 @@ class RefCOCODataset(Dataset):
             labels[:, :prompt_len] = self.answer_ignore_index
             full_inputs["labels"] = labels
             result = _squeeze_intern(full_inputs)
-            result["attn_target_mask"] = torch.tensor([])
             result["bbox_norm"] = torch.tensor(bbox_norm, dtype=torch.float32)
             return result
 
@@ -307,11 +255,6 @@ class RefCOCODataset(Dataset):
                 k: (v.squeeze(0) if isinstance(v, torch.Tensor) and k not in _no_squeeze else v)
                 for k, v in full_inputs.items()
             }
-            # L_attn target — not wired for LLaVA-Next yet (would need a custom
-            # patch-mask aligned to AnyRes packing). Leave empty so the trainer's
-            # nan-safe fallback degenerates to uniform supervision (same as
-            # Gemma4's current Stage-1 contract).
-            result["attn_target_mask"] = torch.tensor([])
             result["bbox_norm"] = torch.tensor(bbox_norm, dtype=torch.float32)
             return result
 
@@ -338,19 +281,5 @@ class RefCOCODataset(Dataset):
         labels[:, :prompt_len] = self.answer_ignore_index
         full_inputs["labels"] = labels
         result = _squeeze_intern(full_inputs)
-        # Count actual image tokens emitted by the processor (dynamic tiling can
-        # produce more crops than ``get_number_of_image_patches`` reports when
-        # we don't thread ``crop_to_patches``/pixel bounds through the call).
-        image_token_id = getattr(self.processor, "image_token_id", None)
-        if image_token_id is not None:
-            n_image_tokens = int((result["input_ids"] == image_token_id).sum().item())
-            num_tiles = max(1, n_image_tokens // self.image_seq_length)
-        else:
-            num_tiles = self._intern_num_patches(image)
-        result["attn_target_mask"] = intern_bbox_to_patch_mask(
-            bbox=bbox_norm,
-            num_image_patches=num_tiles,
-            image_seq_length=self.image_seq_length,
-        )
         result["bbox_norm"] = torch.tensor(bbox_norm, dtype=torch.float32)
         return result

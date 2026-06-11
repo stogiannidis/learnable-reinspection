@@ -57,10 +57,7 @@ class ReInspectionConfig:
     output_file: str = "eval_results.json"
     benchmarks: List[str] = field(
         default_factory=lambda: [
-            "vsr_zeroshot", "gqa_spatial", "whatsup",
-            "3dsrbench", "mindcube", "blink", "srbench",
-            "qspatial", "embspatial", "realworldqa",
-            "cv_bench", "vstar_bench", "mmvp",
+            "srbench", "spatial_rgpt", "mmvp", "3dsrbench",
         ]
     )
     eval_condition: str = "reinspection"
@@ -131,21 +128,15 @@ class ReInspectionConfig:
     # ---- Stage 1 auxiliary losses (each independently toggleable) ----
     # Stage 1 is a pure grounding stage; LM CE / NTP is disabled by default.
     stage1_use_lm_ce: bool = False
-    # Attention KL between selector-token attn_vis and overlap-area target.
-    stage1_use_attn_loss: bool = True
-    stage1_attn_loss_weight: float = 1.0
-    stage1_attn_loss_type: str = "kl"
-    stage1_attn_small_box_weight: bool = True
     # Box regression head on selector tokens: L1 + GIoU (DETR weights).
     stage1_use_grounding_loss: bool = True
     stage1_grounding_loss_weight: float = 1.0
     stage1_grounding_l1_weight: float = 5.0
     stage1_grounding_giou_weight: float = 2.0
     stage1_grounding_warmup_steps: int = 100
-    # ROI feature grounding: cosine between pooled content tokens and ROI-pooled
-    # frozen vision features. Encourages content tokens to carry region info.
-    stage1_use_roi_feature_loss: bool = True
-    stage1_roi_feature_loss_weight: float = 0.2
+    # Bbox head capacity: "mlp" (3-layer GELU MLP) or "linear" (single
+    # Linear+Sigmoid probe — forces box info to be linearly decodable from R).
+    stage1_bbox_head_type: str = "mlp"
     # Symmetric query–text InfoNCE in bottleneck space.
     stage1_use_query_text_infonce: bool = False
     stage1_query_text_infonce_weight: float = 0.1
@@ -162,14 +153,10 @@ class ReInspectionConfig:
     stage2_grad_accum: int = 8
     stage2_warmup_ratio: float = 0.03
     stage2_warmup_steps: Optional[int] = None
-    # Keep the Stage-1 ROI encoder adaptable during instruction tuning unless
-    # an experiment explicitly freezes it.
     stage2_train_reinspection: bool = True
-    # Optional weak grounding stream mixed into Stage 2. Disabled unless both
-    # the master weight and cadence are positive.
+    # Optional weak bbox-grounding stream mixed into Stage 2. Disabled unless
+    # both the master weight and cadence are positive.
     stage2_aux_grounding_weight: float = 0.0
-    stage2_aux_attn_loss_weight: float = 1.0
-    stage2_aux_roi_feature_loss_weight: float = 0.2
     stage2_aux_every_n_steps: int = 0
     stage2_aux_batch_size: Optional[int] = None
     stage2_aux_stage1_dataset_names: Optional[List[str]] = None
@@ -220,9 +207,9 @@ class ReInspectionConfig:
             raise ValueError(
                 f"d_bottleneck ({self.d_bottleneck}) must be divisible by n_heads ({self.n_heads})"
             )
-        if not 0 < self.n_selector_queries < self.n_queries:
+        if not 0 < self.n_selector_queries <= self.n_queries:
             raise ValueError(
-                f"n_selector_queries ({self.n_selector_queries}) must be in (0, n_queries={self.n_queries})"
+                f"n_selector_queries ({self.n_selector_queries}) must be in (0, n_queries={self.n_queries}]"
             )
         self.d_head = self.d_bottleneck // self.n_heads
 

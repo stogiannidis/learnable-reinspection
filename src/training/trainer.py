@@ -1,9 +1,8 @@
 """Distributed DeepSpeed training for re-inspection VLMs.
 
 Builds per-backend frozen-base + trainable-module setups, attaches optional
-stage-1 supervision (attention KL, bounding-box head), runs the
-optimizer loop with cosine warmup scheduling, checkpointing, and optional
-Weights & Biases logging.
+stage-1 bbox grounding supervision, runs the optimizer loop with cosine warmup
+scheduling, checkpointing, and optional Weights & Biases logging.
 """
 
 from __future__ import annotations
@@ -32,21 +31,16 @@ from transformers import AutoProcessor
 from src.utils.progress import get_tqdm
 
 from src.backends.hf_hub_utils import resolve_pretrained_local_path
-from src.model.attn_loss import compute_attn_loss_kl
 from src.model.bbox_head import BboxHead, compute_grounding_loss
 from src.model.query_text_infonce import compute_query_text_infonce_loss
-from src.model.roi_feature_loss import ROIProjection, compute_roi_feature_loss
 from src.config import ReInspectionConfig
 from src.data.refcoco import RefCOCODataset
 from src.data.spatial_dataset import build_spatial_dataset
 from src.data.registry import REGISTRY, stage1_defaults
 
 _CONCAT_KEYS = {"pixel_values", "image_grid_thw", "video_grid_thw", "image_sizes"}
-_VARLEN_FLOAT_PAD_KEYS = {"attn_target_mask", "bbox_norm"}
+_VARLEN_FLOAT_PAD_KEYS = {"bbox_norm"}
 _VARLEN_PAD_KEYS = _VARLEN_FLOAT_PAD_KEYS
-
-# Log once if stage-1 attention targets are resized to match attn_vis width.
-_attn_target_vis_mismatch_logged = False
 
 
 def collate_fn(batch):
@@ -392,12 +386,11 @@ def _stage1_checkpoint_dir(checkpoint_path: Optional[str]) -> Optional[str]:
 
 def _attach_bbox_head(model, config: ReInspectionConfig) -> None:
     """Create and attach a BboxHead for Stage 1 grounding supervision."""
-    model.bbox_head = BboxHead(config.d_bottleneck, dtype=torch.float32)
-
-
-def _attach_roi_projection(model, config: ReInspectionConfig) -> None:
-    """Create and attach the ROI feature projection for Stage 1 grounding."""
-    model.roi_proj = ROIProjection(config.d_bottleneck, config.d_model, dtype=torch.float32)
+    model.bbox_head = BboxHead(
+        config.d_bottleneck,
+        dtype=torch.float32,
+        head_type=config.stage1_bbox_head_type,
+    )
 
 
 def _stage2_aux_grounding_enabled(config: ReInspectionConfig) -> bool:
@@ -406,23 +399,23 @@ def _stage2_aux_grounding_enabled(config: ReInspectionConfig) -> bool:
 
 
 def _attach_stage2_aux_modules(model, config: ReInspectionConfig, stage1_checkpoint: Optional[str]) -> None:
-    """Attach fixed Stage-1 sidecar modules needed by Stage-2 auxiliary losses."""
-    if not _stage2_aux_grounding_enabled(config) or config.stage2_aux_roi_feature_loss_weight <= 0.0:
+    """Attach frozen Stage-1 bbox head for Stage-2 auxiliary grounding."""
+    if not _stage2_aux_grounding_enabled(config):
         return
 
     checkpoint_dir = _stage1_checkpoint_dir(stage1_checkpoint)
-    roi_path = os.path.join(checkpoint_dir, "roi_proj.pt") if checkpoint_dir else None
-    if roi_path and os.path.exists(roi_path):
-        _attach_roi_projection(model, config)
-        state_dict = torch.load(roi_path, map_location="cpu", weights_only=True)
-        model.roi_proj.load_state_dict(state_dict)
-        for parameter in model.roi_proj.parameters():
+    bbox_path = os.path.join(checkpoint_dir, "bbox_head.pt") if checkpoint_dir else None
+    if bbox_path and os.path.exists(bbox_path):
+        _attach_bbox_head(model, config)
+        state_dict = torch.load(bbox_path, map_location="cpu", weights_only=True)
+        model.bbox_head.load_state_dict(state_dict)
+        for parameter in model.bbox_head.parameters():
             parameter.requires_grad = False
-        log(f"Loaded Stage 1 ROI projection for Stage 2 auxiliary loss: {roi_path}")
+        log(f"Loaded Stage 1 bbox head for Stage 2 auxiliary grounding: {bbox_path}")
     else:
         log(
-            "[WARNING] Stage 2 ROI auxiliary loss requested but roi_proj.pt was not "
-            "found next to the Stage 1 checkpoint; ROI auxiliary term will be zero."
+            "[WARNING] Stage 2 auxiliary grounding requested but bbox_head.pt was not "
+            "found next to the Stage 1 checkpoint; auxiliary term will be zero."
         )
 
 
@@ -464,15 +457,6 @@ def _setup_model_intern_stage1(config: ReInspectionConfig, processor):
                 "params": list(model.bbox_head.parameters()),
                 "lr": config.stage1_lr_module,
                 "name": "bbox_head",
-            }
-        )
-    if config.stage1_use_roi_feature_loss:
-        _attach_roi_projection(model, config)
-        optim_groups.append(
-            {
-                "params": list(model.roi_proj.parameters()),
-                "lr": config.stage1_lr_module,
-                "name": "roi_proj",
             }
         )
     if config.stage1_train_projector:
@@ -545,15 +529,6 @@ def _setup_model_qwen25_stage1(config: ReInspectionConfig):
                 "name": "bbox_head",
             }
         )
-    if config.stage1_use_roi_feature_loss:
-        _attach_roi_projection(model, config)
-        optim_groups.append(
-            {
-                "params": list(model.roi_proj.parameters()),
-                "lr": config.stage1_lr_module,
-                "name": "roi_proj",
-            }
-        )
     optimizer = torch.optim.AdamW(optim_groups, weight_decay=0.01)
     return model, optimizer
 
@@ -596,11 +571,23 @@ def _setup_model_gemma4_stage1(config: ReInspectionConfig, processor):
         parameter.requires_grad = False
     for parameter in model.reinspection.parameters():
         parameter.requires_grad = True
-    optimizer = torch.optim.AdamW(
-        [{"params": list(model.reinspection.parameters()), "lr": config.stage1_lr_module, "name": "reinspection"}],
-        lr=config.stage1_lr_module,
-        weight_decay=0.01,
-    )
+    optim_groups = [
+        {
+            "params": list(model.reinspection.parameters()),
+            "lr": config.stage1_lr_module,
+            "name": "reinspection",
+        }
+    ]
+    if config.stage1_use_grounding_loss:
+        _attach_bbox_head(model, config)
+        optim_groups.append(
+            {
+                "params": list(model.bbox_head.parameters()),
+                "lr": config.stage1_lr_module,
+                "name": "bbox_head",
+            }
+        )
+    optimizer = torch.optim.AdamW(optim_groups, weight_decay=0.01)
     return model, optimizer
 
 
@@ -651,8 +638,6 @@ def _setup_model_llava_stage1(config: ReInspectionConfig, processor):
             "name": "reinspection",
         }
     ]
-    # bbox_head and roi_proj are only attached when their loss flags are set,
-    # mirroring the InternVL3 stage-1 setup.
     if config.stage1_use_grounding_loss:
         _attach_bbox_head(model, config)
         optim_groups.append(
@@ -660,15 +645,6 @@ def _setup_model_llava_stage1(config: ReInspectionConfig, processor):
                 "params": list(model.bbox_head.parameters()),
                 "lr": config.stage1_lr_module,
                 "name": "bbox_head",
-            }
-        )
-    if config.stage1_use_roi_feature_loss:
-        _attach_roi_projection(model, config)
-        optim_groups.append(
-            {
-                "params": list(model.roi_proj.parameters()),
-                "lr": config.stage1_lr_module,
-                "name": "roi_proj",
             }
         )
     optimizer = torch.optim.AdamW(optim_groups, weight_decay=0.01)
@@ -756,7 +732,7 @@ def _build_stage2_aux_grounding_dataset(
     Default source is the RefCOCO Stage-1 family; setting
     ``stage2_aux_use_gqa_scene_graphs=True`` swaps in GQA scene graphs
     (per-object referring expressions over the gqa_spatial images), keeping
-    the rest of the aux machinery (KL attn loss + ROI loss) unchanged.
+    the bbox-grounding auxiliary loss unchanged.
     """
     if config.stage2_aux_use_gqa_scene_graphs:
         from src.data.gqa_scene_graphs import GQASceneGraphGroundingDataset
@@ -823,10 +799,8 @@ def _run_validation(
     val_loader,
     backend: str,
     is_stage1: bool,
-    use_attn: bool,
     use_grounding: bool,
     use_qt_infonce: bool,
-    use_roi_feat: bool,
     use_lm_ce: bool,
     config: ReInspectionConfig,
     device,
@@ -839,12 +813,9 @@ def _run_validation(
     was_training = ds_engine.training
     ds_engine.eval()
 
-    # Accumulators on device for cheap all_reduce.
     ce_sum = torch.zeros((), device=device)
-    attn_sum = torch.zeros((), device=device)
     ground_sum = torch.zeros((), device=device)
     qt_sum = torch.zeros((), device=device)
-    roi_sum = torch.zeros((), device=device)
     total_sum = torch.zeros((), device=device)
     n_batches = torch.zeros((), device=device)
 
@@ -864,25 +835,17 @@ def _run_validation(
                 if ce_loss is None:
                     ce_loss = torch.zeros((), device=device)
 
-                attn_loss = torch.zeros((), device=device)
                 grounding_loss = torch.zeros((), device=device)
                 qt_loss = torch.zeros((), device=device)
-                roi_loss = torch.zeros((), device=device)
-                if use_attn:
-                    attn_loss = _stage1_attn_loss(config, outputs, batch, device)
                 if use_grounding:
                     grounding_loss = _stage1_grounding_loss(
                         config, ds_engine, outputs, batch, device, global_step=10**9
                     )
                 if use_qt_infonce:
                     qt_loss = _stage1_query_text_infonce_loss(config, outputs, device)
-                if use_roi_feat:
-                    roi_loss = _stage1_roi_feature_loss(config, ds_engine, outputs, batch, device)
 
                 loss = (ce_loss if use_lm_ce else torch.zeros((), device=device)) \
-                    + (config.stage1_attn_loss_weight * attn_loss if use_attn else 0.0) \
                     + (config.stage1_grounding_loss_weight * grounding_loss if use_grounding else 0.0) \
-                    + (config.stage1_roi_feature_loss_weight * roi_loss if use_roi_feat else 0.0) \
                     + (
                         config.stage1_query_text_infonce_weight * qt_loss
                         if use_qt_infonce
@@ -896,10 +859,8 @@ def _run_validation(
                     continue
 
                 ce_sum = ce_sum + ce_loss.detach()
-                attn_sum = attn_sum + attn_loss.detach()
                 ground_sum = ground_sum + grounding_loss.detach()
                 qt_sum = qt_sum + qt_loss.detach()
-                roi_sum = roi_sum + roi_loss.detach()
                 total_sum = total_sum + loss.detach()
                 n_batches = n_batches + 1
     finally:
@@ -907,18 +868,16 @@ def _run_validation(
             ds_engine.train()
         _drain_zero3_prefetches(ds_engine)
 
-    packed = torch.stack([ce_sum, attn_sum, ground_sum, qt_sum, roi_sum, total_sum, n_batches])
+    packed = torch.stack([ce_sum, ground_sum, qt_sum, total_sum, n_batches])
     if dist.is_initialized():
         dist.all_reduce(packed, op=dist.ReduceOp.SUM)
-    ce_s, attn_s, ground_s, qt_s, roi_s, total_s, n = packed.tolist()
+    ce_s, ground_s, qt_s, total_s, n = packed.tolist()
     denom = max(n, 1.0)
     return {
         "loss": total_s / denom,
         "ce_loss": ce_s / denom,
-        "attn_loss": attn_s / denom,
         "grounding_loss": ground_s / denom,
         "query_text_infonce_loss": qt_s / denom,
-        "roi_feature_loss": roi_s / denom,
         "num_batches": int(n),
     }
 
@@ -973,15 +932,6 @@ def _save_checkpoint(ds_engine, save_dir: str, save_lora: bool = False) -> None:
                     unwrapped.bbox_head.state_dict(),
                     os.path.join(save_dir, "bbox_head.pt"),
                 )
-    if hasattr(unwrapped, "roi_proj"):
-        roi_params = list(unwrapped.roi_proj.parameters())
-        with deepspeed.zero.GatheredParameters(roi_params, modifier_rank=0):
-            if is_main_process():
-                torch.save(
-                    unwrapped.roi_proj.state_dict(),
-                    os.path.join(save_dir, "roi_proj.pt"),
-                )
-
     if save_lora:
         lora_params = [
             p
@@ -1052,7 +1002,7 @@ def _train_forward_kwargs(
     return_attn_maps: Optional[bool] = None,
 ) -> dict:
     if return_attn_maps is None:
-        return_attn_maps = is_stage1
+        return_attn_maps = False
     fwd = {
         "input_ids": batch["input_ids"],
         "attention_mask": batch["attention_mask"],
@@ -1075,37 +1025,6 @@ def _train_forward_kwargs(
     elif backend == "llava_next":
         fwd["image_sizes"] = batch.get("image_sizes")
     return fwd
-
-
-def _stage1_attn_loss(config: ReInspectionConfig, outputs, batch, device):
-    global _attn_target_vis_mismatch_logged
-    if outputs.attn_vis is None or "attn_target_mask" not in batch:
-        return torch.zeros((), device=device)
-    target = batch["attn_target_mask"]
-    n_v = outputs.attn_vis.shape[-1]
-    if target.shape[-1] != n_v:
-        if is_main_process() and not _attn_target_vis_mismatch_logged:
-            log(
-                f"[WARNING] attn_target_mask width {target.shape[-1]} != attn_vis {n_v}; "
-                "truncating/padding for loss. Check image patch counts vs ViT tokens if this persists."
-            )
-            _attn_target_vis_mismatch_logged = True
-        target = F.pad(target[:, :n_v], (0, max(0, n_v - target.shape[-1])))
-
-    k_sel = config.n_selector_queries
-    selector_attn = outputs.attn_vis[:, :k_sel]
-
-    bbox_areas = None
-    if config.stage1_attn_small_box_weight and "bbox_norm" in batch:
-        b = batch["bbox_norm"].to(device).float()
-        bbox_areas = ((b[:, 2] - b[:, 0]).clamp(min=0) * (b[:, 3] - b[:, 1]).clamp(min=0))
-
-    return compute_attn_loss_kl(
-        selector_attn,
-        target,
-        bbox_areas=bbox_areas,
-        small_box_weight=config.stage1_attn_small_box_weight and bbox_areas is not None,
-    )
 
 
 def _stage1_query_text_infonce_loss(config: ReInspectionConfig, outputs, device):
@@ -1142,54 +1061,10 @@ def _stage1_grounding_loss(config, model, outputs, batch, device, global_step):
     return loss * warmup
 
 
-def _stage1_roi_feature_loss(config, model, outputs, batch, device):
-    """Cosine ROI feature loss between pooled content tokens and bbox-pooled V."""
-    unwrapped = model.module if hasattr(model, "module") else model
-    if not hasattr(unwrapped, "roi_proj"):
-        return torch.zeros((), device=device)
-    if (
-        outputs.R_bottleneck is None
-        or outputs.vision_hidden_states is None
-        or "attn_target_mask" not in batch
-    ):
-        return torch.zeros((), device=device)
-
-    V_frozen = outputs.vision_hidden_states.detach()
-    target = batch["attn_target_mask"]
-    n_v = V_frozen.shape[1]
-    if target.shape[-1] != n_v:
-        target = F.pad(target[:, :n_v], (0, max(0, n_v - target.shape[-1])))
-
-    R_content = outputs.R_bottleneck[:, config.n_selector_queries:]
-    if R_content.shape[1] == 0:
-        return torch.zeros((), device=device)
-    loss, _cos = compute_roi_feature_loss(
-        V_frozen=V_frozen,
-        R_content=R_content,
-        attn_target_mask=target.to(device),
-        projection=unwrapped.roi_proj,
-    )
-    return loss
-
-
-def _stage2_aux_grounding_loss(config, model, outputs, batch, device):
-    """Weak Stage-2 grounding regularizer on ROI-labeled auxiliary batches."""
-    attn_loss = torch.zeros((), device=device)
-    roi_loss = torch.zeros((), device=device)
-
-    if config.stage2_aux_attn_loss_weight > 0.0:
-        attn_loss = _stage1_attn_loss(config, outputs, batch, device)
-    if config.stage2_aux_roi_feature_loss_weight > 0.0:
-        roi_loss = _stage1_roi_feature_loss(config, model, outputs, batch, device)
-
-    total = (
-        config.stage2_aux_grounding_weight
-        * (
-            config.stage2_aux_attn_loss_weight * attn_loss
-            + config.stage2_aux_roi_feature_loss_weight * roi_loss
-        )
-    )
-    return total, attn_loss, roi_loss
+def _stage2_aux_grounding_loss(config, model, outputs, batch, device, global_step):
+    """Weak Stage-2 bbox grounding regularizer on RefCOCO auxiliary batches."""
+    loss = _stage1_grounding_loss(config, model, outputs, batch, device, global_step)
+    return config.stage2_aux_grounding_weight * loss
 
 
 def _compute_grad_norm(model) -> float:
@@ -1620,10 +1495,8 @@ def run_training(config: ReInspectionConfig) -> None:
         "dataset/num_workers": num_workers,
     }, step=0)
 
-    use_attn = is_stage1 and config.stage1_use_attn_loss
     use_grounding = is_stage1 and config.stage1_use_grounding_loss
     use_qt_infonce = is_stage1 and config.stage1_use_query_text_infonce
-    use_roi_feat = is_stage1 and config.stage1_use_roi_feature_loss
     # Stage 1 is pure grounding by default — disable LM CE / NTP unless asked.
     use_lm_ce = (not is_stage1) or config.stage1_use_lm_ce
 
@@ -1644,14 +1517,10 @@ def run_training(config: ReInspectionConfig) -> None:
         _early_exit_via_max_steps = False
         epoch_loss = 0.0
         epoch_ce = 0.0
-        epoch_attn = 0.0
         epoch_grounding = 0.0
         epoch_qt_infonce = 0.0
-        epoch_roi_feat = 0.0
         epoch_stage1_supervision = 0.0
         epoch_stage2_aux_grounding = 0.0
-        epoch_stage2_aux_attn = 0.0
-        epoch_stage2_aux_roi = 0.0
 
         tqdm_cls = get_tqdm(config, cloud=is_main_process())
         pbar = tqdm_cls(
@@ -1693,26 +1562,16 @@ def run_training(config: ReInspectionConfig) -> None:
                     raise RuntimeError("Model did not return a loss. Check dataset labels.")
                 ce_loss = torch.zeros((), device=device)
 
-            attn_loss = torch.zeros((), device=device)
             grounding_loss = torch.zeros((), device=device)
             qt_infonce_loss = torch.zeros((), device=device)
-            roi_feat_loss = torch.zeros((), device=device)
             stage2_aux_grounding_loss = torch.zeros((), device=device)
-            stage2_aux_attn_loss = torch.zeros((), device=device)
-            stage2_aux_roi_loss = torch.zeros((), device=device)
-            if use_attn:
-                attn_loss = _stage1_attn_loss(config, outputs, batch, device)
             if use_grounding:
                 grounding_loss = _stage1_grounding_loss(config, model, outputs, batch, device, global_step)
             if use_qt_infonce:
                 qt_infonce_loss = _stage1_query_text_infonce_loss(config, outputs, device)
-            if use_roi_feat:
-                roi_feat_loss = _stage1_roi_feature_loss(config, model, outputs, batch, device)
 
             main_loss = (ce_loss if use_lm_ce else torch.zeros((), device=device)) \
-                + (config.stage1_attn_loss_weight * attn_loss if use_attn else 0.0) \
                 + (config.stage1_grounding_loss_weight * grounding_loss if use_grounding else 0.0) \
-                + (config.stage1_roi_feature_loss_weight * roi_feat_loss if use_roi_feat else 0.0) \
                 + (
                     config.stage1_query_text_infonce_weight * qt_infonce_loss
                     if use_qt_infonce
@@ -1727,9 +1586,8 @@ def run_training(config: ReInspectionConfig) -> None:
                 if is_main_process():
                     tqdm_stdlib.write(
                         f"[WARNING] Non-finite loss={main_loss.item():.4f} "
-                        f"(ce={ce_loss.item():.4f}, attn={attn_loss.item():.4f}, "
+                        f"(ce={ce_loss.item():.4f}, "
                         f"grounding={grounding_loss.item():.4f}, "
-                        f"roi={roi_feat_loss.item():.4f}, "
                         f"qt_infonce={qt_infonce_loss.item():.4f}) "
                         f"at global_step={global_step}, skipping batch"
                     )
@@ -1741,10 +1599,8 @@ def run_training(config: ReInspectionConfig) -> None:
             # auxiliary grounding graph; otherwise aux steps hold both graphs.
             loss = loss.detach()
             ce_loss = ce_loss.detach()
-            attn_loss = attn_loss.detach()
             grounding_loss = grounding_loss.detach()
             qt_infonce_loss = qt_infonce_loss.detach()
-            roi_feat_loss = roi_feat_loss.detach()
             del outputs, main_loss
 
             if (
@@ -1763,14 +1619,11 @@ def run_training(config: ReInspectionConfig) -> None:
                         backend,
                         is_stage1=False,
                         use_lm_ce=False,
-                        return_attn_maps=True,
                     )
                 )
-                (
-                    stage2_aux_grounding_loss,
-                    stage2_aux_attn_loss,
-                    stage2_aux_roi_loss,
-                ) = _stage2_aux_grounding_loss(config, model, aux_outputs, aux_batch, device)
+                stage2_aux_grounding_loss = _stage2_aux_grounding_loss(
+                    config, model, aux_outputs, aux_batch, device, global_step,
+                )
                 aux_finite = torch.tensor(float(torch.isfinite(stage2_aux_grounding_loss)), device=device)
                 if dist.is_initialized():
                     dist.all_reduce(aux_finite, op=dist.ReduceOp.MIN)
@@ -1782,8 +1635,6 @@ def run_training(config: ReInspectionConfig) -> None:
                             f"at global_step={global_step}, skipping aux gradients"
                         )
                     stage2_aux_grounding_loss = torch.zeros((), device=device)
-                    stage2_aux_attn_loss = torch.zeros((), device=device)
-                    stage2_aux_roi_loss = torch.zeros((), device=device)
                 else:
                     ds_engine.backward(stage2_aux_grounding_loss / grad_accum)
                     loss = loss + stage2_aux_grounding_loss.detach()
@@ -1810,13 +1661,9 @@ def run_training(config: ReInspectionConfig) -> None:
 
             epoch_loss += loss.item()
             epoch_ce += ce_loss.item()
-            epoch_attn += attn_loss.item()
             epoch_grounding += grounding_loss.item()
             epoch_qt_infonce += qt_infonce_loss.item()
-            epoch_roi_feat += roi_feat_loss.item()
             epoch_stage2_aux_grounding += stage2_aux_grounding_loss.item()
-            epoch_stage2_aux_attn += stage2_aux_attn_loss.item()
-            epoch_stage2_aux_roi += stage2_aux_roi_loss.item()
             global_step += 1
 
             lr = scheduler.get_last_lr()[0] if update_step > 0 else optimizer.param_groups[0]["lr"]
@@ -1826,28 +1673,18 @@ def run_training(config: ReInspectionConfig) -> None:
                 f"{pfx}/train/lr": lr,
                 f"{pfx}/train/update_step": update_step,
             }
-            if use_attn:
-                metrics[f"{pfx}/train/attn_loss"] = attn_loss.item()
             if use_grounding:
                 metrics[f"{pfx}/train/grounding_loss"] = grounding_loss.item()
             if use_qt_infonce:
                 metrics[f"{pfx}/train/query_text_infonce_loss"] = qt_infonce_loss.item()
-            if use_roi_feat:
-                metrics[f"{pfx}/train/roi_feature_loss"] = roi_feat_loss.item()
             if use_stage2_aux_grounding:
                 metrics[f"{pfx}/train/stage2_aux_grounding_loss"] = stage2_aux_grounding_loss.item()
-                metrics[f"{pfx}/train/stage2_aux_attn_loss"] = stage2_aux_attn_loss.item()
-                metrics[f"{pfx}/train/stage2_aux_roi_feature_loss"] = stage2_aux_roi_loss.item()
-            if is_stage1 and (use_attn or use_grounding or use_qt_infonce or use_roi_feat):
+            if is_stage1 and (use_grounding or use_qt_infonce):
                 stage1_sup = 0.0
-                if use_attn:
-                    stage1_sup += config.stage1_attn_loss_weight * attn_loss.item()
                 if use_grounding:
                     stage1_sup += config.stage1_grounding_loss_weight * grounding_loss.item()
                 if use_qt_infonce:
                     stage1_sup += config.stage1_query_text_infonce_weight * qt_infonce_loss.item()
-                if use_roi_feat:
-                    stage1_sup += config.stage1_roi_feature_loss_weight * roi_feat_loss.item()
                 metrics[f"{pfx}/train/stage1_supervision_loss"] = stage1_sup
                 epoch_stage1_supervision += stage1_sup
 
@@ -1878,12 +1715,8 @@ def run_training(config: ReInspectionConfig) -> None:
             postfix: dict = {"loss": f"{loss.item():.4f}", "lr": f"{lr:.2e}"}
             if use_lm_ce:
                 postfix["ce"] = f"{ce_loss.item():.4f}"
-            if use_attn:
-                postfix["attn"] = f"{attn_loss.item():.4f}"
             if use_grounding:
                 postfix["gnd"] = f"{grounding_loss.item():.4f}"
-            if use_roi_feat:
-                postfix["roi"] = f"{roi_feat_loss.item():.4f}"
             if use_stage2_aux_grounding:
                 postfix["s2_aux"] = f"{stage2_aux_grounding_loss.item():.4f}"
             if use_qt_infonce:
@@ -1929,29 +1762,19 @@ def run_training(config: ReInspectionConfig) -> None:
             f"{pfx}/epoch/ce_loss": epoch_ce / num_steps,
             f"{pfx}/epoch/epoch": epoch + 1,
         }
-        if use_attn:
-            summary[f"{pfx}/epoch/attn_loss"] = epoch_attn / num_steps
         if use_grounding:
             summary[f"{pfx}/epoch/grounding_loss"] = epoch_grounding / num_steps
         if use_qt_infonce:
             summary[f"{pfx}/epoch/query_text_infonce_loss"] = epoch_qt_infonce / num_steps
-        if use_roi_feat:
-            summary[f"{pfx}/epoch/roi_feature_loss"] = epoch_roi_feat / num_steps
         if use_stage2_aux_grounding:
             summary[f"{pfx}/epoch/stage2_aux_grounding_loss"] = epoch_stage2_aux_grounding / num_steps
-            summary[f"{pfx}/epoch/stage2_aux_attn_loss"] = epoch_stage2_aux_attn / num_steps
-            summary[f"{pfx}/epoch/stage2_aux_roi_feature_loss"] = epoch_stage2_aux_roi / num_steps
-        if is_stage1 and (use_attn or use_grounding or use_qt_infonce or use_roi_feat):
+        if is_stage1 and (use_grounding or use_qt_infonce):
             summary[f"{pfx}/epoch/stage1_supervision_loss"] = epoch_stage1_supervision / num_steps
         _log_wandb(summary, global_step)
 
         aux_msg = ""
-        if use_attn:
-            aux_msg += f" attn={epoch_attn / num_steps:.4f}"
         if use_grounding:
             aux_msg += f" ground={epoch_grounding / num_steps:.4f}"
-        if use_roi_feat:
-            aux_msg += f" roi={epoch_roi_feat / num_steps:.4f}"
         if use_stage2_aux_grounding:
             aux_msg += f" s2_aux={epoch_stage2_aux_grounding / num_steps:.4f}"
         if use_qt_infonce:
@@ -1973,7 +1796,7 @@ def run_training(config: ReInspectionConfig) -> None:
                 )
             val_metrics = _run_validation(
                 ds_engine, val_loader, backend, is_stage1,
-                use_attn, use_grounding, use_qt_infonce, use_roi_feat, use_lm_ce,
+                use_grounding, use_qt_infonce, use_lm_ce,
                 config, device,
             )
             val_loss = val_metrics["loss"]
@@ -1983,24 +1806,16 @@ def run_training(config: ReInspectionConfig) -> None:
                 f"{pfx}/val/epoch": epoch + 1,
                 f"{pfx}/val/num_batches": val_metrics["num_batches"],
             }
-            if use_attn:
-                val_summary[f"{pfx}/val/attn_loss"] = val_metrics["attn_loss"]
             if use_grounding:
                 val_summary[f"{pfx}/val/grounding_loss"] = val_metrics["grounding_loss"]
             if use_qt_infonce:
                 val_summary[f"{pfx}/val/query_text_infonce_loss"] = val_metrics["query_text_infonce_loss"]
-            if use_roi_feat:
-                val_summary[f"{pfx}/val/roi_feature_loss"] = val_metrics["roi_feature_loss"]
-            if is_stage1 and (use_attn or use_grounding or use_qt_infonce or use_roi_feat):
+            if is_stage1 and (use_grounding or use_qt_infonce):
                 sup = 0.0
-                if use_attn:
-                    sup += config.stage1_attn_loss_weight * val_metrics["attn_loss"]
                 if use_grounding:
                     sup += config.stage1_grounding_loss_weight * val_metrics["grounding_loss"]
                 if use_qt_infonce:
                     sup += config.stage1_query_text_infonce_weight * val_metrics["query_text_infonce_loss"]
-                if use_roi_feat:
-                    sup += config.stage1_roi_feature_loss_weight * val_metrics["roi_feature_loss"]
                 val_summary[f"{pfx}/val/stage1_supervision_loss"] = sup
             _log_wandb(val_summary, global_step)
             if is_main_process():

@@ -17,10 +17,8 @@ wandb_gradient_log_interval: 100
 num_workers: 8
 dataloader_prefetch_factor: 4
 
-# Weak auxiliary grounding stream — keeps R-token ROI behavior alive during NTP.
+# Weak auxiliary bbox-grounding stream during Stage-2 NTP.
 stage2_train_reinspection: true
 stage2_aux_grounding_weight: 0.05
-stage2_aux_attn_loss_weight: 1.0
-stage2_aux_roi_feature_loss_weight: 0.2
 stage2_aux_every_n_steps: 4
 stage2_aux_batch_size: 2

@@ -19,14 +19,10 @@ stage1_epochs: 5
 stage1_batch_size: 8
 stage1_grad_accum: 16
 stage1_warmup_ratio: 0.03
-stage1_use_attn_loss: false
-stage1_attn_loss_weight: 0.5
-stage1_attn_loss_type: kl
 stage1_use_grounding_loss: true
 stage1_grounding_loss_weight: 1.0
 stage1_grounding_l1_weight: 5.0
 stage1_grounding_giou_weight: 2.0
-stage1_use_roi_feature_loss: false
 stage1_use_query_text_infonce: false
 stage1_query_text_infonce_weight: 0.1
 stage1_query_text_infonce_temperature: 0.07
