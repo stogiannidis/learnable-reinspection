@@ -11,24 +11,46 @@ import torch.nn as nn
 
 
 class BboxHead(nn.Module):
-    """Three-layer MLP mapping mean-pooled bottleneck states to ``[x1,y1,x2,y2]``."""
+    """Head mapping mean-pooled bottleneck states to ``[x1,y1,x2,y2]``.
 
-    def __init__(self, d_r: int, dtype: Optional[torch.dtype] = None):
-        """Create the MLP and Sigmoid output squashing coordinates to ``[0, 1]``.
+    ``head_type="mlp"`` is a three-layer GELU MLP; ``head_type="linear"`` is a
+    single Linear+Sigmoid probe, which pushes all localization capacity into
+    the re-inspection module (box must be linearly decodable from queries).
+    """
+
+    def __init__(
+        self,
+        d_r: int,
+        dtype: Optional[torch.dtype] = None,
+        head_type: str = "mlp",
+    ):
+        """Create the head and Sigmoid output squashing coordinates to ``[0, 1]``.
 
         Args:
             d_r: Bottleneck dimension ``R_r`` (matches re-inspection width).
             dtype: Optional module dtype for mixed precision.
+            head_type: ``"mlp"`` or ``"linear"``.
+
+        Raises:
+            ValueError: If ``head_type`` is not recognized.
         """
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(d_r, d_r, dtype=dtype),
-            nn.GELU(),
-            nn.Linear(d_r, d_r, dtype=dtype),
-            nn.GELU(),
-            nn.Linear(d_r, 4, dtype=dtype),
-            nn.Sigmoid(),
-        )
+        if head_type == "mlp":
+            self.mlp = nn.Sequential(
+                nn.Linear(d_r, d_r, dtype=dtype),
+                nn.GELU(),
+                nn.Linear(d_r, d_r, dtype=dtype),
+                nn.GELU(),
+                nn.Linear(d_r, 4, dtype=dtype),
+                nn.Sigmoid(),
+            )
+        elif head_type == "linear":
+            self.mlp = nn.Sequential(
+                nn.Linear(d_r, 4, dtype=dtype),
+                nn.Sigmoid(),
+            )
+        else:
+            raise ValueError(f"head_type must be 'mlp' or 'linear', got {head_type!r}")
         self._init_weights()
 
     def _init_weights(self):

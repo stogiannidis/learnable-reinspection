@@ -1,0 +1,50 @@
+# CPU-only probe: does the per-token image attention have a first-patch sink
+# (the "always bright top-left corner") in the R-token panels? Runs
+# scripts/analysis/r_token_sink_probe.py over the three CoT capture runs
+# (bbox_linear e1 + s2_internvl e1 = 64 queries, nq256 e4 = 256 queries).
+# Pure numpy over maps.npz — no GPU, no model. Launch with `kubectl create -f`.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-sink-probe-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-sink-probe
+    spec:
+      containers:
+      - name: reinspection-sink-probe
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+            export PYTHONDONTWRITEBYTECODE=1
+            find scripts -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+            python scripts/analysis/r_token_sink_probe.py \
+              outputs/token_attn/bbox_linear_e1_cot_1024 \
+              outputs/token_attn/s2_internvl_e1_cot_1024 \
+              outputs/token_attn/nq256_e4_cot_1024
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+        resources:
+          requests: { cpu: 4, memory: "16Gi" }
+          limits:   { cpu: 4, memory: "16Gi" }
+        volumeMounts:
+          - { mountPath: /data, name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }

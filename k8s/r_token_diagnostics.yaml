@@ -1,0 +1,117 @@
+# R-token diagnostic: compare bbox decodability before vs after W_up and measure
+# whether supervised answer tokens attend to the inserted R block. Runs over
+# RefCOCO validation samples for the production Stage-2 notile checkpoint.
+# Launch with `kubectl create -f k8s/r_token_diagnostics.yaml`.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-r-token-diag-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 172800
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-r-token-diag
+    spec:
+      containers:
+      - name: reinspection-r-token-diag
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            mkdir -p logs outputs/r_token_diagnostics
+            export OMP_NUM_THREADS=4
+            export HYDRA_FULL_ERROR=1
+            export HF_HOME=/data/Huggingface
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+            export WANDB_MODE=offline
+            export PYTHONDONTWRITEBYTECODE=1
+            export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+            # Stale .pyc on NFS can mask freshly-added diagnostics across pods.
+            find src scripts tests -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+            python -c "import torch, transformers; print('torch', torch.__version__, 'transformers', transformers.__version__, 'cuda', torch.cuda.is_available())"
+
+            # CPU sanity check of diagnostic metric math (fast, fail early).
+            python -m pytest tests/test_r_token_diagnostics.py -q
+
+            CKPT=models/internvl3/s2_internvl_notile/stage2/epoch_4
+            STAGE1=models/internvl3/stage1/epoch_4/reinspection_module.pt
+            OUT=outputs/r_token_diagnostics/s2_notile_e4_refcoco_val.json
+
+            python scripts/analysis/r_token_diagnostics.py \
+              --backend internvl3 \
+              --checkpoint_dir "${CKPT}" \
+              --lora_checkpoint_dir "${CKPT}" \
+              --stage1_checkpoint "${STAGE1}" \
+              --split val \
+              --dataset_names refcoco,refcoco+,refcocog \
+              --max_samples 256 \
+              --batch_size 1 \
+              --decoder_attention_samples 16 \
+              --output_file "${OUT}" \
+              2>&1 | tee logs/r_token_diagnostics_s2_notile_e4.log
+
+            python - <<'PY'
+            import json
+            p = "outputs/r_token_diagnostics/s2_notile_e4_refcoco_val.json"
+            with open(p, encoding="utf-8") as f:
+                r = json.load(f)
+            print("==== R-token diagnostic summary ====")
+            for name, metrics in r["bbox_linear_probe"].items():
+                test = metrics.get("test", {})
+                print(
+                    f"{name}: "
+                    f"IoU={test.get('iou_mean', float('nan')):.4f} "
+                    f"IoU@0.5={test.get('iou_at_0_5', float('nan')):.4f} "
+                    f"L1={test.get('l1', float('nan')):.4f}"
+                )
+            head = r.get("trained_bbox_head_on_bottleneck")
+            if head:
+                print(
+                    "trained_bbox_head_on_bottleneck: "
+                    f"IoU={head.get('iou_mean', float('nan')):.4f} "
+                    f"IoU@0.5={head.get('iou_at_0_5', float('nan')):.4f} "
+                    f"L1={head.get('l1', float('nan')):.4f}"
+                )
+            attn = r.get("answer_attention_to_r", {})
+            if "all_layers_mean" in attn:
+                print(
+                    "answer_attention_to_r: "
+                    f"all_layers={attn['all_layers_mean']:.4f} "
+                    f"last={attn['last_layer']:.4f}"
+                )
+            emb = r.get("r_token_embedding", {})
+            ratio = emb.get("per_sample_r_median_over_text_median_norm", {})
+            if "median" in ratio:
+                print(f"R/text norm ratio median={ratio['median']:.4f} p90={ratio['p90']:.4f}")
+            PY
+
+            test -f "${OUT}" && echo "R TOKEN DIAGNOSTIC SUCCESS" || { echo "R TOKEN DIAGNOSTIC FAILED"; exit 1; }
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+        resources:
+          requests: { cpu: 16, memory: "80Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 16, memory: "80Gi", nvidia.com/gpu: 1 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "32Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3

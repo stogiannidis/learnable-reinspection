@@ -1,0 +1,60 @@
+# Stage-2 run (Visual-CoT mix), InternVL3 64 queries, Stage-2 ONLY from the
+# bbox_linear Stage-1 epoch_5 checkpoint (Linear+Sigmoid grounding probe
+# instead of the 3-layer MLP in Stage-1; the head itself is not used here).
+# Pod shape and DeepSpeed/grad-accum knobs copied from k8s/stage2_fullrun.yaml
+# (bs=8 + GC on, z2, grad_accum=11 -> effective batch 528, 384Gi for the
+# per-rank host-memory growth over one epoch).
+# Checkpoints: models/internvl3/bbox_linear/stage2/epoch_*/
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-s2-bboxlinear-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 172800
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-s2-bboxlinear
+    spec:
+      containers:
+      - name: reinspection-s2-bboxlinear
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            # Avoid stale NFS bytecode masking freshly-added symbols.
+            find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+            mkdir -p logs models
+            export TRITON_CACHE_DIR=/tmp/triton_cache
+            REINSPECTION_EXPERIMENT_STAGE2=s2_internvl_bboxlinear \
+            STAGE1_CHECKPOINT=models/internvl3/bbox_linear/stage1/epoch_5/reinspection_module.pt \
+              bash src/scripts/run_train_stage2.sh \
+                deepspeed_config=src/configs/deepspeed_z2.json \
+                stage2_grad_accum=11
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+        resources:
+          requests: { cpu: 72, memory: "384Gi", nvidia.com/gpu: 6 }
+          limits:   { cpu: 72, memory: "384Gi", nvidia.com/gpu: 6 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "72Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3

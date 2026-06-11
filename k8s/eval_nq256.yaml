@@ -1,0 +1,80 @@
+# Benchmark eval for the nq256 Stage-2 checkpoint, epoch_4
+# (models/internvl3/nq256/stage2/epoch_4) — the 256-query re-inspection variant.
+# CRITICAL: n_queries=256 so the reinspection module is built at the trained
+# size (default 64 would crash load_state_dict on shape mismatch).
+# Matches the comparable 64-query baseline exactly:
+#   outputs/internvl3/s2_internvl_notile_1024/eval_stage2_epoch4_compare.json
+# i.e. same 11 benchmarks, 3 conditions (frozen/lora_only/reinspection), eval
+# CoT protocol, 1024-token decode, batched (bs=64), tiling OFF (default, matches
+# nq256's post-2026-06-04 training). checkpoint_dir AND lora_checkpoint_dir both
+# point at the nq256 epoch_4 dir (the RI module is loaded from lora_checkpoint_dir
+# first — pairing it with a different LoRA collapses the model).
+# Launch with `kubectl create -f` (generateName).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-eval-nq256-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-eval-nq256
+    spec:
+      containers:
+      - name: reinspection-eval-nq256
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            mkdir -p logs outputs/internvl3/nq256
+            export OMP_NUM_THREADS=4
+            export HYDRA_FULL_ERROR=1
+            export HF_HOME=/data/Huggingface
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+            export WANDB_MODE=offline
+            export PYTHONDONTWRITEBYTECODE=1
+
+            find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+            bash src/scripts/run_eval.sh \
+              checkpoint_dir=models/internvl3/nq256/stage2/epoch_4 \
+              lora_checkpoint_dir=models/internvl3/nq256/stage2/epoch_4 \
+              n_queries=256 \
+              benchmarks='[3dsrbench,blink,cv_bench,gqa_spatial,mindcube,mmvp,realworldqa,srbench,vsr_zeroshot,vstar_bench,whatsup]' \
+              eval_condition=reinspection \
+              eval_compare=true \
+              eval_cot_enabled=true \
+              eval_max_new_tokens=1024 \
+              eval_batch_size=64 \
+              pbar_enabled=true \
+              output_file=outputs/internvl3/nq256/eval_stage2_epoch4_compare.json \
+              2>&1 | tee logs/eval_nq256_stage2_epoch4.log
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+          - { name: PBAR_API_KEY,  valueFrom: { secretKeyRef: { name: reinspection-secrets, key: PBAR_API_KEY, optional: true } } }
+        resources:
+          requests: { cpu: 64, memory: "64Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 64, memory: "64Gi", nvidia.com/gpu: 1 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "32Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3

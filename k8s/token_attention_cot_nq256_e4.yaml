@@ -1,0 +1,115 @@
+# Per-token attention captures under the EVAL CoT PROTOCOL for the nq256
+# Stage-2 checkpoint, epoch_4 (models/internvl3/nq256/stage2/epoch_4) — the
+# 256-query re-inspection variant (vs the default 64). Same protocol as the
+# earlier captures: dataset VSR question + eval CoT suffix (join "\n\n"),
+# 1024-token decode budget, frozen + reinspection side by side.
+# CRITICAL: --n_queries 256 is passed so the module/config matches the trained
+# checkpoint (the learned queries are [256, d_r]; the default 64 would fail the
+# state_dict load on shape mismatch). nq256 was trained after the 2026-06-04
+# tiling-off flip, so the capture engine's forced single-tile input matches
+# training (cleaner than the tiling-ON s2_internvl captures).
+# Outputs: outputs/token_attn/nq256_e4_cot_1024/internvl3_<name>/ with static
+# figures + maps.npz + interactive.html, then an aggregate index.html gallery.
+# NOTE: the static r_tokens grid now has 256 panels (one per R query); the
+# interactive.html slider is the practical way to browse them.
+# Launch with `kubectl create -f` (generateName).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-token-attn-cot-nq256-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 36000
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-token-attn-cot-nq256
+    spec:
+      containers:
+      - name: reinspection-token-attn-cot-nq256
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            OUT=outputs/token_attn/nq256_e4_cot_1024
+            mkdir -p logs "${OUT}"
+            export OMP_NUM_THREADS=4
+            export HYDRA_FULL_ERROR=1
+            export HF_HOME=/data/Huggingface
+            export PYTHONPATH="${PWD}:/tmp/pyextra:${PYTHONPATH:-}"
+            export WANDB_MODE=offline
+            export PYTHONDONTWRITEBYTECODE=1
+
+            find src scripts -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+
+            CKPT=models/internvl3/nq256/stage2/epoch_4
+            COT="Think step by step. Then provide the final answer on a separate line starting with 'Final answer:'."
+
+            while IFS='|' read -r name img q; do
+              [ -n "${name}" ] || continue
+              echo "=== capture: ${name} ==="
+              python scripts/analysis/visualize_token_attention.py \
+                --backend internvl3 \
+                --image "${img}" \
+                --question "${q}"$'\n\n'"${COT}" \
+                --conditions frozen,reinspection \
+                --checkpoint_dir "${CKPT}" \
+                --lora_checkpoint_dir "${CKPT}" \
+                --n_queries 256 \
+                --output_dir "${OUT}" \
+                --sample_name "${name}" \
+                --max_new_tokens 1024 \
+                --max_panels 0 \
+                2>&1 | tee "logs/token_attn_cot_nq256_${name}.log"
+            done <<'SAMPLES'
+            cat_laptop|/data/datasets/vsr/images/000000452072.jpg|Is the following statement true or false about the image? "The cat is on top of the laptop." Answer with just True or False.
+            laptop_tv|/data/datasets/vsr/images/000000407386.jpg|Is the following statement true or false about the image? "The laptop is left of the tv." Answer with just True or False.
+            oven_cake|/data/datasets/vsr/images/000000169660.jpg|Is the following statement true or false about the image? "The oven is above the cake." Answer with just True or False.
+            SAMPLES
+
+            # Interactive HTMLs + aggregate gallery (no pip in image -> get-pip bootstrap).
+            if ! python3 -m pip --version >/dev/null 2>&1; then
+              curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
+              python3 /tmp/get-pip.py -q --target /tmp/pip-boot
+              export PYTHONPATH="/tmp/pip-boot:${PYTHONPATH}"
+            fi
+            python3 -m pip install -q --target /tmp/pyextra plotly
+            for npz in "${OUT}"/*/maps.npz; do
+              python3 scripts/analysis/interactive_token_attention.py --run_dir "${npz}" \
+                || echo "FAILED interactive html ${npz} (continuing)"
+            done
+            python3 scripts/analysis/build_token_attention_html.py \
+              --runs_dir "${OUT}" \
+              --gallery_title "Token attention — nq256 Stage-2 epoch_4 (256 queries, CoT, 1024-tok)" \
+              || echo "FAILED gallery index.html (continuing)"
+
+            echo "==== outputs ===="
+            ls -R "${OUT}" 2>/dev/null | head -80
+            n=$(ls -d "${OUT}"/internvl3_* 2>/dev/null | wc -l)
+            test "${n}" -ge 1 && echo "CAPTURE SUCCESS (${n} runs)" || { echo "CAPTURE FAILED"; exit 1; }
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+        resources:
+          requests: { cpu: 16, memory: "64Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 16, memory: "64Gi", nvidia.com/gpu: 1 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "32Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3

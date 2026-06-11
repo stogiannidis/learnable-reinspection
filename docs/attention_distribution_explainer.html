@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Each query = one full distribution over the image patches</title>
+<style>
+  :root {
+    --ink: #1e293b; --muted: #64748b; --line: #e2e8f0;
+    --accent: #dc2626; --target: #059669;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink); background: #f8fafc; margin: 0; padding: 28px 36px 60px;
+  }
+  h1 { font-size: 22px; margin: 0 0 6px; }
+  .sub { color: var(--muted); font-size: 14px; max-width: 880px; margin-bottom: 22px; }
+  .pipeline {
+    display: flex; align-items: stretch; gap: 10px; margin: 18px 0 26px; flex-wrap: wrap;
+  }
+  .step {
+    background: #fff; border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px 16px; font-size: 13px; max-width: 270px; line-height: 1.45;
+  }
+  .step b { display: block; margin-bottom: 4px; font-size: 13px; }
+  .arrow { align-self: center; color: var(--muted); font-size: 20px; }
+  .controls { margin: 0 0 16px; font-size: 14px; }
+  .controls button {
+    font: inherit; padding: 6px 14px; margin-right: 8px; border-radius: 8px;
+    border: 1px solid var(--line); background: #fff; cursor: pointer;
+  }
+  .controls button.active { background: var(--ink); color: #fff; border-color: var(--ink); }
+  .controls .hint { color: var(--muted); font-size: 13px; margin-left: 6px; }
+  .main { display: flex; gap: 34px; align-items: flex-start; flex-wrap: wrap; }
+  .panel {
+    background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px;
+  }
+  .panel h2 { font-size: 15px; margin: 0 0 12px; }
+  .panel .cap { color: var(--muted); font-size: 12.5px; margin-top: 10px; max-width: 430px; line-height: 1.5; }
+  /* image grid */
+  #gridwrap { position: relative; width: 430px; }
+  #grid { display: grid; gap: 1px; width: 100%; aspect-ratio: 4 / 3; }
+  .patch {
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; font-family: ui-monospace, Menlo, monospace; border-radius: 2px;
+    overflow: hidden; white-space: nowrap;
+  }
+  #bbox {
+    position: absolute; border: 2.5px dashed var(--target); border-radius: 4px;
+    pointer-events: none;
+  }
+  #bboxlabel {
+    position: absolute; font-size: 11px; color: var(--target); font-weight: 600;
+    background: rgba(255,255,255,.85); padding: 1px 5px; border-radius: 4px; pointer-events: none;
+  }
+  /* matrix */
+  .rowline { display: flex; align-items: center; gap: 10px; margin-bottom: 7px; cursor: pointer; }
+  .rowline .qname {
+    width: 34px; font-family: ui-monospace, Menlo, monospace; font-size: 13px; text-align: right;
+  }
+  .rowline .cells {
+    display: flex; height: 30px; flex: 0 0 560px; border-radius: 4px; overflow: hidden;
+    border: 2px solid transparent;
+  }
+  .rowline.selected .cells { border-color: var(--ink); }
+  .rowline .cells div { height: 100%; }
+  .badge {
+    font-family: ui-monospace, Menlo, monospace; font-size: 12px; padding: 2px 8px;
+    border-radius: 6px; background: #f1f5f9; color: var(--ink); white-space: nowrap;
+  }
+  .badge.kl-low  { background: #dcfce7; color: #166534; }
+  .badge.kl-mid  { background: #fef3c7; color: #92400e; }
+  .badge.kl-high { background: #fee2e2; color: #991b1b; }
+  .rowline.target-row { cursor: default; margin-top: 14px; }
+  .rowline.target-row .qname { color: var(--target); font-weight: 700; width: 60px; }
+  .divider { border: 0; border-top: 1px dashed var(--line); margin: 14px 0 12px; }
+  .note {
+    margin-top: 26px; font-size: 13px; color: var(--muted); max-width: 880px; line-height: 1.55;
+    background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 14px 18px;
+  }
+  code { background: #f1f5f9; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+
+<h1>Each query is one full probability distribution over <em>all</em> the image patches</h1>
+<div class="sub">
+  Toy version of the re-inspection cross-attention: <b>Q = 6 queries</b> (real model: 64) attending over
+  <b>V image patches</b> (real model: ~1000+). The 6 and the V never have to match — the softmax runs
+  <em>across the patches</em>, so every query gets its own row that sums to 1, whatever V is.
+  Click a row to project it onto the image. Change V and watch nothing break.
+</div>
+
+<div class="pipeline">
+  <div class="step"><b>1 &nbsp;Dot products</b>
+    One query vector &middot; every patch's key vector &rarr; <b>V raw scores</b> (one per patch).</div>
+  <div class="arrow">&rarr;</div>
+  <div class="step"><b>2 &nbsp;Softmax across the V patches</b>
+    The V scores become V positive numbers that <b>sum to 1</b> — a "where am I looking?" map.</div>
+  <div class="arrow">&rarr;</div>
+  <div class="step"><b>3 &nbsp;Repeat for every query</b>
+    64 different query vectors &rarr; 64 independent rows. Stacked: the <b>(Q &times; V)</b> attention matrix.</div>
+  <div class="arrow">&rarr;</div>
+  <div class="step"><b>4 &nbsp;KL, row by row</b>
+    Each row (over V) is compared to the bbox target (also over V). Same support &rarr; KL is well-defined.</div>
+</div>
+
+<div class="controls">
+  <b>V =</b>
+  <button data-g="0">12 &nbsp;(4&times;3)</button>
+  <button data-g="1" class="active">48 &nbsp;(8&times;6)</button>
+  <button data-g="2">192 &nbsp;(16&times;12)</button>
+  <span class="hint">&larr; more image tokens than queries? Rows just get longer; each still sums to 1.</span>
+</div>
+
+<div class="main">
+  <div class="panel">
+    <h2 id="gridtitle">Selected query's row, painted onto the image</h2>
+    <div id="gridwrap">
+      <div id="grid"></div>
+      <div id="bbox"></div>
+      <div id="bboxlabel">ground-truth bbox ("the red mug")</div>
+    </div>
+    <div class="cap">
+      Darker red = more of this query's attention. The dashed green box is the RefCOCO target region.
+      Numbers are the row's probabilities — they always total <b>1.00</b>, whether there are 12 patches or 192.
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>The attention matrix — one row per query, V cells per row</h2>
+    <div id="matrix"></div>
+    <hr class="divider">
+    <div id="targetrow"></div>
+    <div class="cap">
+      <b>&Sigma;</b> = the row's actual sum (always 1.000). <b>KL</b> = KL(target &Verbar; row): small when the
+      query's attention sits inside the box (q1&ndash;q3), large when it looks elsewhere (q4) or is diffuse (q5).
+      Note the KL never involves "64 vs V" — it compares two length-V rows.
+    </div>
+  </div>
+</div>
+
+<div class="note">
+  <b>Where this lives in the real code:</b> <code>src/model/reinspection_module.py:97</code> does
+  <code>softmax(scores, dim=-1)</code> — the last dim is the V image tokens — giving
+  <code>(B, H, Q, V)</code>, head-averaged to <code>(B, Q, V)</code> at line 227.
+  <code>src/model/attn_loss.py</code> then re-normalizes each row and the bbox target over that same V axis
+  and takes KL(target &Verbar; row) per query. <br><br>
+  <b>And the catch we discussed:</b> the current loss gives the <em>same</em> target to every supervised query —
+  in this toy, q1, q2 and q3 would all be pulled toward the green target row until they look identical.
+  That's why "each query learns its own corresponding token" needs a different loss design
+  (coverage-of-the-average, matching, or transport), not a different KL formula.
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var GRIDS = [
+    { cols: 4,  rows: 3  },
+    { cols: 8,  rows: 6  },
+    { cols: 16, rows: 12 }
+  ];
+  // bbox in normalized [0,1]^2 image coordinates (x0, y0, x1, y1)
+  var BBOX = { x0: 0.55, y0: 0.25, x1: 0.95, y1: 0.70 };
+  // toy queries: a preferred image location (cx, cy) + sharpness s.
+  // q1-q3, q6 look inside the box; q4 looks elsewhere; q5 is diffuse.
+  var QUERIES = [
+    { name: "q1", cx: 0.62, cy: 0.32, s: 60 },
+    { name: "q2", cx: 0.86, cy: 0.46, s: 60 },
+    { name: "q3", cx: 0.70, cy: 0.62, s: 40 },
+    { name: "q4", cx: 0.18, cy: 0.80, s: 50 },
+    { name: "q5", cx: 0.50, cy: 0.50, s: 6  },
+    { name: "q6", cx: 0.76, cy: 0.38, s: 25 }
+  ];
+  var EPS = 1e-8;
+
+  var state = { g: 1, sel: 0 };
+
+  function centers(grid) {
+    var out = [];
+    for (var r = 0; r < grid.rows; r++)
+      for (var c = 0; c < grid.cols; c++)
+        out.push({ x: (c + 0.5) / grid.cols, y: (r + 0.5) / grid.rows });
+    return out;
+  }
+
+  function softmaxRow(q, cs) {
+    var scores = cs.map(function (p) {
+      var dx = p.x - q.cx, dy = p.y - q.cy;
+      return -q.s * (dx * dx + dy * dy);
+    });
+    var m = Math.max.apply(null, scores);
+    var ex = scores.map(function (s) { return Math.exp(s - m); });
+    var Z = ex.reduce(function (a, b) { return a + b; }, 0);
+    return ex.map(function (e) { return e / Z; });
+  }
+
+  function targetRow(cs) {
+    var raw = cs.map(function (p) {
+      return (p.x >= BBOX.x0 && p.x <= BBOX.x1 && p.y >= BBOX.y0 && p.y <= BBOX.y1) ? 1 : 0;
+    });
+    var Z = raw.reduce(function (a, b) { return a + b; }, 0) || 1;
+    return raw.map(function (v) { return v / Z; });
+  }
+
+  function kl(t, p) {
+    var s = 0;
+    for (var i = 0; i < t.length; i++) {
+      var ti = Math.max(t[i], EPS), pi = Math.max(p[i], EPS);
+      s += ti * Math.log(ti / pi);
+    }
+    return s;
+  }
+
+  function heat(v, vmax, green) {
+    var t = Math.sqrt(Math.min(1, v / (vmax || 1)));
+    var hue = green ? 145 : 35 - 27 * t;          // amber -> red, or green
+    var light = 97 - 52 * t;
+    return "hsl(" + hue + ", 88%, " + light + "%)";
+  }
+
+  function klBadgeClass(v) {
+    return v < 1 ? "kl-low" : v < 3 ? "kl-mid" : "kl-high";
+  }
+
+  function render() {
+    var grid = GRIDS[state.g];
+    var cs = centers(grid);
+    var V = cs.length;
+    var rows = QUERIES.map(function (q) { return softmaxRow(q, cs); });
+    var tgt = targetRow(cs);
+
+    // ---- image grid ----
+    var g = document.getElementById("grid");
+    g.style.gridTemplateColumns = "repeat(" + grid.cols + ", 1fr)";
+    g.innerHTML = "";
+    var row = rows[state.sel];
+    var vmax = Math.max.apply(null, row);
+    var showNums = V <= 48;
+    row.forEach(function (v, i) {
+      var d = document.createElement("div");
+      d.className = "patch";
+      d.style.background = heat(v, vmax, false);
+      d.title = "patch " + i + "  p = " + v.toFixed(4);
+      if (showNums) {
+        d.textContent = v >= 0.0005 ? v.toFixed(V <= 12 ? 3 : 2).replace(/^0/, "") : "·";
+        d.style.color = v / vmax > 0.45 ? "#fff" : "#94a3b8";
+      }
+      g.appendChild(d);
+    });
+    document.getElementById("gridtitle").textContent =
+      "Query " + QUERIES[state.sel].name + "'s row, painted onto the image  (V = " + V + ", Σ = " +
+      row.reduce(function (a, b) { return a + b; }, 0).toFixed(3) + ")";
+
+    // bbox overlay (grid has 1px gaps; close enough)
+    var wrap = document.getElementById("gridwrap");
+    var bw = wrap.clientWidth, bh = g.clientHeight || bw * 3 / 4;
+    var bb = document.getElementById("bbox");
+    bb.style.left = (BBOX.x0 * bw) + "px";
+    bb.style.top = (BBOX.y0 * bh) + "px";
+    bb.style.width = ((BBOX.x1 - BBOX.x0) * bw) + "px";
+    bb.style.height = ((BBOX.y1 - BBOX.y0) * bh) + "px";
+    var bl = document.getElementById("bboxlabel");
+    bl.style.left = (BBOX.x0 * bw) + "px";
+    bl.style.top = (BBOX.y0 * bh - 20) + "px";
+
+    // ---- matrix ----
+    var m = document.getElementById("matrix");
+    m.innerHTML = "";
+    rows.forEach(function (r, qi) {
+      var line = document.createElement("div");
+      line.className = "rowline" + (qi === state.sel ? " selected" : "");
+      line.onclick = function () { state.sel = qi; render(); };
+
+      var name = document.createElement("div");
+      name.className = "qname";
+      name.textContent = QUERIES[qi].name;
+      line.appendChild(name);
+
+      var cells = document.createElement("div");
+      cells.className = "cells";
+      var rmax = Math.max.apply(null, r);
+      r.forEach(function (v, i) {
+        var c = document.createElement("div");
+        c.style.width = (100 / V) + "%";
+        c.style.background = heat(v, rmax, false);
+        c.title = QUERIES[qi].name + " → patch " + i + "  p = " + v.toFixed(4);
+        cells.appendChild(c);
+      });
+      line.appendChild(cells);
+
+      var sum = document.createElement("span");
+      sum.className = "badge";
+      sum.textContent = "Σ " + r.reduce(function (a, b) { return a + b; }, 0).toFixed(3);
+      line.appendChild(sum);
+
+      var k = kl(tgt, r);
+      var kb = document.createElement("span");
+      kb.className = "badge " + klBadgeClass(k);
+      kb.textContent = "KL " + k.toFixed(2);
+      line.appendChild(kb);
+
+      m.appendChild(line);
+    });
+
+    // ---- target row ----
+    var tr = document.getElementById("targetrow");
+    tr.innerHTML = "";
+    var line = document.createElement("div");
+    line.className = "rowline target-row";
+    var name = document.createElement("div");
+    name.className = "qname";
+    name.textContent = "target";
+    line.appendChild(name);
+    var cells = document.createElement("div");
+    cells.className = "cells";
+    var tmax = Math.max.apply(null, tgt);
+    tgt.forEach(function (v, i) {
+      var c = document.createElement("div");
+      c.style.width = (100 / V) + "%";
+      c.style.background = heat(v, tmax, true);
+      c.title = "target → patch " + i + "  t = " + v.toFixed(4);
+      cells.appendChild(c);
+    });
+    line.appendChild(cells);
+    var sum = document.createElement("span");
+    sum.className = "badge";
+    sum.textContent = "Σ " + tgt.reduce(function (a, b) { return a + b; }, 0).toFixed(3);
+    line.appendChild(sum);
+    var lbl = document.createElement("span");
+    lbl.className = "badge";
+    lbl.textContent = "bbox mask, normalized over the SAME V patches";
+    line.appendChild(lbl);
+    tr.appendChild(line);
+  }
+
+  document.querySelectorAll(".controls button").forEach(function (b) {
+    b.onclick = function () {
+      state.g = parseInt(b.dataset.g, 10);
+      document.querySelectorAll(".controls button").forEach(function (x) {
+        x.classList.toggle("active", x === b);
+      });
+      render();
+    };
+  });
+
+  window.addEventListener("resize", render);
+  render();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,85 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-query-diversity-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 172800
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-query-diversity
+    spec:
+      containers:
+      - name: reinspection-query-diversity
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            mkdir -p logs outputs/query_diversity
+            export OMP_NUM_THREADS=4
+            export HYDRA_FULL_ERROR=1
+            export HF_HOME=/data/Huggingface
+            export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+            export WANDB_MODE=offline
+            export PYTHONDONTWRITEBYTECODE=1
+
+            # Stale .pyc on NFS can mask freshly-added symbols across pods.
+            find src scripts -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+            python -c "import torch, transformers; print('torch', torch.__version__, 'transformers', transformers.__version__, 'cuda', torch.cuda.is_available())"
+
+            # CPU sanity check of the metric math (fast, fail early).
+            python scripts/analysis/query_diversity_analysis.py --selfcheck
+
+            # 1) Stage-1 module alone — where the broadcast-target attention KL
+            #    actually trained the queries (no LoRA; module from stage1).
+            python scripts/analysis/query_diversity_analysis.py \
+              --backend internvl3 \
+              --checkpoint_dir models/internvl3/stage1/epoch_5 \
+              --output_dir outputs/query_diversity/stage1_e5 \
+              --label stage1_e5 \
+              --n_samples 32 --max_scan 200 --seed 0 \
+              2>&1 | tee logs/query_diversity_stage1_e5.log
+
+            # 2) Production Stage-2 notile checkpoint — module + LoRA paired
+            #    from the SAME epoch dir (eval loader contract).
+            python scripts/analysis/query_diversity_analysis.py \
+              --backend internvl3 \
+              --checkpoint_dir models/internvl3/s2_internvl_notile/stage2/epoch_4 \
+              --lora_checkpoint_dir models/internvl3/s2_internvl_notile/stage2/epoch_4 \
+              --output_dir outputs/query_diversity/s2_notile_e4 \
+              --label s2_notile_e4 \
+              --n_samples 32 --max_scan 200 --seed 0 \
+              2>&1 | tee logs/query_diversity_s2_notile_e4.log
+
+            echo "==== outputs ===="
+            ls -R outputs/query_diversity 2>/dev/null | head -60
+            test -f outputs/query_diversity/stage1_e5/VERDICT.md \
+              && test -f outputs/query_diversity/s2_notile_e4/VERDICT.md \
+              && echo "QUERY DIVERSITY SUCCESS" || { echo "QUERY DIVERSITY FAILED"; exit 1; }
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+        resources:
+          requests: { cpu: 16, memory: "64Gi", nvidia.com/gpu: 1 }
+          limits:   { cpu: 16, memory: "64Gi", nvidia.com/gpu: 1 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "16Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3

@@ -8,13 +8,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import shutil
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 from urllib.request import urlretrieve
 
 from PIL import Image
@@ -23,6 +24,7 @@ from tqdm import tqdm
 ALL_BENCHMARKS = [
     "3dsrbench", "mindcube", "blink", "srbench", "qspatial", "embspatial",
     "realworldqa", "vsr_zeroshot", "cv_bench", "vstar_bench", "mmvp",
+    "spatial_rgpt",
 ]
 
 VSR_ZEROSHOT_COCO_DIR = "/data/datasets/coco/train2017"
@@ -54,6 +56,16 @@ def _format_mcq(question: str, choices: dict[str, Optional[str]]) -> str:
             parts.append(f"({letter}) {text}")
     parts.append("Answer with the option's letter from the given choices directly.")
     return "\n".join(parts)
+
+
+def _maybe_parse_literal(value: Any) -> Any:
+    """Parse HF parquet string columns that store Python literals."""
+    if isinstance(value, str):
+        try:
+            return ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            return value
+    return value
 
 
 # --------------------------------------------------------------------------- #
@@ -986,6 +998,95 @@ def prepare_mmvp(output_dir: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# SpatialRGPT-Bench                                                            #
+# --------------------------------------------------------------------------- #
+def prepare_spatial_rgpt(output_dir: str) -> None:
+    """Download a8cheng/SpatialRGPT-Bench and convert.
+
+    Grounded spatial reasoning over masked regions (qualitative relations and
+    quantitative measurements). HF exposes a single ``val`` split; we write
+    ``test.json`` to match the other eval benchmarks in this repo.
+    """
+    from datasets import load_dataset
+
+    print("\n=== Preparing SpatialRGPT-Bench ===")
+    bench_dir = _ensure_dir(os.path.join(output_dir, "spatial_rgpt"))
+    img_dir = _ensure_dir(os.path.join(bench_dir, "images"))
+
+    try:
+        ds_dict = load_dataset("a8cheng/SpatialRGPT-Bench")
+    except Exception as e:
+        print(f"  Could not load a8cheng/SpatialRGPT-Bench: {e}")
+        return
+
+    split_name = "val" if "val" in ds_dict else list(ds_dict.keys())[0]
+    ds = ds_dict[split_name]
+    print(f"  Loaded split={split_name} ({len(ds)} rows)")
+
+    samples = []
+    skipped = 0
+    for i, row in enumerate(tqdm(ds, desc="SpatialRGPT-Bench")):
+        sample_id = str(row.get("id", f"spatialrgpt_{i:05d}"))
+        img = row.get("image")
+        question = str(row.get("text_q", "")).strip()
+
+        conversations = _maybe_parse_literal(row.get("conversations", []))
+        answer = ""
+        if isinstance(conversations, list):
+            for turn in conversations:
+                if isinstance(turn, dict) and turn.get("from") == "gpt":
+                    answer = str(turn.get("value", "")).strip()
+
+        qa_info = _maybe_parse_literal(row.get("qa_info", {}))
+        image_info = _maybe_parse_literal(row.get("image_info", {}))
+        bbox = _maybe_parse_literal(row.get("bbox", []))
+
+        if img is None or not question or not answer:
+            skipped += 1
+            continue
+
+        image_filename = f"{sample_id}.jpg"
+        image_path = os.path.join(img_dir, image_filename)
+        if not os.path.exists(image_path):
+            if isinstance(img, Image.Image):
+                img.convert("RGB").save(image_path)
+            elif isinstance(img, str) and os.path.exists(img):
+                Image.open(img).convert("RGB").save(image_path)
+            else:
+                skipped += 1
+                continue
+
+        qa_type = qa_info.get("type", "") if isinstance(qa_info, dict) else ""
+        qa_category = qa_info.get("category", "") if isinstance(qa_info, dict) else ""
+        category = f"{qa_type}/{qa_category}".strip("/") or "spatial"
+
+        sample = {
+            "image": image_filename,
+            "question": question,
+            "answer": answer,
+            "split": "test",
+            "category": category,
+            "benchmark": "spatial_rgpt",
+            "id": sample_id,
+        }
+        if isinstance(qa_info, dict):
+            sample["qa_type"] = qa_type
+            sample["qa_category"] = qa_category
+            if qa_info.get("class"):
+                sample["classes"] = qa_info["class"]
+        if isinstance(image_info, dict):
+            sample["source_dataset"] = image_info.get("dataset", "")
+            sample["landmark"] = image_info.get("landmark", "")
+        if bbox:
+            sample["bbox"] = bbox
+
+        samples.append(sample)
+
+    print(f"  Skipped {skipped} rows (missing image/question/answer)")
+    _save_json(samples, os.path.join(bench_dir, "test.json"))
+
+
+# --------------------------------------------------------------------------- #
 # CLI                                                                          #
 # --------------------------------------------------------------------------- #
 PREPARE_FNS = {
@@ -1000,6 +1101,7 @@ PREPARE_FNS = {
     "cv_bench": prepare_cv_bench,
     "vstar_bench": prepare_vstar_bench,
     "mmvp": prepare_mmvp,
+    "spatial_rgpt": prepare_spatial_rgpt,
 }
 
 

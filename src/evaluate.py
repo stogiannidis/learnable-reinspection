@@ -106,6 +106,10 @@ BENCHMARK_CONFIGS = {
     "cv_bench": {"data_file": "cv_bench/test.json", "image_root": "cv_bench/images"},
     "vstar_bench": {"data_file": "vstar_bench/test.json", "image_root": "vstar_bench/images"},
     "mmvp": {"data_file": "mmvp/test.json", "image_root": "mmvp/images"},
+    "spatial_rgpt": {
+        "data_file": "spatial_rgpt/test.json",
+        "image_root": "spatial_rgpt/images",
+    },
 }
 
 # tqdm refresh and explicit acc line (both avoid per-instance log spam when tee'd to a file).

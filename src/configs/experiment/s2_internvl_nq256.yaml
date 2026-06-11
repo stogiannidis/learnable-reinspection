@@ -1,0 +1,16 @@
+# @package _global_
+# Stage 2 — spatial VQA. InternVL3. Default mix.
+# Same recipe as s2_internvl but with 256 re-inspection queries (vs 64),
+# starting from the nq256 Stage-1 checkpoint. n_queries must match the
+# Stage-1 module or the state_dict load fails on shape mismatch.
+# Checkpoints land under models/internvl3/nq256/stage2/ (paired with stage1).
+defaults:
+  - override /backend: internvl3
+  - override /stage: stage2
+  - override /stage2_datasets: default
+
+n_queries: 256
+
+stage1_checkpoint: models/internvl3/nq256/stage1/epoch_5/reinspection_module.pt
+wandb_run_name: internvl3-stage2-nq256
+experiment_name: nq256

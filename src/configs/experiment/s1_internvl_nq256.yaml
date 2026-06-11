@@ -1,0 +1,18 @@
+# @package _global_
+# Stage 1 — grounding. InternVL3. RefCOCO family only (stage1_datasets/refcoco).
+# Same recipe as s1_internvl but with 256 re-inspection queries (vs 64).
+# Fresh experiment_name so checkpoints land under models/internvl3/nq256/stage1/
+# and do not overwrite the 64-query run.
+defaults:
+  - override /backend: internvl3
+  - override /stage: stage1
+  - override /stage1_datasets: refcoco
+
+n_queries: 256
+
+wandb_run_name: internvl3-stage1-nq256
+experiment_name: nq256
+
+# Smaller/faster validation to avoid OOM after long training epochs.
+val_split_ratio: 0.01
+val_batch_size: 4

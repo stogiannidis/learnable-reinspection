@@ -1,0 +1,19 @@
+# @package _global_
+# Stage 1 — grounding. InternVL3. RefCOCO family only (stage1_datasets/refcoco).
+# Same recipe as s1_internvl (64 queries) but the bbox head is a single
+# Linear+Sigmoid probe instead of the 3-layer MLP, so the grounding loss
+# pressure lands entirely on the re-inspection module.
+# Fresh experiment_name so checkpoints land under models/internvl3/bbox_linear/stage1/.
+defaults:
+  - override /backend: internvl3
+  - override /stage: stage1
+  - override /stage1_datasets: refcoco
+
+stage1_bbox_head_type: linear
+
+wandb_run_name: internvl3-stage1-bboxlinear
+experiment_name: bbox_linear
+
+# Smaller/faster validation to avoid OOM after long training epochs.
+val_split_ratio: 0.01
+val_batch_size: 4

@@ -1,5 +1,5 @@
 # Full Stage-2 run (Visual-CoT), InternVL3, 6x H100, Stage-2 ONLY from the
-# existing epoch_4 Stage-1 checkpoint (no Stage-1 rerun).
+# existing epoch_5 Stage-1 checkpoint (no Stage-1 rerun).
 #
 # Config chosen from the smoke sweep:
 #   - bs=8, gradient checkpointing ON  (bs=16 was throughput-neutral; GC-off OOMs)
@@ -52,7 +52,7 @@ spec:
             find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
             mkdir -p logs models
             REINSPECTION_EXPERIMENT_STAGE2=s2_internvl \
-            STAGE1_CHECKPOINT=models/internvl3/stage1/epoch_4/reinspection_module.pt \
+            STAGE1_CHECKPOINT=models/internvl3/stage1/epoch_5/reinspection_module.pt \
               bash src/scripts/run_train_stage2.sh \
                 deepspeed_config=src/configs/deepspeed_z2.json \
                 stage2_grad_accum=11

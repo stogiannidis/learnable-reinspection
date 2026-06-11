@@ -347,6 +347,8 @@ def main():
     p.add_argument("--skip_special", action="store_true", help="Drop special tokens from input rows.")
     p.add_argument("--no_r_tokens", action="store_true", help="Skip R-token panels for reinspection.")
     p.add_argument("--system_prompt", default=None, help="Override the default system prompt.")
+    p.add_argument("--n_queries", type=int, default=None,
+                   help="Override n_queries (must match the checkpoint's module, e.g. 256 for nq256).")
     args = p.parse_args()
 
     if args.from_npz:
@@ -387,6 +389,8 @@ def main():
     )
     if args.system_prompt is not None:
         overrides["system_prompt"] = args.system_prompt
+    if args.n_queries is not None:
+        overrides["n_queries"] = args.n_queries
     config = _config_from_backend_yaml(args.backend, overrides)
 
     processor = _load_processor(args.backend, config)
@@ -434,6 +438,7 @@ def main():
     _save_npz(results, os.path.join(out_dir, "maps.npz"),
               meta=dict(backend=args.backend, question=args.question, image=args.image,
                         layer_reduce=str(layer_reduce), max_new_tokens=args.max_new_tokens,
+                        checkpoint=(args.lora_checkpoint_dir or args.checkpoint_dir or ""),
                         h=results[next(iter(results))]["h"],
                         w=results[next(iter(results))]["w"]))
     print(f"\nDone → {out_dir}", flush=True)

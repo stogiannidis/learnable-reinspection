@@ -6,6 +6,6 @@ defaults:
   - override /stage: stage2
   - override /stage2_datasets: default
 
-stage1_checkpoint: models/internvl3/stage1/epoch_4/reinspection_module.pt
+stage1_checkpoint: models/internvl3/stage1/epoch_5/reinspection_module.pt
 wandb_run_name: s2_internvl
 experiment_name: s2_internvl

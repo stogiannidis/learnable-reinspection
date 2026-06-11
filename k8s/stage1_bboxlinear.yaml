@@ -1,0 +1,57 @@
+# InternVL3 Stage-1 grounding run, 64 queries, single-linear bbox head
+# (vs the default 3-layer MLP). Same pod shape as k8s/stage1.yaml.
+# Checkpoints: models/internvl3/bbox_linear/stage1/epoch_*/
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: reinspection-internvl-stage1-bboxlinear-
+  namespace: eidf098ns
+  labels:
+    kueue.x-k8s.io/queue-name: eidf098ns-user-queue
+spec:
+  ttlSecondsAfterFinished: 172800
+  parallelism: 1
+  completions: 1
+  backoffLimit: 0
+  template:
+    metadata:
+      name: reinspection-internvl-stage1-bboxlinear
+    spec:
+      containers:
+      - name: reinspection-internvl-stage1-bboxlinear
+        image: stogian/l_reinspection:latest
+        workingDir: /data/users/stogian/learnable-reinspection
+        command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            # Avoid stale NFS bytecode masking freshly-added symbols.
+            find src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+            mkdir -p logs models
+            export TRITON_CACHE_DIR=/tmp/triton_cache
+            LOG=logs/pipeline_s1_internvl_bboxlinear__stage1_only.log
+            if [[ -f "$LOG" ]]; then
+              mv "$LOG" "logs/pipeline_s1_internvl_bboxlinear__stage1_only_$(date -u +%Y%m%dT%H%M%SZ).log"
+            fi
+            REINSPECTION_EXPERIMENT=s1_internvl_bboxlinear REINSPECTION_EXPERIMENT_STAGE2= \
+              bash src/scripts/run_train.sh
+        imagePullPolicy: Always
+        env:
+          - { name: HF_TOKEN,      valueFrom: { secretKeyRef: { name: reinspection-secrets, key: HF_TOKEN } } }
+          - { name: WANDB_API_KEY, valueFrom: { secretKeyRef: { name: reinspection-secrets, key: WANDB_API_KEY } } }
+        resources:
+          requests: { cpu: 32, memory: "256Gi", nvidia.com/gpu: 4 }
+          limits:   { cpu: 32, memory: "256Gi", nvidia.com/gpu: 4 }
+        volumeMounts:
+          - { mountPath: /dev/shm, name: dshm }
+          - { mountPath: /data,    name: nfs }
+      restartPolicy: Never
+      securityContext: { runAsUser: 30545, runAsGroup: 4451, runAsNonRoot: true }
+      volumes:
+      - name: dshm
+        emptyDir: { medium: Memory, sizeLimit: "64Gi" }
+      - name: nfs
+        nfs: { server: 10.24.6.66, path: / }
+      nodeSelector:
+        nvidia.com/gpu.product: NVIDIA-H100-80GB-HBM3

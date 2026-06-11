@@ -1,0 +1,15 @@
+# @package _global_
+# Stage 2 — spatial VQA. InternVL3. Default mix.
+# Same recipe as s2_internvl (64 queries) but starting from the bbox_linear
+# Stage-1 module (Linear+Sigmoid grounding probe instead of the 3-layer MLP).
+# The bbox head itself is not used in Stage-2 — only the re-inspection module
+# carries over — so no stage1_bbox_head_type override is needed here.
+# Checkpoints land under models/internvl3/bbox_linear/stage2/ (paired with stage1).
+defaults:
+  - override /backend: internvl3
+  - override /stage: stage2
+  - override /stage2_datasets: default
+
+stage1_checkpoint: models/internvl3/bbox_linear/stage1/epoch_5/reinspection_module.pt
+wandb_run_name: internvl3-stage2-bboxlinear
+experiment_name: bbox_linear
